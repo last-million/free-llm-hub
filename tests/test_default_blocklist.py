@@ -134,3 +134,174 @@ def test_model_blocks_keep_the_users_own_entries(store):
     store[A._BLOCKED_SETTING] = ["groq/some/model"]
     A._seed_default_model_blocks()
     assert {"groq/some/model"} | set(A._DEFAULT_BLOCKED_MODELS) == A._blocked_models()
+
+
+# --------------------------------------------------------------------------- #
+# The shipped list vs the owner's live blocklist (checked 2026-10-23)
+# --------------------------------------------------------------------------- #
+
+def test_the_owners_newer_blocks_ship_and_the_current_nemotron_does_not():
+    # generic identities the owner blocked that the list did not hold yet
+    assert {"codellama-70b", "nemotron-3-super-120b-a12b"} <= A._DEFAULT_BLOCKED_IDENTITIES
+    # the 3.5 chat variants were un-shipped; the safety classifier stays off
+    assert "nemotron-3.5-lightning-30b" not in A._DEFAULT_BLOCKED_IDENTITIES
+    assert "nemotron-3.5-lightning-30b-a3b" not in A._DEFAULT_BLOCKED_IDENTITIES
+    assert "nemotron-3.5-content-safety" in A._DEFAULT_BLOCKED_IDENTITIES
+
+
+def test_nothing_install_specific_is_shipped():
+    for ident in A._DEFAULT_BLOCKED_IDENTITIES:
+        assert not ident.startswith(("srv_", "pa:")), ident     # g4f backend ids
+        assert ":" not in ident, ident
+
+
+# --------------------------------------------------------------------------- #
+# Retiring a shipped default (nemotron 3.5 chat variants, 2026-10-23)
+# --------------------------------------------------------------------------- #
+
+RETIRED_A = "nemotron-3.5-lightning-30b"
+RETIRED_B = "nemotron-3.5-lightning-30b-a3b"
+ENC_KEY = "enc.v1:AAAA-not-a-real-key"
+
+
+@pytest.fixture
+def writes(store, monkeypatch):
+    """`store`, plus a log of every setting name written to it."""
+    log = []
+    real = A.config.set_setting
+
+    def spy(key, value):
+        log.append(key)
+        real(key, value)
+
+    monkeypatch.setattr(A.config, "set_setting", spy)
+    return log
+
+
+def _existing_install(store, *, extra_blocked=(), seeded_extra=()):
+    """An install that booted the PREVIOUS release: it was offered the old
+    shipped set (retired ids included), holds all of it in blocked_identities,
+    and has an API key in its providers block."""
+    old_shipped = set(A._DEFAULT_BLOCKED_IDENTITIES) | A._RETIRED_DEFAULT_BLOCKS
+    store[A._BLOCKED_IDENTITY_SETTING] = sorted(old_shipped | set(extra_blocked))
+    store[A._DEFAULT_BLOCKS_SEEDED_SETTING] = sorted(old_shipped | set(seeded_extra))
+    store["providers"] = {"nvidia": {"api_key": ENC_KEY, "enabled": True}}
+    return old_shipped
+
+
+def test_an_existing_install_loses_exactly_the_retired_seeded_entries(store):
+    _existing_install(store, extra_blocked=["something-i-hate"])
+    before = A._blocked_identities()
+    A._seed_default_blocks()
+    got = A._blocked_identities()
+    assert RETIRED_A not in got and RETIRED_B not in got
+    assert before - got == A._RETIRED_DEFAULT_BLOCKS            # nothing else left
+    assert "something-i-hate" in got                            # the user's own stays
+    assert "nemotron-3.5-content-safety" in got                 # the classifier stays
+    assert "nemotron-3-super-120b-a12b" in got                  # older gen stays
+    assert A._RETIRED_DEFAULT_BLOCKS <= set(store[A._RETIRED_BLOCKS_DONE_SETTING])
+
+
+def test_an_entry_the_user_added_themselves_is_kept(store):
+    """Not in the seeded snapshot = the hub never offered it = the user's."""
+    _existing_install(store)
+    store[A._DEFAULT_BLOCKS_SEEDED_SETTING] = sorted(
+        set(store[A._DEFAULT_BLOCKS_SEEDED_SETTING]) - {RETIRED_B})
+    A._seed_default_blocks()
+    got = A._blocked_identities()
+    assert RETIRED_B in got                                     # user-added: kept
+    assert RETIRED_A not in got                                 # hub-seeded: gone
+
+
+def test_the_owners_own_3_5_blocks_are_not_touched(store):
+    """nemotron-3.5-lightning / -super-vl-120b-a12b are hand-ticked, never
+    shipped: the step must leave them (the owner unticks them in the UI)."""
+    _existing_install(store, extra_blocked=["nemotron-3.5-lightning",
+                                            "nemotron-3.5-super-vl-120b-a12b"])
+    A._seed_default_blocks()
+    got = A._blocked_identities()
+    assert {"nemotron-3.5-lightning", "nemotron-3.5-super-vl-120b-a12b"} <= got
+
+
+def test_an_untick_is_not_undone_by_the_step_or_the_seed(store):
+    _existing_install(store)
+    A._set_identity_blocked(RETIRED_A, False)                   # already unticked
+    A._seed_default_blocks()
+    A._seed_default_blocks()
+    assert RETIRED_A not in A._blocked_identities()
+    assert RETIRED_A not in A._DEFAULT_BLOCKED_IDENTITIES       # nothing re-adds it
+
+
+def test_a_tick_made_after_the_step_ran_survives_later_boots(store):
+    _existing_install(store)
+    A._seed_default_blocks()                                    # the step runs
+    A._set_identity_blocked(RETIRED_B, True)                    # user blocks it again
+    A._seed_default_blocks()
+    A._seed_default_blocks()
+    assert RETIRED_B in A._blocked_identities()
+
+
+def test_the_step_is_idempotent_and_writes_nothing_the_second_time(writes, store):
+    _existing_install(store)
+    assert A._retire_default_blocks() == 2
+    writes.clear()
+    assert A._retire_default_blocks() == 0
+    assert writes == []
+    A._seed_default_blocks()                                    # settles the other seeds
+    snapshot = {k: (list(v) if isinstance(v, list) else v) for k, v in store.items()}
+    A._seed_default_blocks()                                    # nothing new to ship
+    A._seed_default_blocks()
+    assert {k: (list(v) if isinstance(v, list) else v)
+            for k, v in store.items()} == snapshot
+
+
+def test_the_step_writes_only_the_two_blocklist_settings_and_never_keys(writes, store):
+    _existing_install(store)
+    keys_before = dict(store["providers"])
+    assert A._retire_default_blocks() == 2
+    assert set(writes) == {A._BLOCKED_IDENTITY_SETTING, A._RETIRED_BLOCKS_DONE_SETTING}
+    assert store["providers"] == keys_before                    # API keys untouched
+    assert store["providers"]["nvidia"]["api_key"] == ENC_KEY
+    # and the full boot step still only touches blocklist-related settings
+    A._seed_default_blocks()
+    assert set(writes) <= {
+        A._BLOCKED_IDENTITY_SETTING, A._RETIRED_BLOCKS_DONE_SETTING,
+        A._DEFAULT_BLOCKS_SEEDED_SETTING, A._BLOCKED_SETTING,
+        A._DEFAULT_MODEL_BLOCKS_SEEDED_SETTING}
+    assert store["providers"]["nvidia"]["api_key"] == ENC_KEY
+
+
+def test_a_fresh_install_records_the_step_and_blocks_no_3_5_chat_model(store):
+    A._seed_default_blocks()
+    assert not (A._RETIRED_DEFAULT_BLOCKS & A._blocked_identities())
+    assert A._RETIRED_DEFAULT_BLOCKS <= set(store[A._RETIRED_BLOCKS_DONE_SETTING])
+
+
+def test_the_step_runs_even_when_the_boot_has_no_new_shipped_ids(store):
+    """It sits above _seed_default_blocks' early return: an install whose seeded
+    snapshot already covers every shipped id still gets the take-back."""
+    _existing_install(store)
+    assert set(store[A._DEFAULT_BLOCKS_SEEDED_SETTING]) >= A._DEFAULT_BLOCKED_IDENTITIES
+    A._seed_default_blocks()
+    assert RETIRED_A not in A._blocked_identities()
+
+
+def test_a_retired_id_that_is_shipped_again_is_neither_removed_nor_marked(store, monkeypatch):
+    _existing_install(store)
+    monkeypatch.setattr(A, "_DEFAULT_BLOCKED_IDENTITIES",
+                        A._DEFAULT_BLOCKED_IDENTITIES | {RETIRED_A})
+    assert A._retire_default_blocks() == 1                      # only B goes
+    assert RETIRED_A in A._blocked_identities()
+    assert RETIRED_A not in set(store[A._RETIRED_BLOCKS_DONE_SETTING])
+
+
+def test_the_step_never_raises(monkeypatch):
+    sunk = []
+
+    def boom(*a, **k):
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(A.config, "get_setting", boom)
+    monkeypatch.setattr(A.config, "set_setting", lambda k, v: sunk.append(k))
+    assert A._retire_default_blocks() == 0
+    A._seed_default_blocks()                                    # must not raise either

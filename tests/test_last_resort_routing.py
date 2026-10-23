@@ -242,6 +242,113 @@ def test_hard_prefers_strong_even_when_low_quality_outscores(
 
 
 # --------------------------------------------------------------------------- #
+# The CURRENT Nemotron generation (3.5+) is a normal model (owner, 2026-10-23)
+# --------------------------------------------------------------------------- #
+
+CUR_NEMOTRON = "nvidia/nemotron-3.5-lightning-30b-a3b"      # tool-capable 3.5 chat
+OLD_NEMOTRON = "nvidia/nemotron-3-ultra-550b-a55b"          # generation 3: last resort
+JUST_BELOW = "nvidia/nemotron-3.4-lightning"                # hypothetical: under the cut
+STRONG = {
+    ("cerebras", "zai-glm-4.7"): 100.0,
+    ("g4f-nvidia", "moonshotai/kimi-k2.6"): 100.0,
+    ("cloudflare", "@cf/moonshotai/kimi-k2.6"): 100.0,
+    ("opencode-zen", "mimo-v2.5-free"): 90.0,
+}
+
+
+@pytest.fixture
+def fleet_with_current_nemotron(fresh_quota, monkeypatch):
+    fleet = {
+        "cerebras": ["zai-glm-4.7"],
+        "g4f-nvidia": ["moonshotai/kimi-k2.6", OLD_NEMOTRON, CUR_NEMOTRON, JUST_BELOW],
+        "cloudflare": ["@cf/moonshotai/kimi-k2.6", "@cf/openai/gpt-oss-120b"],
+        "opencode-zen": ["mimo-v2.5-free"],
+    }
+    monkeypatch.setattr(app, "_available_providers", lambda: list(fleet))
+    monkeypatch.setattr(app, "_auto_models", lambda pid: list(fleet.get(pid, ())))
+    monkeypatch.setattr(app, "_sub_available_providers", lambda: [])
+    monkeypatch.setattr(app, "_is_model_dead", lambda pid, m: False)
+    monkeypatch.setattr(app, "_context_ok", lambda pid, m, est: True)
+    monkeypatch.setattr(app.prov, "is_model_allowed", lambda m: True)
+    monkeypatch.setattr(app, "_aa_scores", {})
+    app._session_pins.clear()
+    yield fleet
+    app._session_pins.clear()
+
+
+def _scores(monkeypatch, **extra):
+    table = dict(STRONG)
+    table.update({("g4f-nvidia", OLD_NEMOTRON): extra.get("old", 10.0),
+                  ("g4f-nvidia", CUR_NEMOTRON): extra.get("cur", 10.0),
+                  ("g4f-nvidia", JUST_BELOW): extra.get("below", 10.0),
+                  ("cloudflare", "@cf/openai/gpt-oss-120b"): extra.get("oss", 10.0)})
+    monkeypatch.setattr(app, "_benchmark_score", lambda pid, m: table.get((pid, m), 10.0))
+
+
+def test_the_generation_decides_the_tail():
+    assert app._is_low_quality(CUR_NEMOTRON) is False
+    assert app._is_low_quality("nvidia/nemotron-3.6-ultra") is False
+    assert app._is_low_quality("nemotron-4-ultra-1t") is False          # future: passes
+    assert app._is_low_quality(OLD_NEMOTRON) is True
+    assert app._is_low_quality(JUST_BELOW) is True
+    assert app._is_low_quality("nvidia/nemotron-4-340b-instruct") is True  # 2024 model
+    assert app._is_low_quality("nvidia/nemotron-3.5-content-safety") is True
+    assert app._is_low_quality("@cf/openai/gpt-oss-120b") is True
+
+
+@pytest.mark.parametrize("tools", [True, False])
+def test_a_current_nemotron_is_out_of_the_tail_and_older_ones_stay_in_it(
+        fleet_with_current_nemotron, monkeypatch, tools):
+    _scores(monkeypatch)
+    chain = app._build_chain("cerebras", "zai-glm-4.7", est=30000,
+                             require_tools=tools, messages=_msgs("build it"))
+    ids = [m for _pid, m in chain]
+    assert CUR_NEMOTRON in ids, "the current generation must be in the chain"
+    assert CUR_NEMOTRON not in [ids[i] for i in _lowq_positions(chain)]
+    _assert_lowq_tail(chain)
+    tail = set(ids[min(_lowq_positions(chain)):])
+    # whatever of them the chain carries is last, and nothing else is down there
+    assert tail <= {OLD_NEMOTRON, JUST_BELOW, "@cf/openai/gpt-oss-120b"}
+
+
+def test_a_current_nemotron_is_not_boosted_by_the_old_tool_proven_evidence(
+        fleet_with_current_nemotron, monkeypatch):
+    """_TOOL_PROVEN names 'nemotron' from the Nemotron 3 builds. With the tail
+    gone for 3.5+, that substring would have put a score-10 model at hop 2,
+    ahead of every unproven strong model. It competes on score like the rest."""
+    _scores(monkeypatch, cur=10.0)
+    assert app._is_tool_proven(OLD_NEMOTRON) is True        # the evidence still holds
+    assert app._is_tool_proven(CUR_NEMOTRON) is False
+    chain = app._build_chain("cerebras", "zai-glm-4.7", est=30000,
+                             require_tools=True, messages=_msgs("build it"))
+    ids = [m for _pid, m in chain]
+    for strong in ("zai-glm-4.7", "moonshotai/kimi-k2.6", "mimo-v2.5-free"):
+        assert ids.index(strong) < ids.index(CUR_NEMOTRON), strong
+
+
+def test_a_current_nemotron_that_outscores_everything_may_lead(
+        fleet_with_current_nemotron, monkeypatch):
+    monkeypatch.setattr(app, "_is_fast", lambda pid, m: True)
+    _scores(monkeypatch, cur=200.0, old=190.0, oss=195.0)
+    pid, model, diff = app._route_by_difficulty(_msgs(_HARD_TEXT), est=30000,
+                                                require_tools=True)
+    assert diff == "hard"
+    assert (pid, model) == ("g4f-nvidia", CUR_NEMOTRON)
+
+
+def test_an_older_nemotron_that_outscores_everything_still_goes_last(
+        fleet_with_current_nemotron, monkeypatch):
+    monkeypatch.setattr(app, "_is_fast", lambda pid, m: True)
+    _scores(monkeypatch, cur=50.0, old=200.0, below=199.0, oss=195.0)
+    pid, model, _diff = app._route_by_difficulty(_msgs(_HARD_TEXT), est=30000,
+                                                 require_tools=True)
+    assert not app._is_low_quality(model)
+    chain = app._build_chain(pid, model, est=30000, require_tools=True,
+                             messages=_msgs("build it"))
+    _assert_lowq_tail(chain)
+
+
+# --------------------------------------------------------------------------- #
 # FIX 2 — kimi-k2.6 / kimi-k2.7 preference floor across provider id shapes
 # --------------------------------------------------------------------------- #
 

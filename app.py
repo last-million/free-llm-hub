@@ -87,6 +87,7 @@ import image_history
 import craft
 import arena
 import modelrank
+import nemotron_gen
 import benchmarks
 import lowres
 import orchestrator
@@ -4216,8 +4217,9 @@ _SLOW_MODEL_RE = re.compile(
     r"(reasoning|thinking|\bqwq\b|deepseek[-_]?r\d|deepseek[-_/]?v[4-9]|[-/]r1\b|\bo1\b|\bo3\b|"
     r"magistral|nemotron[-_](ultra|super)|gpt[-_]?oss|[-_]think\b|deepthink)", re.I)
 
-# LAST-RESORT families — nemotron (ANY variant), gpt-oss, gemma. Demoted to
-# Tier C in _BENCH_FAMILY, but a real Artificial Analysis score (_aa_score_for)
+# LAST-RESORT families — nemotron (every variant OLDER than the current
+# generation, nemotron_gen.ALLOWED_FROM; see _is_low_quality), gpt-oss, gemma.
+# Demoted to Tier C in _BENCH_FAMILY, but a real Artificial Analysis score (_aa_score_for)
 # OVERRIDES the tier guess and re-inflates them (measured: nemotron-3-ultra
 # ~104, gpt-oss-120b ~99), and _TOOL_PROVEN still lists them from the
 # 2026-07-25 dialect evidence — so SCORES alone cannot keep them behind the
@@ -4238,11 +4240,27 @@ _SLOW_MODEL_RE = re.compile(
 _MIN_AGENTIC_PROVIDERS = 4
 
 _LOW_QUALITY_RE = re.compile(r"nemotron|gpt[-_]?oss|gemma", re.I)
+# The part of _LOW_QUALITY_RE that is NOT nemotron: a model matching these stays
+# a last resort even when its id also names a current Nemotron.
+_LOW_QUALITY_NON_NEMOTRON_RE = re.compile(r"gpt[-_]?oss|gemma", re.I)
 
 
 def _is_low_quality(model_id):
-    """True for the demoted last-resort families (see _LOW_QUALITY_RE)."""
-    return bool(_LOW_QUALITY_RE.search(model_id or ""))
+    """True for the demoted last-resort families (see _LOW_QUALITY_RE).
+
+    OWNER DECISION 2026-10-23: the CURRENT Nemotron generation (version in the id
+    >= nemotron_gen.ALLOWED_FROM, 3.5 today, any later one automatically) is a
+    normal model: it is not in the tail. Nemotron 3 nano/super/ultra, the 2024
+    Nemotron-4 340B, the llama-/mistral-nemotron fine-tunes and the utility
+    variants (content-safety, parse, reward) keep the old last-resort handling.
+    gpt-oss and gemma are never exempted."""
+    s = model_id or ""
+    if not _LOW_QUALITY_RE.search(s):
+        return False
+    if (nemotron_gen.is_current_chat(s)
+            and not _LOW_QUALITY_NON_NEMOTRON_RE.search(s)):
+        return False
+    return True
 
 
 def _speed_score(pid, model):
@@ -16050,9 +16068,21 @@ def _may_lead_pool(pool):
 
 
 def _is_tool_proven(model_id):
-    """True for a model empirically shown to complete an agentic CLI build."""
+    """True for a model empirically shown to complete an agentic CLI build.
+
+    The "nemotron" entry is evidence about the Nemotron 3 builds (2026-07-25),
+    not about the 3.5+ generation the hub now treats as a normal model
+    (nemotron_gen): with no last-resort tail left to neutralise it, that
+    substring match would put a CURRENT Nemotron ahead of every unproven strong
+    model in a tool chain whatever its score (MEASURED in the chain probe of
+    2026-10-23: hop 2 at score 10). A current Nemotron competes on its own
+    evidence like any other model (_may_lead_agentic: score floor or board
+    record); it joins this list after a real multi-file build, like the rest."""
     low = (model_id or "").lower()
-    return any(f in low for f in _TOOL_PROVEN)
+    hits = [f for f in _TOOL_PROVEN if f in low]
+    if hits == ["nemotron"] and nemotron_gen.is_current_chat(low):
+        return False
+    return bool(hits)
 
 
 def _tool_dialect_penalty(model_id):
@@ -25771,8 +25801,11 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     "mistral-nemo-minitron-8b-8k-instruct", "mistral-nemotron",
     "nemotron-3-nano", "nemotron-3-nano-omni-30b-a3b-reasoning",
     "nemotron-3-super", "nemotron-3-ultra",
+    "nemotron-3-super-120b-a12b",
+    # nemotron-3.5-content-safety is a safety CLASSIFIER, not a chat model, so it
+    # stays shipped-blocked (the 3.5 CHAT variants were retired from this list
+    # 2026-10-23, see _RETIRED_DEFAULT_BLOCKS and nemotron_gen).
     "nemotron-3.5-content-safety",
-    "nemotron-3.5-lightning-30b", "nemotron-3.5-lightning-30b-a3b",
     "nemotron-4-340b-instruct", "nemotron-4-340b-reward",
     "nemotron-nano-3-30b-a3b", "nemotron-parse", "nemotron-parse-2.0",
     "nex-n2.5-mini", "nex-n2.5-pro",
@@ -25802,7 +25835,22 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     "step-5-preview",
     "xing4.0-29b-a4b",
     "zamba2-7b-instruct",
+    # The owner's own blocklist, re-checked 2026-10-23 against the shipped set:
+    # Code Llama 70B (Jan 2024), an old code model every current one outranks.
+    "codellama-70b",
 })
+# Identities this hub SHIPPED as blocked once and no longer does (the 3.5 chat
+# variants of Nemotron, 2026-10-23: nemotron_gen). Shipping is a one-way door --
+# an install that was already offered them holds them in its editable
+# blocked_identities -- so _retire_default_blocks takes them back out, ONCE per
+# id, and only where the hub itself put them there (see that function). Add an id
+# here when you remove it from _DEFAULT_BLOCKED_IDENTITIES on purpose.
+_RETIRED_DEFAULT_BLOCKS = frozenset({
+    "nemotron-3.5-lightning-30b", "nemotron-3.5-lightning-30b-a3b",
+})
+# Which retired ids this install has ALREADY been through the step for. Recorded
+# whether or not anything was removed, so a user who re-ticks one later keeps it.
+_RETIRED_BLOCKS_DONE_SETTING = "default_blocks_retired_done"
 # Exact provider/model pairs the owner switched off where the SAME model stays
 # fine on other hosts (identity-level blocking would lose those copies).
 # Seeded into the editable blocked_models list with the same "offered once"
@@ -26156,7 +26204,12 @@ def _seed_default_blocks():
         not in the snapshot yet).
     The defaults land in the editable setting, so the blacklist UI can untick
     any of them. Returns how many were newly added. Never raises -- a blocklist
-    seed must not stop the hub booting."""
+    seed must not stop the hub booting.
+
+    First takes back any identity the hub SHIPPED as blocked and no longer does
+    (_retire_default_blocks) -- before the early return below, or a boot with no
+    new shipped ids would never run it."""
+    _retire_default_blocks()
     try:
         already = {str(x).strip().lower()
                    for x in (config.get_setting(_DEFAULT_BLOCKS_SEEDED_SETTING, []) or [])
@@ -26177,6 +26230,44 @@ def _seed_default_blocks():
     except Exception:                                            # noqa: BLE001
         pass
     return len(to_add) + added
+
+
+def _retire_default_blocks():
+    """One-time take-back of identities the hub shipped as blocked and no longer
+    does (_RETIRED_DEFAULT_BLOCKS). Runs once per retired id per install.
+
+    An id is removed from blocked_identities ONLY when it is also in the seeded
+    snapshot (default_blocks_seeded_ids) -- the record of what the hub itself
+    offered -- so an entry the user added by hand before it was ever shipped
+    stays. Then the id is marked done whether or not it was removed: a user who
+    ticks it again later is never undone, and an id the user had already
+    unticked is simply marked. It writes only blocked_identities and the done
+    marker; it never touches providers, API keys or any other setting, and is
+    idempotent. Returns how many were removed. Never raises.
+
+    Limit, stated plainly: the snapshot records what was OFFERED, not what the
+    hub added, so a user who had ticked a retired id themselves before the hub
+    offered it, or re-ticked it before this step first ran, cannot be told apart
+    from a seeded one and loses that tick once."""
+    try:
+        done = {str(x).strip().lower()
+                for x in (config.get_setting(_RETIRED_BLOCKS_DONE_SETTING, []) or [])
+                if str(x).strip()}
+        todo = {i for i in _RETIRED_DEFAULT_BLOCKS
+                if i not in done and i not in _DEFAULT_BLOCKED_IDENTITIES}
+        if not todo:
+            return 0
+        offered = {str(x).strip().lower()
+                   for x in (config.get_setting(_DEFAULT_BLOCKS_SEEDED_SETTING, []) or [])
+                   if str(x).strip()}
+        cur = _identity_set(_BLOCKED_IDENTITY_SETTING)
+        drop = {i for i in todo if i in cur and i in offered}
+        if drop:
+            config.set_setting(_BLOCKED_IDENTITY_SETTING, sorted(cur - drop))
+        config.set_setting(_RETIRED_BLOCKS_DONE_SETTING, sorted(done | todo))
+        return len(drop)
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 def _seed_default_model_blocks():
