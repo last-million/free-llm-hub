@@ -19,7 +19,11 @@ no changes at all.
 Hermetic: FREE_LLM_HUB_CONFIG points at a fresh temp file per test (same
 pattern as tests/test_provider_out_reason.py); no network.
 """
+import io
 import json
+import re
+import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -382,6 +386,40 @@ def test_live_discovery_actually_lists_models():
     assert models == ["disco-model-a", "disco-model-b"]
 
 
+def test_upstream_chat_posts_to_the_custom_providers_own_base_url_and_key():
+    """Direct proof, one layer below the Test route (which mocks
+    _bounded_probe_call): dispatch for a custom provider's own id actually
+    posts to ITS OWN definition's base_url with ITS OWN saved key -- the
+    exact call shape tests/test_per_key_test.py's
+    test_upstream_chat_pins_to_exactly_the_requested_key proves for a real
+    provider, run here unmocked past _resolve_base_url so the REAL merge
+    point does the resolving."""
+    _create(_basic_body(base_url="https://api.example.com/v1"))
+    config.add_provider_key("my-test-provider", "sk-direct-proof-123")
+    config.set_provider_config("my-test-provider", enabled=True)
+
+    sent = []
+
+    def fake_post(url, **kw):
+        sent.append((url, (kw.get("headers") or {}).get("Authorization")))
+        r = mock.Mock(status_code=200)
+        r.json.return_value = {"choices": [{"message": {"content": "hi"}}]}
+        r.headers = {}
+        r.text = "{}"
+        r.close = mock.Mock()
+        return r
+
+    with mock.patch.object(app.requests, "post", side_effect=fake_post), \
+         mock.patch.object(app.quota, "record"), \
+         mock.patch.object(app.quota, "observe_headers"):
+        app._upstream_chat("my-test-provider", {"model": "m", "messages": []}, False)
+
+    assert sent, "requests.post was never called"
+    url, auth = sent[0]
+    assert url == "https://api.example.com/v1/chat/completions"
+    assert auth == "Bearer sk-direct-proof-123"
+
+
 def test_enabled_keyed_includes_a_custom_provider():
     _create(_basic_body())
     config.add_provider_key("my-test-provider", "sk-1")
@@ -636,6 +674,27 @@ def test_import_skips_a_now_builtin_id_without_failing_the_whole_import():
     assert config.get_flag("some_flag") is True
 
 
+def test_import_skip_also_drops_that_ids_api_key_so_it_never_misdirects():
+    """The SAME upload can carry an api_keys row for the skipped id (it was
+    the custom provider's own saved key before 'groq' became built-in).
+    Writing it anyway would send that key to groq's REAL endpoint the next
+    time groq is used -- exactly the misdirection 'shadowed' warns about --
+    so the skip must drop the matching api_keys entry too."""
+    body = {
+        "custom_providers": {
+            "groq": {"name": "Should be skipped", "base_url": "https://skip.example.com"},
+        },
+        "api_keys": {
+            "groq": {"api_keys": ["sk-do-not-send-to-real-groq"], "enabled": True},
+        },
+    }
+    r = _client().post("/api/settings/import", json=body, headers=_auth())
+    assert r.status_code == 200
+    assert r.get_json()["custom_providers_skipped"] == ["groq"]
+    # the key was NOT written onto groq's real row
+    assert "sk-do-not-send-to-real-groq" not in config.get_provider_config("groq")["api_keys"]
+
+
 def test_import_still_hard_rejects_a_genuinely_reserved_id():
     """A reserved WORD (not a static-provider-id collision) is still a hard
     validation failure, not a skip -- only a real built-in-id collision is
@@ -643,6 +702,69 @@ def test_import_still_hard_rejects_a_genuinely_reserved_id():
     body = {"custom_providers": {"auto": {"name": "x", "base_url": "https://x.example.com"}}}
     r = _client().post("/api/settings/import", json=body, headers=_auth())
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# renderCustomProviders must escape every field it puts into innerHTML --
+# same discipline, same test shape, as tests/test_dashboard_feature_rendering
+# .py's own XSS checks (which found the ORIGINAL bug class this guards:
+# "the Multi-run phase `needs` list went into innerHTML unescaped").
+# --------------------------------------------------------------------------- #
+_XSS = "<img src=x onerror=alert(1)>"
+
+
+def _fn(html, name, last=False):
+    """Source of a top-level (2-space indented) `function name(...)`."""
+    hits = list(re.finditer(r"(\n  function %s\(.*?\n  \}\n)" % re.escape(name), html, re.S))
+    assert hits, "could not extract %s from the template" % name
+    return (hits[-1] if last else hits[0]).group(1)
+
+
+_needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+
+
+@_needs_node
+def test_render_custom_providers_escapes_every_field_including_base_url():
+    """REGRESSION: an earlier version of renderCustomProviders concatenated
+    p.base_url into the row's innerHTML WITHOUT esc() (name/id were escaped,
+    base_url was not). _validate_custom_base_url checks scheme/host/
+    credentials/query/fragment but not path characters, so
+    'https://x.example.com/<img src=x onerror=alert(1)>' is a VALID base_url
+    that would have carried the payload straight through import or a direct
+    config.set_custom_provider call."""
+    html = _html()
+    src = "".join([
+        _fn(html, "esc"),
+        """
+        var _listEl = {hidden: false, innerHTML: ''};
+        var _noteEl = {hidden: false};
+        var _formEl = {hidden: false};
+        function $(sel){
+          if (sel === '#cp-list') return _listEl;
+          if (sel === '#cp-disabled-note') return _noteEl;
+          if (sel === '#cp-form') return _formEl;
+          return null;
+        }
+        var _customProviders = [];
+        """,
+        _fn(html, "renderCustomProviders"),
+        """
+        renderCustomProviders({enabled: true, providers: [
+          {id: 'evil', name: %s, base_url: 'https://x.example.com/%s',
+           has_key: false, shadowed: false}
+        ]});
+        console.log(_listEl.innerHTML);
+        """ % (json.dumps(_XSS), _XSS),
+    ])
+    tmp = Path(tempfile.mkdtemp())
+    js = tmp / "render.js"
+    js.write_text(src, encoding="utf-8")
+    out = subprocess.run(["node", str(js)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    rendered = out.stdout
+    assert "<img" not in rendered, "raw <img made it into innerHTML: %r" % rendered
+    # it DID pass through -- escaped, not silently stripped
+    assert "&lt;img" in rendered
 
 
 # --------------------------------------------------------------------------- #

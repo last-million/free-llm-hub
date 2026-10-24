@@ -15113,7 +15113,7 @@
     var list = $('#cp-list');
     if (!list) return;
     list.innerHTML = _customProviders.length ? _customProviders.map(function(p){
-      var desc = (p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet');
+      var desc = esc(p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet');
       // A later update can ship a BUILT-IN provider using this same id --
       // the built-in then wins and this definition (and its saved key) is
       // no longer in effect. Shown, never auto-fixed; the user decides

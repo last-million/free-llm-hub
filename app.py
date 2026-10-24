@@ -29477,6 +29477,17 @@ def api_settings_import():
     # section _apply_settings_import understands -- pulled out before
     # computing "imported" so a skipped-id note is never counted as applied.
     skipped = sections.pop("custom_providers_skipped", None)
+    if skipped and "api_keys" in sections:
+        # A skipped id is one a LATER update shipped as a built-in provider
+        # (see _custom_provider_definition_view's "shadowed" docstring) --
+        # if this SAME upload also carries that id's api_keys row, writing
+        # it would send the user's custom-endpoint key to the new built-in
+        # provider's real endpoint, which is exactly the misdirection the
+        # "shadowed" warning exists to prevent. Drop it; the user re-enters
+        # the key for whichever provider (the old custom one under a new
+        # id, or the new built-in) they actually mean.
+        for pid in skipped:
+            sections["api_keys"].pop(pid, None)
     _apply_settings_import(sections)
     result = {"imported": sorted(sections.keys())}
     if skipped:

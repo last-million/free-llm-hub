@@ -6293,3 +6293,80 @@ dir, like `tests/test_provider_out_reason.py`).
     all live in the SAME top-level script block -- i.e. the same closure --
     so a cross-call (my delete/save handlers calling `loadProviders()`)
     resolves at runtime, not just at parse time.
+
+- **Second hardening pass (same day, review of the hardening commit itself).**
+  - **A REAL unescaped-innerHTML bug, found and fixed.**
+    `renderCustomProviders` put `p.base_url` into a row's innerHTML WITHOUT
+    `esc()` (name/id were escaped, base_url was not). `_validate_custom_base_url`
+    checks scheme/host/credentials/query/fragment but NOT path characters, so
+    `https://x.example.com/<img src=x onerror=alert(1)>` is a valid base_url
+    that would have carried a payload straight through -- reachable via a
+    direct create, an edit, or an import. Fixed: `esc(p.base_url || '')`.
+    `tests/test_custom_providers.py::test_render_custom_providers_escapes_every_field_including_base_url`
+    extracts `esc`+`renderCustomProviders` from the rendered template and runs
+    them under `node`, same shape as `test_dashboard_feature_rendering.py`'s
+    own XSS checks; verified it FAILS with the bug reintroduced (raw `<img`
+    in the output) and passes with the fix.
+  - **Negative controls run against the COMMITTED files, not scratch
+    scripts.** Reverting `prov.set_custom_source(_custom_provider_rows)`'s
+    registration call: 25 of 76 tests in `tests/test_custom_providers.py`
+    failed. Reverting `is_free_model`'s `_lookup(provider_id)` back to the
+    original `PROVIDERS.get(provider_id)`: exactly 2 failed --
+    `test_is_free_model_true_for_a_custom_provider_model` and
+    `test_live_discovery_actually_lists_models` -- confirming those two
+    tests, and only those two, actually guard that fix. Both reverts were
+    restored and `git diff` on `app.py`/`providers.py` confirmed clean
+    before continuing.
+  - **`[hidden]` CSS precedence, checked, not assumed.** `grep -n
+    "\[hidden\]" templates/index.html` confirms a global `[hidden]
+    {display:none !important}` rule (line ~123, with its own comment
+    explaining exactly this failure mode: a normal-priority author
+    `display:` class rule would otherwise beat the UA stylesheet's
+    `[hidden]{display:none}`). So `$('#cp-form').hidden = disabled` DOES
+    hide the form despite `.sk-form{display:flex}` -- no separate fix
+    needed, just confirmed.
+  - **A skipped id's KEY is now also dropped on import.** The
+    skip-with-note fix above (a now-built-in id is skipped, not written) had
+    a gap: if the SAME upload also carried that id's `api_keys` row (the
+    custom provider's own saved key from before the collision), it still
+    landed on the now-built-in provider's `providers[pid]` row -- the exact
+    misdirection "shadowed" exists to warn about, just reached a different
+    way. `api_settings_import` now drops `sections["api_keys"][pid]` for
+    every id in `custom_providers_skipped` before applying.
+  - **One more direct proof of dispatch, one layer below the Test route.**
+    `test_upstream_chat_posts_to_the_custom_providers_own_base_url_and_key`
+    calls `app._upstream_chat("my-test-provider", ...)` directly (mocking
+    only `requests.post`/`quota.record`/`quota.observe_headers`, NOT
+    `_resolve_base_url`) and asserts the posted URL is the definition's own
+    `base_url + "/chat/completions"` and the bearer is its own saved key --
+    the same call shape `tests/test_per_key_test.py`'s
+    `test_upstream_chat_pins_to_exactly_the_requested_key` proves for a real
+    provider.
+  - **Flag-off decision, stated plainly (not a new decision, just said
+    explicitly here since it was flagged as ambiguous):** with
+    `custom_providers_manual` off, an ALREADY-EXISTING custom provider keeps
+    routing and keeps showing as an ordinary card -- only create/edit/delete
+    (the admin/management surface) and the Settings add-form are disabled.
+    This is a deliberate reading of "the dashboard shows nothing new" as "no
+    new ADMIN capability", not "the feature regresses to not existing" --
+    the provider's own `enabled` row field is what already controls whether
+    IT routes, and flipping an unrelated management flag should not silently
+    stop a working, already-configured provider or remove its card.
+  - **The dashboard JS was syntax-checked, not executed in a browser.** The
+    `node --check` test proves no syntax error; a separate ad hoc run of the
+    WHOLE script under a hand-rolled Node DOM shim threw on a null element,
+    but that was the shim's own minimal `document.querySelector` always
+    returning null for every selector (every OTHER init function in this
+    file would throw identically against that shim) -- not evidence of a
+    real bug, and not something a standing test asserts either way. No
+    Playwright/browser check was run (would need a throwaway local server,
+    out of scope given "do not start/stop the hub").
+  - **Deleting a provider that has keys logs loudly, on purpose, pre-
+    existing.** `DELETE /api/custom-providers/<id>` with `confirm: true`
+    drops the key pool via the ordinary `providers[pid]` write path, which
+    trips config.py's existing `RECORDING A KEY WIPE` ERROR-level log line
+    (a key-count-to-zero save). That log line predates this feature (see
+    `save_config`'s own comment, 2026-09-05) and is deliberately loud for
+    ANY provider's key wipe, custom or real -- expected, not a regression,
+    but worth knowing it will appear in hub.log after every custom-provider
+    delete that had a key.
