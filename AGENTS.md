@@ -6079,3 +6079,29 @@ Covered by `tests/test_learned_state_survives_restart.py`,
   so repeated recap rewrites cannot erode them (ACE, arXiv 2510.04618), and trigger old-result
   clearing by share of the hop's window instead of a flat 60K. Not worth building per the
   evidence: file offloading with re-read, embedding retrieval over history.
+
+## A reply that is only thinking is empty, not an answer (2026-10-24)
+
+MEASURED: a live roles tool turn ("ok go" continuation, web recon) was served a reply
+whose ENTIRE content was one well-formed `<think>...reasoning about the next
+call...</think>` block with nothing before or after it. `_strip_leaked_think_msg`
+deliberately leaves that case untouched (stripping would leave nothing to show), on the
+stated assumption that "the answer gate / non-answer logic handles it". It did not: every
+empty-reply check in the codebase tested `(content or "").strip()`, and raw `<think>` TEXT
+is non-empty text, so a pure-reasoning reply read as "has content" and was served as the
+final answer -- no tool call, nothing the CLI could act on, the turn just stopped.
+
+`answer_check.visible_text(text)` strips what the hub already strips elsewhere for display
+(a well-formed `<think>`/`<thinking>` pair) plus, when nothing follows it, a trailing
+UNCLOSED opening tag (reasoning that never finished). `is_blank_after_thinking(text)` is
+true when nothing word-like is left. Never changes what the client sees -- read only by the
+emptiness checks, so a reply that still has real words after the strip is untouched. Wired
+into the three places that decide "is this reply empty": `_chat_json_is_empty` (the ~8-site
+non-stream choke point for all three protocols), `_role_judge`'s empty check and the old
+`tool_turn_race` judge's identical check. Applies on every provider, relay or direct: a
+reply with zero visible content and no tool call is a failed hop regardless of who sent it.
+No flag (same posture as `tool_deadend` / `idle_greeting`: it only widens what already
+counts as a failed hop). Covered by `tests/test_blank_after_thinking.py`, including a
+negative control (monkeypatching the two helpers back to passthrough makes the wired
+tests fail) and a real roles-path run where the pure-think actor is tried and rejected
+before a tool-calling model serves the turn.

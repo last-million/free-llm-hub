@@ -1072,6 +1072,49 @@ def is_tool_deadend(text, prompt_text=None):
         return False
 
 
+# A REPLY THAT IS ONLY THINKING IS EMPTY, NOT AN ANSWER (2026-10-24).
+# MEASURED: a live roles tool turn (an "ok go" continuation) was served a reply whose
+# ENTIRE content was one well-formed <think>...reasoning about the next call...</think>
+# block with nothing before or after it. _strip_leaked_think_msg deliberately leaves such
+# a reply untouched (stripping would leave nothing to show -- see
+# test_a_reply_that_is_only_thinking_is_left_alone), on the stated assumption that "the
+# answer gate / non-answer logic handles it". It did not: every empty-reply check in this
+# codebase tests `(content or "").strip()`, and raw <think> TEXT is non-empty text, so a
+# pure-reasoning reply read as "has content" and was served as the final answer -- no tool
+# call, nothing the CLI could act on, the turn just stopped.
+# `visible_text` strips what the hub already strips elsewhere for display (_THINK_BLOCK_RE:
+# well-formed <think>/<thinking> pairs) plus, when nothing follows it, a trailing UNCLOSED
+# opening tag (reasoning that never finished before the stream/response ended). It never
+# shows anything different to the client -- it is read ONLY by the emptiness checks below,
+# so a reply that still has real words after the strip is never touched by this function's
+# callers. Applies on every provider (relay or direct): a reply with zero visible content
+# and no tool call is a failed hop regardless of who sent it.
+def visible_text(text):
+    """What is left of `text` once reasoning markup this hub already strips elsewhere is
+    removed. Not used to change what the client sees -- only to judge whether a reply
+    carries any real content. Never raises (returns the original string on error)."""
+    try:
+        if not isinstance(text, str) or not text:
+            return text if isinstance(text, str) else ""
+        out = _THINK_BLOCK_RE.sub("", text)
+        m = _THINK_OPEN_RE.search(out)
+        if m and not _THINK_CLOSE_RE.search(out[m.end():]):
+            out = out[:m.start()]          # an opening tag with no matching close: cut it
+        return out
+    except Exception:                                            # noqa: BLE001
+        return text if isinstance(text, str) else ""
+
+
+def is_blank_after_thinking(text):
+    """True when `text` has no word/number content once its reasoning markup is
+    removed -- i.e. the whole reply WAS the thinking. Never raises (False on error, so a
+    judgement failure never turns a real answer into an empty one)."""
+    try:
+        return not re.search(r"\w", visible_text(text) or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # MEASURED 2026-10-24 (opencode `coding-swarm`, session ses_e9602c99, 01:46 and 01:49):
 # the user had sent a concrete 372-character task ("start with whitebit and go exploit all
 # of ..."). The real models stalled, the chain fell to a relay's gpt-5, and that model -- which

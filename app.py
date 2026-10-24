@@ -3898,7 +3898,7 @@ _PROVIDER_TPM = {
     # workhorse) — 60000 wrongly dropped it once a growing conversation passed ~52k,
     # exactly when it was needed most.
     "groq": 8000, "github-models": 60000, "huggingface": 30000, "mistral": 120000,
-    "morph": 30000, "sambanova": 120000, "cerebras": 128000, "deepseek": 120000,
+    "sambanova": 120000, "cerebras": 128000, "deepseek": 120000,
     "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
     "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
     "aiand": 120000, "xiaomi": 60000, "minimax": 120000,
@@ -4485,7 +4485,7 @@ def _provider_capable(pid, est):
 # a long hidden 'thinking' pass -> slow to a useful answer) and huge params.
 # --------------------------------------------------------------------------- #
 _PROVIDER_SPEED = {
-    "cerebras": 100, "groq": 92, "sambanova": 78, "morph": 70, "deepseek": 66,
+    "cerebras": 100, "groq": 92, "sambanova": 78, "deepseek": 66,
     "mistral": 66, "google": 62, "nvidia": 54, "openrouter": 52,
     "huggingface": 46, "github-models": 44, "cohere": 60,
 }
@@ -36634,7 +36634,8 @@ def _chat_json_is_empty(data):
         if isinstance(content, list):  # content-parts -> join their text
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
-        has_text = bool(content and str(content).strip())
+        has_text = bool(content and str(content).strip()
+                        and not answer_check.is_blank_after_thinking(str(content)))
         # A tool_call counts as content ONLY if it has a usable function name — a
         # nameless/blank tool_call is unusable and should fall through to a real model.
         has_tools = any(
@@ -40564,7 +40565,8 @@ def _swarm_tool_result(body):
             except Exception:                                    # noqa: BLE001
                 pass
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
+        if not (msg.get("tool_calls") or (answer_check.visible_text(
+                msg.get("content") or "").strip())):
             _record_outcome(hop_pid, hop_model, False)
             return _why("200 with an empty message")
         # A member that TYPED its tool call instead of emitting one looks like
@@ -41794,7 +41796,8 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
         if not isinstance(data, dict):
             return fail("bad-json", "200 but the body was not a JSON object")
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
+        if not (msg.get("tool_calls") or (answer_check.visible_text(
+                msg.get("content") or "").strip())):
             _record_outcome(pid, model, False)
             _note_empty_200(pid, model)
             return fail("empty", "200 with an empty message")
