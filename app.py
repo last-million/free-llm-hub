@@ -2649,6 +2649,9 @@ _RANK_TTL = 30.0
 _rank_cache = [0.0, None]                 # [built_at, {(family, tier): (version, score)}]
 _rank_lock = threading.Lock()
 _rank_tls = threading.local()
+# [best reachable Claude flagship's tool-turn score | None] -- built with the
+# anchors above (same fleet, same TTL), cleared by _rank_reset. See _gpt_below_claude.
+_gc_ref = [None]
 
 
 def _rank_fleet_ids():
@@ -2686,6 +2689,7 @@ def _rank_reset():
     """Drop the cached anchors (the next score rebuilds them)."""
     with _rank_lock:
         _rank_cache[0], _rank_cache[1] = 0.0, None
+        _gc_ref[0] = None
 
 
 def _rank_anchors():
@@ -2699,10 +2703,12 @@ def _rank_anchors():
         return hit or {}
     try:
         _rank_tls.building = True
+        ids = _rank_fleet_ids()
         anchors = modelrank.build_anchors(
-            _rank_fleet_ids(), lambda mid: _benchmark_score("", mid, _rank=False),
+            ids, lambda mid: _benchmark_score("", mid, _rank=False),
             canon=_canon_model_id)
         _rank_cache[0], _rank_cache[1] = now, anchors
+        _gc_ref[0] = _gc_build_reference(ids)     # same fleet, same TTL (never raises)
         return anchors
     except Exception:                                            # noqa: BLE001
         _rank_cache[0], _rank_cache[1] = now, hit or {}     # retry in a TTL, not per score
@@ -2714,6 +2720,97 @@ def _rank_anchors():
 
 def _rank_anchor_for(family, tier):
     return _rank_anchors().get((family, tier))
+
+
+# --------------------------------------------------------------------------- #
+# GPT BELOW CLAUDE ON TOOL TURNS (OWNER DECISION 2026-10-24, flag
+# `gpt_below_claude_tools`). Once the real Terminal-Bench / AutomationBench rows
+# landed, first-party tool scores read Opus 5.5 144.66, Sonnet 5.5 144.48, GPT-6
+# Astra 143.60, Fable 5.1 143.49, GPT-6.1 Sol 143.46: Astra sat INSIDE the 2.0
+# _AUTO_TOP_BAND of Opus, so the weighted pick could choose either. The owner's
+# standing order since 2026-07-31 is Claude > GPT > Gemini (the chat ladder holds
+# every GPT id at `claude - 0.5`), and the boards agree (AA Opus 58 vs Astra 53,
+# LMArena ~1504 vs 1475, Terminal-Bench level). So on TOOL turns a GPT-family
+# score is held OUTSIDE _AUTO_TOP_BAND of the best reachable Claude flagship.
+#
+# Same anchor logic as the chat ladder: the reference is built from
+# _rank_fleet_ids() (enabled, keyed, not blocked, not parked, not measured to
+# fail -- a dead-stub relay Opus is not "reachable"), in the same rebuild, so it
+# shares the 30 s TTL and _rank_reset. Reference = the best provider-neutral
+# TOOL score (chat score + the board bonus _agentic_score adds) among the
+# reachable full-size Claude lines (opus / fable / sonnet; Haiku is the small
+# tier). A line with NO agentic board row (an old Opus 4.6, Sonnet 4.5) is not a
+# reference: its tool score is its chat score, ~7 points under a GPT-6 on the
+# boards, and capping GPT-6 under it would drop it below GLM and Kimi -- far more
+# than the rule is for. Nothing reachable = no reference = nothing changes.
+#
+# Composition: applied last in _agentic_score, so it can only LOWER a GPT-family
+# score (min-style, never stacked on the relay discount: an untried relay GPT has
+# no board bonus and a 4.0 discount, sits far under the cap and is untouched; a
+# proven relay GPT competes on first-party terms and clamps like first-party).
+# Chat (_benchmark_score) is not touched, nor is any non-GPT family.
+# The flag is read when the reference is rebuilt (<= 30 s), never per candidate:
+# config.get_flag re-parses config.json on every call.
+# --------------------------------------------------------------------------- #
+_GC_CLAUDE_TIERS = ("opus", "fable", "sonnet")
+# GPT scores above the cap are squeezed into this sliver under it (half the hub's
+# finest score step) instead of flattened to one value, so newest-first order
+# among GPT ids survives: gpt-7 > gpt-6.2 > astra stays true on tool turns.
+_GC_SLIVER = _BAND_MINOR_STEP / 2.0
+
+
+def _gc_build_reference(ids):
+    """Best reachable Claude flagship's provider-neutral tool-turn score among
+    the fleet `ids`, or None (flag off, no such Claude, any error). Never raises."""
+    try:
+        if not config.get_flag("gpt_below_claude_tools", True):
+            return None
+        best = None
+        for mid in ids or ():
+            low = _canon_model_id(str(mid or "").strip().lower())
+            p = modelrank.parse(low)
+            if p is None or p.family != "claude" or p.tier not in _GC_CLAUDE_TIERS:
+                continue
+            if not _ev_has_agentic_evidence(mid):
+                continue
+            # The RANK-ADJUSTED chat score, so the Opus > Fable > Sonnet pins
+            # (modelrank tier offsets) hold in the reference. Called from the
+            # anchors' own rebuild right after it published them, so the nested
+            # _rank_anchors() is a cache hit -- no re-entry.
+            s = float(_benchmark_score("", mid))
+            if s < modelrank.STRONG:
+                continue
+            s += _ev_agentic_bonus(mid)
+            if best is None or s > best:
+                best = s
+        return best
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _gpt_below_claude(score, model_id):
+    """`score` (a tool-turn _agentic_score) with a GPT-family model held outside
+    _AUTO_TOP_BAND of the best reachable Claude flagship; every other score, and
+    every score when no Claude flagship is reachable or the flag is off, comes
+    back unchanged. Only ever lowers. Cheap: a cached reference, a cached parse."""
+    try:
+        _rank_anchors()                       # (re)builds the reference when stale
+        ref = _gc_ref[0]
+        if ref is None:
+            return score
+        p = modelrank.parse(_canon_model_id((model_id or "").lower()))
+        if p is None or p.family != "gpt":
+            return score
+        # The band test is `>=` (see _auto_top_band): ref - band is still inside it,
+        # so the cap sits one finest score step further out.
+        cap = ref - _AUTO_TOP_BAND - _BAND_MINOR_STEP
+        base = cap - _GC_SLIVER
+        if not score > base:                  # well under the cap (or not a number)
+            return score
+        x = score - base                      # strictly increasing, saturating at cap
+        return base + _GC_SLIVER * x / (1.0 + x)
+    except Exception:                                            # noqa: BLE001
+        return score
 
 
 # --------------------------------------------------------------------------- #
@@ -16631,12 +16728,18 @@ def _agentic_score(entry, sustain_override=None):
     # the boards do not cover, so those keep exactly their prior agentic order.
     # Sized so a 29-point TB4.0 gap (GLM 5.3 vs Kimi K3) clears _AUTO_TOP_BAND
     # while a 9-point gap (GLM 5.3 vs GLM 5.3 Flash) stays inside it.
-    return (entry[0] - penalty - _tool_dialect_penalty(entry[2])
-            - _reliability_penalty(entry[1], entry[2])
-            - _latency_penalty(entry[1], entry[2])
-            - _answer_quality_penalty(entry[1], entry[2])
-            + (0.0 if _rp_withholds_evidence(entry[1], entry[2])
-               else _ev_agentic_bonus(entry[2])))
+    #
+    # OWNER DECISION 2026-10-24 (last word, `gpt_below_claude_tools`): a GPT-family
+    # score is held outside _AUTO_TOP_BAND of the best reachable Claude flagship
+    # -- see _gpt_below_claude. It can only lower; chat scores never pass here.
+    return _gpt_below_claude(
+        entry[0] - penalty - _tool_dialect_penalty(entry[2])
+        - _reliability_penalty(entry[1], entry[2])
+        - _latency_penalty(entry[1], entry[2])
+        - _answer_quality_penalty(entry[1], entry[2])
+        + (0.0 if _rp_withholds_evidence(entry[1], entry[2])
+           else _ev_agentic_bonus(entry[2])),
+        entry[2])
 
 
 def _context_ok(pid, model, est):

@@ -6079,3 +6079,23 @@ Covered by `tests/test_learned_state_survives_restart.py`,
   so repeated recap rewrites cannot erode them (ACE, arXiv 2510.04618), and trigger old-result
   clearing by share of the hop's window instead of a flat 60K. Not worth building per the
   evidence: file offloading with re-read, embedding retrieval over history.
+
+## GPT stays below Claude on tool turns (2026-10-24)
+
+Covered by `tests/test_gpt_below_claude_tools.py`. Owner: after the real board rows landed, first-party
+tool scores read Opus 5.5 144.66, Sonnet 5.5 144.48, GPT-6 Astra 143.60, Fable 5.1 143.49, GPT-6.1 Sol
+143.46 -- Astra INSIDE `_AUTO_TOP_BAND` of Opus, so the weighted pick could take either. Standing order
+Claude > GPT > Gemini. Flag `gpt_below_claude_tools` (`config.get_flag`, default ON; OFF = byte-identical).
+- **Rule** (`_gpt_below_claude`, last word of `_agentic_score`): a GPT-family tool score is held OUTSIDE
+  `_AUTO_TOP_BAND` of the best reachable Claude flagship (`cap = ref - band - _BAND_MINOR_STEP`, because
+  the band test is `>=`). Table: Astra 143.595 -> 142.642, Sol 6.1 143.459 -> 142.642 (Opus 144.655).
+- **Reference** (`_gc_build_reference`, built inside `_rank_anchors`' rebuild: same `_rank_fleet_ids()`
+  fleet, same 30 s TTL, cleared by `_rank_reset`): the best rank-adjusted neutral chat score + board
+  bonus among reachable opus / fable / sonnet ids (Haiku is the small tier). Claude lines with NO agentic
+  board row (Opus 4.6, Sonnet 4.5) are not a reference -- capping GPT-6 under them would cost ~7 points.
+- **Only lowers, only GPT, only tool turns**: chat (`_benchmark_score`) and every other family are exact;
+  an untried relay GPT (discount, no bonus) sits under the cap and is untouched; a proven relay GPT clamps
+  like first-party. Scores over the cap are squeezed into `_GC_SLIVER` (half a score step) under it,
+  strictly monotone, so newest-first order among GPT ids survives (gpt-7 > gpt-6.2 > astra).
+- The flag is read at rebuild, never per candidate (`config.get_flag` re-parses config.json): a flip
+  applies within the TTL. Specialist/verifier/planner pools band on chat scores and are not touched.
