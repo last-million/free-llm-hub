@@ -6153,8 +6153,11 @@ dir, like `tests/test_provider_out_reason.py`).
   `/keys/<idx>`, `/keys/<idx>/reveal`) work completely unchanged for the new
   id -- proven in tests by saving a key through `/api/providers/<id>/keys`
   and confirming Test/discovery/`_enabled_keyed` see it, not a parallel path.
-  `_provider_row` gained one field, `"custom": bool`, so the dashboard card
-  can offer Edit/Remove only on a user-added one. Route count: 194 -> 198.
+  `_provider_row` gained one field, `"custom": bool`; `cardHTML` shows a
+  small "Custom" badge on it (same `.badge` class as Recommended/New) so a
+  user-added row is identifiable on the Providers page -- Edit/Remove
+  themselves live in the Settings list (`renderCustomProviders`), next to
+  that row's own key field, not on the card. Route count: 194 -> 198.
 - **Export/import.** A new section, `"custom_providers"`, in
   `_SETTINGS_SECTIONS` (also added to `_SETTINGS_RESERVED_KEYS`, so a crafted
   `flags` payload can never clobber it). `_export_settings` deep-copies
@@ -6370,3 +6373,94 @@ dir, like `tests/test_provider_out_reason.py`).
     ANY provider's key wipe, custom or real -- expected, not a regression,
     but worth knowing it will appear in hub.log after every custom-provider
     delete that had a key.
+
+- **Third hardening pass (same day, review of the second hardening commit).**
+  - **Brief step 5's key field was only half built -- fixed.** The brief
+    asks for the Settings list to show existing providers "each with its
+    own key field ... and a Remove button". The first two commits built
+    Edit/Remove but no key field: a key could only be pasted on the
+    Providers-page card. `renderCustomProviders` now gives each row its own
+    `<form class="keyrow cp-key-form">` (reusing the card's OWN
+    `.keyrow`/`.kwrap`/`.key-input` CSS -- no new CSS) that POSTs
+    `{api_key}` to the EXISTING `/api/providers/<id>/keys` route through
+    `api()`, then reloads both lists. No new route, no second key-storage
+    path -- same discipline as everything else in this feature.
+  - **The dashboard card now shows a "Custom" badge.** `_provider_row`'s
+    `custom: bool` field was added in the first commit but nothing read it
+    anywhere in the template -- an unreported deviation from what AGENTS.md
+    claimed. `cardHTML` now adds a `<span class="badge">Custom</span>` (same
+    class as Recommended/New) when `p.custom`, so a user-added row is
+    visually identifiable on the Providers page; Edit/Remove/the key field
+    stay in the Settings list, which is the right place to manage a
+    DEFINITION (the card is about keys/testing/enabling, which it already
+    handles for a custom provider transparently via the merge point).
+  - **Wider-boundary escaping audit (no new bug found, confirmed clean).**
+    `grep -n "p\.name\|p\.key_hint\|p\.notes"` across every OTHER renderer
+    that was already reading these fields for a REAL provider (`cardHTML`'s
+    name/key-input-placeholder/aria-label, `notesCardHTML`, `openNotesModal`,
+    `guidedStepHTML`'s name/key-hint-placeholder) -- every hit already runs
+    through `esc()`; those fields were simply hard-coded registry strings
+    before this feature and are user text now, but the existing escaping
+    discipline already covers them. `window.confirm(...)` and `.textContent`
+    sites (`toast`, `err.textContent`) are not innerHTML and need no `esc()`.
+  - **Auto routing treats every custom model as genuinely free, by design
+    (documented, not changed) -- but a custom provider claiming a FLAGSHIP
+    id was getting MORE trust than a known relay claiming the same id, which
+    WAS a real gap, now closed.** `_RELAY_DISCOUNT`/`_TOOL_RELAY_PIDS`/
+    `_is_relay_pid` key on a hardcoded pid tuple (`g4f`, `freemodel`) -- a
+    custom provider id is never in it, so a custom provider whose `/models`
+    listed `claude-opus-5.5` scored the FULL undiscounted owner floor (138)
+    for that id, MEASURED higher than a g4f/freemodel relay's DISCOUNTED
+    claim to the exact same id (134), with no skepticism applied at all (an
+    arbitrary user-typed endpoint is at least as unverifiable as a named
+    community relay -- more so, since g4f/freemodel at least have an
+    aggregate track record). `_rp_claim_pair` (the shared gate
+    `_relay_discount` AND `_rp_withholds_evidence` both read) now also
+    recognizes a custom provider (`_is_custom_provider_pid`, via the merge
+    point's `custom: True` tag) claiming a claude/gpt-family id
+    (`_RP_FAMILIES`); `_relay_discount` applies the SAME table value (not an
+    invented number) for that case. Deliberately NOT special-cased away from
+    `_relay_proven`'s escape hatch: a custom provider that measurably,
+    reliably delivers a tool-capable claude/gpt-shaped response over real
+    use earns back the discount exactly as a proven g4f pair does -- never
+    on name alone, always on measured behaviour, same bar, no new one
+    invented. An open-weight family claim (glm/kimi/deepseek/...) is
+    untouched -- the risk this closes is identity-spoofing a FLAGSHIP name,
+    not general over-trust of BYOK endpoints (which Auto's `free_filter:
+    "all"` treatment already accepts as the documented BYOK trust model).
+    All 180 tests across every test file that exercises `_rp_claim_pair`/
+    `_relay_discount`/`_relay_proven`/`_RP_FAMILIES`/`relay_proven_lead`
+    stayed green; a negative control (reverting the membership check) failed
+    exactly the one new test written to guard it, then was restored.
+  - **Import can no longer bypass the `custom_providers_manual` flag.** The
+    flag gated the three REST routes; a settings-import upload was a second,
+    ungated door to the same definitions -- switching the feature off did
+    not actually stop a new custom provider from arriving via a backup
+    upload. `api_settings_import` now folds every id in an import's
+    `custom_providers` section into the SAME `custom_providers_skipped`
+    list (with the same key-protection) when the flag is off, while the
+    rest of that same upload (flags, api_keys for ids NOT skipped, ...)
+    still lands.
+  - **A stale "Advanced: custom base URL" card override could make an Edit
+    silently not apply.** Every provider card (static or custom) has a
+    second base-URL field -- `providers[pid].base_url`, the per-provider
+    override originally built for Cloudflare's account-id templating and a
+    generic per-provider base-URL override -- and `_resolve_base_url` checks
+    it BEFORE the registry/definition value. If a user ever used that
+    generic card field on their OWN custom provider instead of the Settings
+    Edit form, a later Edit that changed `base_url` would update the
+    DEFINITION (the Settings list would show the new value) while dispatch
+    kept silently using the STALE override forever. `PUT
+    /api/custom-providers/<id>` now clears that override (`base_url=""`,
+    config.py's own documented "clear" convention) whenever the edit
+    actually changes `base_url` -- and ONLY then, so an edit of unrelated
+    fields (notes, key_hint, ...) never touches it.
+  - **Every fix in this pass has its own test, and the two most load-
+    bearing (the ranking discount, the import key-drop) were negative-
+    controlled against the committed file**: reverting the discount's
+    membership check failed exactly
+    `test_custom_provider_claiming_a_flagship_id_gets_the_relay_discount`;
+    disabling the key-drop loop failed exactly
+    `test_import_skip_also_drops_that_ids_api_key_so_it_never_misdirects`.
+    Both reverted cleanly (`git diff` on `app.py` confirmed clean) before
+    continuing.

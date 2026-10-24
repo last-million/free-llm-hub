@@ -6893,6 +6893,10 @@
     var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
     if (p.recommended) badges += '<span class="badge recommended" title="' + esc(REC_TIP) + '">' + STAR_SVG + 'Recommended</span>';
     if (p['new']) badges += '<span class="badge new-provider" title="' + esc(NEW_TIP) + '">' + NEW_SVG + 'New</span>';
+    // Added by the owner in Settings -> Custom providers. Edit/Remove live
+    // there (next to its key field), not on this card -- the badge is just
+    // the identity marker so it is obvious which cards are user-added.
+    if (p.custom) badges += '<span class="badge" title="Added by you in Settings -> Custom providers; edit or remove it there">Custom</span>';
     // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
     // free tier; every other provider has one, so it shows BOTH free + paid.
     /* No free tier (morph): its catalog still lists models, but none is free
@@ -15121,8 +15125,20 @@
       var warn = p.shadowed ?
         '<div class="sk-desc">&#9888; A built-in provider now uses this id -- ' +
         'this definition is not in effect. Rename or remove it.</div>' : '';
+      // Its own key field, right here -- reuses the provider card's
+      // key-entry classes (.keyrow/.kwrap/.key-input, already styled) and
+      // the EXISTING /api/providers/<id>/keys route (no new route, no
+      // second key-storage path).
+      var keyField = disabled ? '' :
+        '<form class="keyrow cp-key-form" data-cp-key-pid="' + esc(p.id) + '">' +
+          '<div class="kwrap"><input type="password" class="key-input" autocomplete="off" ' +
+            'spellcheck="false" placeholder="' + esc(p.key_hint || (p.has_key ? 'paste another key to add' : 'paste API key')) + '" ' +
+            'aria-label="API key for ' + esc(p.name) + '"></div>' +
+          '<button type="submit" class="btn sm">Save key</button>' +
+        '</form>';
       return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(p.name) +
-        ' <code>' + esc(p.id) + '</code></div><div class="sk-desc">' + desc + '</div>' + warn + '</div>' +
+        ' <code>' + esc(p.id) + '</code></div><div class="sk-desc">' + desc + '</div>' + warn +
+        keyField + '</div>' +
         '<div class="sk-acts">' +
         (disabled ? '' :
           '<button class="btn sm ghost" type="button" data-cp-edit="' + esc(p.id) + '">Edit</button>' +
@@ -15163,6 +15179,24 @@
         $('#cp-save').textContent = 'Save changes'; $('#cp-cancel').hidden = false;
         $('#cp-name').focus();
       }
+    });
+    // Per-row key save -- goes through the EXISTING /api/providers/<id>/keys
+    // route (the one a real provider's card key field already uses), not a
+    // second key-storage path.
+    group.addEventListener('submit', function(ev){
+      var form = ev.target && ev.target.closest ? ev.target.closest('.cp-key-form') : null;
+      if (!form) return;
+      ev.preventDefault();
+      var pid = form.getAttribute('data-cp-key-pid');
+      var input = form.querySelector('.key-input');
+      var key = input ? input.value.trim() : '';
+      if (!key){ toast('Enter a key first', true); return; }
+      var btn = form.querySelector('button');
+      if (btn) btn.disabled = true;
+      api('/api/providers/' + encodeURIComponent(pid) + '/keys', { method: 'POST', body: { api_key: key } })
+        .then(function(){ toast('Key saved'); loadCustomProviders(); loadProviders(); })
+        .catch(function(e){ toast('Custom providers: ' + e.message, true); })
+        .then(function(){ if (btn) btn.disabled = false; });
     });
     $('#cp-cancel').addEventListener('click', cpFormReset);
     $('#cp-form').addEventListener('submit', function(ev){

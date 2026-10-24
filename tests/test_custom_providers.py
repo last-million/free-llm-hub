@@ -119,6 +119,43 @@ def test_edit_unknown_id_is_404():
     assert r.status_code == 404
 
 
+def test_edit_base_url_overrides_a_stale_advanced_card_override():
+    """Every provider card (static or custom) ALSO has an "Advanced: custom
+    base URL" field (providers[pid].base_url via the ordinary
+    /api/providers/<pid> route), which _resolve_base_url checks BEFORE the
+    definition's own base_url. If the user ever used that card field instead
+    of this Edit form, an edit here must still win -- not be silently
+    shadowed by a stale override forever."""
+    _create(_basic_body(base_url="https://original.example.com/v1"))
+    _client().post("/api/providers/my-test-provider",
+                   json={"base_url": "https://stale-override.example.com/v1"},
+                   headers=_auth())
+    assert app._resolve_base_url("my-test-provider",
+                                 config.get_provider_config("my-test-provider")) == \
+        "https://stale-override.example.com/v1"
+
+    r = _client().put("/api/custom-providers/my-test-provider",
+                      json={"base_url": "https://new.example.com/v1"}, headers=_auth())
+    assert r.status_code == 200
+    assert app._resolve_base_url("my-test-provider",
+                                 config.get_provider_config("my-test-provider")) == \
+        "https://new.example.com/v1"
+
+
+def test_edit_without_touching_base_url_leaves_any_override_alone():
+    """The override is cleared ONLY when the edit actually changes base_url
+    -- an edit of unrelated fields (e.g. notes) must not have this side
+    effect at all."""
+    _create(_basic_body())
+    _client().post("/api/providers/my-test-provider",
+                   json={"base_url": "https://override.example.com/v1"}, headers=_auth())
+    r = _client().put("/api/custom-providers/my-test-provider",
+                      json={"notes": "just a note"}, headers=_auth())
+    assert r.status_code == 200
+    assert config.get_provider_config("my-test-provider")["base_url"] == \
+        "https://override.example.com/v1"
+
+
 def test_delete_needs_confirm():
     _create(_basic_body())
     r = _client().delete("/api/custom-providers/my-test-provider", headers=_auth())
@@ -455,6 +492,34 @@ def test_provider_card_shows_in_the_providers_list_route():
 
 
 # --------------------------------------------------------------------------- #
+# Ranking: a custom provider is an UNVERIFIED endpoint. Claiming a flagship
+# claude/gpt model id must not score higher than a KNOWN, discounted relay's
+# claim to the very same id -- free_filter:"all" has no catalog of ours to
+# check "is this really Claude" against, so a custom provider gets no more
+# trust than a scraped relay by default.
+# --------------------------------------------------------------------------- #
+def test_custom_provider_claiming_a_flagship_id_gets_the_relay_discount():
+    _create(_basic_body(name="Sketchy Reseller"))
+    claimed = app._benchmark_score("sketchy-reseller", "claude-opus-5.5")
+    g4f_claim = app._benchmark_score("g4f", "claude-opus-5.5")
+    assert claimed == g4f_claim, (
+        "a custom provider's claude/gpt claim must score exactly like a "
+        "known relay's claim to the same id, not the raw undiscounted floor")
+    assert claimed < 138.0, "must be discounted below the raw owner floor"
+
+
+def test_custom_provider_claiming_an_open_weight_id_is_not_discounted():
+    """The discount targets identity-spoofing risk (claude/gpt family
+    claims only, per _RP_FAMILIES) -- an open-weight family claim (glm, the
+    SAME family nvidia's real glm-5.3 is scored under) is not second-
+    guessed just for coming from a custom provider."""
+    _create(_basic_body(name="Open Weight Mirror"))
+    claimed = app._benchmark_score("open-weight-mirror", "glm-5.3")
+    real = app._benchmark_score("nvidia", "z-ai/glm-5.3")
+    assert claimed == real
+
+
+# --------------------------------------------------------------------------- #
 # Export / import round trip on a fresh config (definition AND key).
 # --------------------------------------------------------------------------- #
 def test_export_includes_definition_and_key():
@@ -731,7 +796,9 @@ def test_render_custom_providers_escapes_every_field_including_base_url():
     credentials/query/fragment but not path characters, so
     'https://x.example.com/<img src=x onerror=alert(1)>' is a VALID base_url
     that would have carried the payload straight through import or a direct
-    config.set_custom_provider call."""
+    config.set_custom_provider call. key_hint/notes are plain free text
+    (no URL validation at all) and feed the row's key-field placeholder and
+    description, so they are exercised here too."""
     html = _html()
     src = "".join([
         _fn(html, "esc"),
@@ -748,13 +815,13 @@ def test_render_custom_providers_escapes_every_field_including_base_url():
         var _customProviders = [];
         """,
         _fn(html, "renderCustomProviders"),
-        """
+        ("""
         renderCustomProviders({enabled: true, providers: [
           {id: 'evil', name: %s, base_url: 'https://x.example.com/%s',
-           has_key: false, shadowed: false}
+           key_hint: %s, notes: %s, has_key: false, shadowed: false}
         ]});
         console.log(_listEl.innerHTML);
-        """ % (json.dumps(_XSS), _XSS),
+        """ % (json.dumps(_XSS), _XSS, json.dumps(_XSS), json.dumps(_XSS))),
     ])
     tmp = Path(tempfile.mkdtemp())
     js = tmp / "render.js"
@@ -822,6 +889,24 @@ def test_flag_off_is_reported_so_the_dashboard_can_hide_the_form():
     config.set_flag("custom_providers_manual", False)
     r = _client().get("/api/custom-providers", headers=_auth())
     assert r.get_json()["enabled"] is False
+
+
+def test_flag_off_also_blocks_a_new_custom_provider_arriving_via_import():
+    """The flag gates create/edit/delete; a settings-import upload is a
+    SECOND door to the same definitions, so it must not bypass the same
+    switch -- otherwise turning custom providers off would not actually
+    stop a new one from appearing."""
+    config.set_flag("custom_providers_manual", False)
+    body = {"custom_providers": {"flag-off-id": {"name": "x", "base_url": "https://x.example.com"}},
+            "flags": {"keep_me": True}}
+    r = _client().post("/api/settings/import", json=body, headers=_auth())
+    assert r.status_code == 200
+    j = r.get_json()
+    assert "custom_providers" not in j["imported"]
+    assert j["custom_providers_skipped"] == ["flag-off-id"]
+    assert prov.get_provider("flag-off-id") is None
+    # the REST of the same upload still lands
+    assert config.get_flag("keep_me") is True
 
 
 # --------------------------------------------------------------------------- #

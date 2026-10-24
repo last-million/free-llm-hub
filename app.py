@@ -1854,10 +1854,37 @@ def _rp_on():
         return False
 
 
-def _rp_claim_pair(pid, model):
-    """True for a discounted relay pid serving a claude / gpt id."""
+def _is_custom_provider_pid(pid):
+    """True for a user-added custom provider (Settings -> Custom providers),
+    never a static registry id -- the merge point already tags its row
+    `"custom": True` (providers._lookup prefers the static entry when an id
+    collides, so a shadowed custom id correctly reads False here too)."""
     try:
-        if not pid or pid not in _RELAY_DISCOUNT or not model:
+        return bool((prov.get_provider(pid) or {}).get("custom"))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rp_claim_pair(pid, model):
+    """True for a discounted relay pid (or a user-added CUSTOM provider)
+    serving a claude / gpt id.
+
+    A CUSTOM provider is an arbitrary endpoint the USER typed in -- at least
+    as unverifiable as a scraped relay's claim to serve a flagship model,
+    and with no catalog of ours to check it against (see _custom_provider_
+    row: free_filter is deliberately 'all'). Without this, a custom
+    provider whose /models lists 'claude-opus-5.5' scored the FULL
+    undiscounted owner floor for that id -- higher than a g4f/freemodel
+    relay's DISCOUNTED claim to the very same id -- with no skepticism at
+    all. Included here (not only in _RELAY_DISCOUNT's table) so the SAME
+    _relay_proven escape hatch below also applies: a custom provider that
+    measurably, reliably DELIVERS a tool-capable claude/gpt-shaped response
+    over real use earns back the discount exactly as a proven g4f pair
+    does -- never on name alone, only on measured behaviour."""
+    try:
+        if not pid or not model:
+            return False
+        if pid not in _RELAY_DISCOUNT and not _is_custom_provider_pid(pid):
             return False
         p = modelrank.parse(model)
         return p is not None and p.family in _RP_FAMILIES
@@ -1904,8 +1931,13 @@ def _relay_proven(pid, model):
 
 def _relay_discount(pid, model):
     """The relay discount `_benchmark_score` subtracts: 0 for a proven claude /
-    gpt relay pair, the table value otherwise."""
+    gpt relay pair, the table value otherwise. A CUSTOM provider claiming a
+    claude/gpt-family id (see _rp_claim_pair) gets the SAME table value as a
+    known scraped relay -- not a separate, invented number -- until it earns
+    _relay_proven's escape hatch on real measured delivery."""
     disc = _RELAY_DISCOUNT.get(pid, 0.0)
+    if not disc and _rp_claim_pair(pid, model):
+        disc = _RELAY_DISCOUNT["g4f"]
     if disc and _relay_proven(pid, model):
         return 0.0
     return disc
@@ -19360,6 +19392,18 @@ def api_custom_provider_update(pid):
     row["created_at"] = existing.get("created_at") or time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     config.set_custom_provider(pid, row)
+    if "base_url" in fields:
+        # Every provider card (static or custom) also has an "Advanced:
+        # custom base URL" override field (providers[pid].base_url via the
+        # ordinary /api/providers/<pid> route), which _resolve_base_url
+        # checks BEFORE the registry/definition value. If the user had ever
+        # set that override for this id (e.g. by using the card's Advanced
+        # field instead of this Edit form), this edit would silently keep
+        # using the STALE override forever -- the Settings list would show
+        # the new base_url while dispatch kept using the old one. An Edit
+        # that changes base_url always wins: clear any lingering override
+        # ('' clears it -- see config.set_provider_config's own docstring).
+        config.set_provider_config(pid, base_url="")
     with _model_cache_lock:
         _model_cache.pop(pid, None)       # base/models URL may have changed -> rediscover
         _paid_model_cache.pop(pid, None)
@@ -29476,7 +29520,15 @@ def api_settings_import():
     # key in `sections` (see _validate_settings_import) but is NOT itself a
     # section _apply_settings_import understands -- pulled out before
     # computing "imported" so a skipped-id note is never counted as applied.
-    skipped = sections.pop("custom_providers_skipped", None)
+    skipped = sections.pop("custom_providers_skipped", None) or []
+    if "custom_providers" in sections and not _custom_providers_enabled():
+        # The flag gates create/edit/delete; importing a backup is another
+        # door to the same definitions, so it is gated too -- otherwise
+        # switching custom providers off would not actually stop new ones
+        # from appearing via a settings upload. Every id in THIS upload's
+        # custom_providers is treated as skipped (not a collision, just
+        # switched off), so the SAME key-protection below also applies.
+        skipped = sorted(set(skipped) | set(sections.pop("custom_providers").keys()))
     if skipped and "api_keys" in sections:
         # A skipped id is one a LATER update shipped as a built-in provider
         # (see _custom_provider_definition_view's "shadowed" docstring) --
