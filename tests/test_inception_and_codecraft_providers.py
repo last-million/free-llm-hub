@@ -167,3 +167,19 @@ def test_the_page_puts_the_fresh_batch_first_in_the_recommended_zone():
     assert "var fa = a.fresh ? 1 : 0, fb = b.fresh ? 1 : 0;" in src
     # the New badge those cards carry is the existing one
     assert "if (p['new']) badges +=" in src
+
+
+@pytest.mark.parametrize("pid", ["codecraft", "radoxai", "freemodel"])
+def test_the_gateway_notes_explain_the_hidden_telegram_activation(pid):
+    # A fresh key authenticates and lists models but every generation is refused HTTP 402
+    # "Billing verification failed" until the free tokens are enabled with Telegram
+    # verification in the dashboard (confirmed on FreeModel 2026-10-24). A 402 here is NOT a
+    # dead provider, so the card must say how to fix it.
+    notes = P.PROVIDERS[pid]["notes"]
+    assert "Telegram" in notes and "Billing verification failed" in notes
+    assert "Do not add a payment method" in notes
+
+
+def test_freemodel_notes_state_how_small_one_million_tokens_a_month_is():
+    notes = P.PROVIDERS["freemodel"]["notes"]
+    assert "1M TOKENS A MONTH IS SMALL" in notes and "VERIFIED WORKING" in notes

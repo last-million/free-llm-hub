@@ -5844,3 +5844,15 @@ Covered by `tests/test_inception_and_codecraft_providers.py`,
   `_AA_SLUG_STRIP_RE` and `_AA_LEGACY_VENDOR_KEYS`, because the AA cache keyed Mercury as
   `inceptionmercury25` and the plain id never found it. Model discovery already refreshes
   every `MODEL_CACHE_TTL` (600 s), so new models appear with no restart.
+- **UPDATE, same day -- the free tokens need a hidden activation step.** CodeCraft and Radox AI
+  authenticated, listed 33 models and were recognised as free-plan accounts
+  (`X-Ratelimit-Limit` 100 / 80) but refused EVERY generation with HTTP 402
+  `{"code":"insufficient_quota","type":"insufficient_funds","message":"Billing
+  verification failed. Please check your payment method."}` (five models, the hub's Test,
+  `Authorization: Bearer`, `x-api-key` and both alike; a wrong key is 401, so NOT an auth-scheme
+  problem). The owner then enabled FreeModel's free tokens with **Telegram verification** in its
+  dashboard and its Test passed (real generation on `glm-5.3-flash`, canary correct). No docs page
+  mentions that step, so the same step is expected on the other two (not yet confirmed there).
+  Lesson: a 402 "Billing verification failed" from this gateway kit means ACTIVATE THE FREE TIER,
+  it is not a dead provider -- do not remove one on that error alone. (A removal patch was written
+  and discarded before commit; nothing was pushed.)
