@@ -113,3 +113,35 @@ def test_garbage_in_never_raises():
     A._note_continuation_outcome(None, None, None, None)
     A._note_continuation_outcome(*PAIR, "not a list", "not a dict")
     assert not A._never_chains(None, None)
+
+
+def test_the_default_run_is_four():
+    # LOWERED 2026-10-24 (owner: swap a stalled model faster). Four text-only
+    # continuations in a row is enough; three is not.
+    assert A._NEVER_CHAIN_MIN == 4
+    _text_serves(4)
+    assert A._never_chains(*PAIR)
+    A._chain_seen.clear()
+    _text_serves(3)
+    assert not A._never_chains(*PAIR)
+
+
+def test_the_threshold_is_tunable_per_install(monkeypatch):
+    # `tool_chain_watch_min` raises or lowers the run that marks a pair; a bad
+    # value falls back to the default, and it never drops below 2.
+    vals = {}
+    monkeypatch.setattr(A.config, "get_setting",
+                        lambda k, d=None: vals.get(k, d))
+    vals["tool_chain_watch_min"] = 6
+    _text_serves(5)
+    assert not A._never_chains(*PAIR)          # 5 < 6
+    _text_serves(1)
+    assert A._never_chains(*PAIR)              # 6 >= 6
+    A._chain_seen.clear()
+    vals["tool_chain_watch_min"] = "garbage"
+    _text_serves(A._NEVER_CHAIN_MIN)
+    assert A._never_chains(*PAIR)              # bad value -> default
+    A._chain_seen.clear()
+    vals["tool_chain_watch_min"] = 1
+    _text_serves(2)
+    assert A._never_chains(*PAIR)              # clamped up to 2

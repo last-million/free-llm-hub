@@ -10715,12 +10715,30 @@ def _tool_turn_reliability(pid, model):
 # 0-9% text. Clean text is a valid ending, so the delivery ledger above filed each
 # one as a success, the roles layer kept electing them, and the CLI's loop stopped
 # after every step (a "go" per step, opencode session ses_e9602c99). Only a
-# CONTINUATION (tools already ran this turn) can show it, and only a long unbroken
+# CONTINUATION (tools already ran this turn) can show it, and only an unbroken
 # run of text-only serves marks the pair; one tool call clears it. The mark
 # expires, so a repaired relay is tried again. Flag `tool_chain_watch` (default on).
-_NEVER_CHAIN_MIN = 8                 # text-only continuations in a row
+# LOWERED 2026-10-24 (owner: a stalled model should be swapped FASTER): the run
+# was 8, so a relay that answered prose instead of acting kept being elected ~8
+# turns before it was demoted -- long enough for an opencode session to burn a
+# "go" per step. 4 demotes it sooner; the mark only REORDERS (the pair stays in
+# the chain, as a last resort), clears on any single tool call, and only counts
+# text-only CONTINUATIONS, so a healthy agentic pair that calls tools never
+# accumulates it. Tunable per install via the setting `tool_chain_watch_min`.
+_NEVER_CHAIN_MIN = 4                 # text-only continuations in a row (default)
 _NEVER_CHAIN_TTL = 6 * 3600.0        # seconds the mark is remembered
 _chain_seen = {}                     # (pid, model) -> {"text": n, "last": ts}
+
+
+def _never_chain_min():
+    """The text-only-continuation run that marks a pair, from the setting
+    `tool_chain_watch_min` (default _NEVER_CHAIN_MIN), clamped to >= 2. A bad
+    value falls back to the default. Never raises."""
+    try:
+        v = config.get_setting("tool_chain_watch_min", _NEVER_CHAIN_MIN)
+        return max(2, int(v))
+    except Exception:                                            # noqa: BLE001
+        return _NEVER_CHAIN_MIN
 
 
 def _file_chain_reply(pid, model, continuation, called, text):
@@ -10796,11 +10814,11 @@ def _note_request_data(pid, model, data):
 
 
 def _never_chains(pid, model):
-    """True while the pair's last _NEVER_CHAIN_MIN continuations were all text."""
+    """True while the pair's last _never_chain_min() continuations were all text."""
     try:
         with _outcome_lock:
             rec = _chain_seen.get((pid, model))
-        return bool(rec and rec["text"] >= _NEVER_CHAIN_MIN
+        return bool(rec and rec["text"] >= _never_chain_min()
                     and time.time() - rec.get("last", 0) <= _NEVER_CHAIN_TTL
                     and config.get_flag("tool_chain_watch", True))
     except Exception:                                            # noqa: BLE001

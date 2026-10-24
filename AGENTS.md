@@ -5802,12 +5802,29 @@ blamed tool results not reaching the model.
   user's own prompt quotes it. `reads_as_answer` never releases it early.
 - **`_never_chains`** (flag `tool_chain_watch`, default on): `_file_chain_reply`
   is the one writer. Text-only serves of a CONTINUATION (`_turn_used_tools`)
-  count; `_NEVER_CHAIN_MIN` (8) in a row mark the pair for `_NEVER_CHAIN_TTL`
+  count; `_never_chain_min()` (setting `tool_chain_watch_min`, default
+  `_NEVER_CHAIN_MIN`, clamped >= 2) in a row mark the pair for `_NEVER_CHAIN_TTL`
   (6 h); a tool call on ANY tool turn, an opening turn included, clears it (a
   healthy pair doing "call a tool, then answer" tasks only ever shows text on its
   continuations); text on an opening turn never counts. `_tool_turn_sick`
   includes it, so the pair goes behind the pairs that call (primary pick, chain
   sick group, quality fallback) -- never out of the chain.
+  - **Default lowered 8 -> 4 (2026-10-24, owner: swap a stalled model FASTER).**
+    MEASURED live (opencode `coding-swarm`, session 04f3e590): `g4f/poe/
+    GLM-5.3-Flash-T` answered prose instead of a tool call turn after turn -- the
+    user sent "go" ~5 times and the pair was never demoted, because the run was
+    8. The model even talked itself into "I stop issuing commands" (a false
+    "results never came back" story -- hub.log showed the full history forwarded
+    every hop, the newest tool result unchanged because the model issued no new
+    call). At 4 the pair is demoted after the 4th text-only continuation. The
+    mark only REORDERS (last-resort still reachable), clears on one tool call,
+    and counts text-only CONTINUATIONS only, so a healthy agentic pair never
+    accumulates it. Tunable per install via `tool_chain_watch_min`. CAVEAT, said
+    plainly: demotion helps only when a BETTER model is alive; when the whole
+    free fleet is degraded at once (that session: nvidia silent, dahl 429, g4f
+    claude backends budget-exhausted) the chain falls back to the one answering
+    pair regardless -- no threshold conjures a good provider. Covered by
+    `tests/test_never_chains.py`.
 - **Every way in feeds it**: the roles path (`_note_continuation_outcome`, after
   a served actor) and the single-model tiers on all three protocols (chat =
   opencode/qwen/kimi/..., responses = codex, messages = Claude Code), stream and
