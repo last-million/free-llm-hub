@@ -864,8 +864,9 @@ def get_custom_provider(pid: str) -> Optional[dict]:
 
 
 def set_custom_provider(pid: str, row: dict) -> None:
-    """Create or REPLACE one custom provider's definition. Never touches its
-    saved key(s) -- those live in providers[pid], untouched by this call."""
+    """Create or REPLACE one custom provider's definition (edit / import
+    semantics -- overwrite IS the point). Never touches its saved key(s) --
+    those live in providers[pid], untouched by this call."""
     with _LOCK:
         cfg = load_config(strict=True)
         cur = cfg.get("custom_providers")
@@ -873,6 +874,25 @@ def set_custom_provider(pid: str, row: dict) -> None:
         cur[pid] = dict(row or {})
         cfg["custom_providers"] = cur
         save_config(cfg)
+
+
+def create_custom_provider(pid: str, row: dict) -> bool:
+    """Atomically create a BRAND NEW custom provider -- False (nothing
+    written) if `pid` already has one. Closes a TOCTOU gap: a caller that
+    reads get_custom_providers() to check for a collision, then separately
+    calls set_custom_provider(), could race a concurrent create of the same
+    id between the read and the write; this does the check-and-write under
+    ONE lock acquisition."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cur = cfg.get("custom_providers")
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        if pid in cur:
+            return False
+        cur[pid] = dict(row or {})
+        cfg["custom_providers"] = cur
+        save_config(cfg)
+        return True
 
 
 def delete_custom_provider(pid: str) -> bool:

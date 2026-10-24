@@ -544,6 +544,124 @@ def test_custom_provider_key_masked_in_an_error_response():
     assert "sk-leak-check-999" not in msg
 
 
+def test_test_route_masks_a_key_echoed_by_a_malicious_upstream_body():
+    """End-to-end through the REAL /api/test/<pid> route (not a hand-built
+    string): a 401 whose JSON body echoes the saved key back must never
+    reach the client. Also proves dispatch reaches generation for THIS
+    custom provider's id, not some other path."""
+    _create(_basic_body())
+    config.add_provider_key("my-test-provider", "sk-test-echo-999")
+    config.set_provider_config("my-test-provider", enabled=True)
+
+    class FakeModelsResp:
+        status_code = 200
+        def json(self):
+            return {"data": [{"id": "probe-model"}]}
+
+    class FakeGenResp:
+        status_code = 401
+        text = ""
+        def json(self):
+            return {"error": {"message": "invalid key: sk-test-echo-999"}}
+
+    calls = []
+
+    def fake_probe(pid_arg, payload, pin, seconds):
+        calls.append((pid_arg, payload.get("model")))
+        return FakeGenResp()
+
+    with mock.patch.object(app.requests, "get", return_value=FakeModelsResp()), \
+         mock.patch.object(app, "_bounded_probe_call", side_effect=fake_probe):
+        r = _client().post("/api/test/my-test-provider", headers=_auth())
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert "sk-test-echo-999" not in json.dumps(body)
+    assert body["ok"] is False
+    assert calls and calls[0][0] == "my-test-provider"
+
+
+# --------------------------------------------------------------------------- #
+# Shadowing: a LATER static provider can collide with an EARLIER custom id.
+# --------------------------------------------------------------------------- #
+def test_shadowed_marker_when_a_later_update_ships_the_same_id():
+    """Not reachable through the create route (static collision is rejected
+    there) -- this is what happens when a NEWER providers.py ships a
+    built-in using an id an EXISTING custom provider already took."""
+    config.set_custom_provider("groq", {"name": "Shadow Groq",
+                                        "base_url": "https://shadow.example.com"})
+    r = _client().get("/api/custom-providers", headers=_auth())
+    rows = {p["id"]: p for p in r.get_json()["providers"]}
+    assert rows["groq"]["shadowed"] is True
+
+
+def test_not_shadowed_for_an_ordinary_custom_id():
+    _create(_basic_body())
+    r = _client().get("/api/custom-providers", headers=_auth())
+    rows = {p["id"]: p for p in r.get_json()["providers"]}
+    assert rows["my-test-provider"]["shadowed"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Create is atomic (no lost-update race between the collision check and the
+# write), and import SKIPS a now-built-in id instead of failing the WHOLE
+# import.
+# --------------------------------------------------------------------------- #
+def test_create_custom_provider_is_atomic_against_a_second_writer():
+    first = config.create_custom_provider("race-test", {"name": "A", "base_url": "https://a.example.com"})
+    second = config.create_custom_provider("race-test", {"name": "B", "base_url": "https://b.example.com"})
+    assert first is True
+    assert second is False
+    assert config.get_custom_provider("race-test")["name"] == "A"
+
+
+def test_import_skips_a_now_builtin_id_without_failing_the_whole_import():
+    body = {
+        "custom_providers": {
+            "groq": {"name": "Should be skipped", "base_url": "https://skip.example.com"},
+            "still-fine": {"name": "Still Fine", "base_url": "https://fine.example.com"},
+        },
+        "flags": {"some_flag": True},
+    }
+    r = _client().post("/api/settings/import", json=body, headers=_auth())
+    assert r.status_code == 200
+    j = r.get_json()
+    assert "custom_providers" in j["imported"]
+    assert "flags" in j["imported"]
+    assert j["custom_providers_skipped"] == ["groq"]
+    # the real collision -- "groq" -- was skipped, not written as a custom row
+    assert config.get_custom_provider("groq") is None
+    # everything else in the same upload still landed
+    assert prov.get_provider("still-fine")["name"] == "Still Fine"
+    assert config.get_flag("some_flag") is True
+
+
+def test_import_still_hard_rejects_a_genuinely_reserved_id():
+    """A reserved WORD (not a static-provider-id collision) is still a hard
+    validation failure, not a skip -- only a real built-in-id collision is
+    forgiven."""
+    body = {"custom_providers": {"auto": {"name": "x", "base_url": "https://x.example.com"}}}
+    r = _client().post("/api/settings/import", json=body, headers=_auth())
+    assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# The signup_url / "where to get a key" field is free text, not always a
+# URL -- cardHTML and the guided-setup list must never render it as a dead
+# relative link.
+# --------------------------------------------------------------------------- #
+def test_non_url_signup_text_is_not_rendered_as_a_dead_link():
+    html = _html()
+    fn = _re.search(r"(\n  function providerKeyLinkUrl\(.*?\n  \}\n)", html, _re.S)
+    assert fn, "providerKeyLinkUrl not found"
+    card_fn = _re.search(r"(\n  function cardHTML\(.*?\n  \}\n)", html, _re.S)
+    assert card_fn
+    assert "providerKeyLinkUrl(p.signup_url)" in card_fn.group(1)
+    guided_fn = _re.search(r"(\n  function guidedStepHTML\(.*?\n  \}\n)", html, _re.S)
+    assert guided_fn
+    assert "providerKeyLinkUrl(s.signup_url)" in guided_fn.group(1)
+
+
 # --------------------------------------------------------------------------- #
 # Flag off: create/edit/delete refused; list stays harmless; the dashboard
 # shows nothing new.
@@ -643,3 +761,31 @@ def test_template_provider_grid_zone_filters_never_drop_an_unflagged_row():
     # unknown custom id by omission.
     assert "function isKeyless(p){ return !!(KEYLESS_GATEWAYS[p.id] || p.no_key); }" in html
     assert "function isPurePaid(p){ return !!(p.paid && PURE_PAID[p.id]); }" in html
+
+
+# --------------------------------------------------------------------------- #
+# The page actually renders, and the inline JS it ships is syntactically
+# valid -- about 70 lines went into the ONE shared dashboard script, so a
+# single typo there would break every panel, not only this one. Skipped
+# without `node` on PATH (same convention as
+# tests/test_dashboard_feature_rendering.py).
+# --------------------------------------------------------------------------- #
+def _node_available():
+    import shutil
+    return shutil.which("node") is not None
+
+
+@pytest.mark.skipif(not _node_available(), reason="node not on PATH")
+def test_the_dashboard_page_renders_and_its_inline_js_is_syntactically_valid():
+    import subprocess
+    r = _client().get("/")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert 'id="cp-group"' in html
+    scripts = _re.findall(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', html, _re.S)
+    assert scripts, "no inline <script> blocks found"
+    assert not any("{{" in s for s in scripts), "unrendered Jinja syntax leaked into the page"
+    tmp_js = Path(tempfile.mkdtemp()) / "dashboard.js"
+    tmp_js.write_text("\n;\n".join(scripts), encoding="utf-8")
+    result = subprocess.run(["node", "--check", str(tmp_js)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

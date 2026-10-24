@@ -19219,7 +19219,16 @@ def _custom_provider_definition_view(pid, row):
     deliberately NOT the full provider-card shape (/api/providers already
     gives every provider, custom ones included via the merge point above, the
     full card: status/quota/keys/etc); this is just what the add/edit form
-    needs back."""
+    needs back.
+
+    `shadowed`: a LATER git pull can ship a built-in provider using an id a
+    custom provider already took (create-time collision checks only see
+    TODAY's static registry). providers._lookup prefers the static entry when
+    that happens, so routing silently stops using this definition -- and
+    because the saved KEY sits in the SAME providers[pid] row a real
+    provider's key would, that key would be sent to the NEW built-in
+    provider's real endpoint, not this one, if it is ever enabled. Flagged
+    here (never auto-fixed -- the user decides whether to rename/remove)."""
     return {
         "id": pid,
         "name": row.get("name") or pid,
@@ -19230,6 +19239,7 @@ def _custom_provider_definition_view(pid, row):
         "notes": row.get("notes") or "",
         "created_at": row.get("created_at") or "",
         "has_key": bool(config.get_provider_config(pid).get("api_keys")),
+        "shadowed": pid in prov.PROVIDERS,
     }
 
 
@@ -19294,25 +19304,37 @@ def api_custom_provider_create():
     fields, err = _custom_provider_body_fields(body, creating=True)
     if err:
         return jsonify({"error": err}), 400
-    existing = config.get_custom_providers() or {}
+    row = dict(fields)
+    row["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     raw_id = body.get("id")
     if raw_id:
         try:
             pid = _validate_custom_provider_id(raw_id)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        if pid in existing:
+        # config.create_custom_provider does the "does it already exist?"
+        # check AND the write under ONE lock acquisition, so a concurrent
+        # create of the same id can never slip in between a check here and a
+        # write there (set_custom_provider alone would have that TOCTOU gap).
+        if not config.create_custom_provider(pid, row):
             return jsonify({"error": "a custom provider '%s' already exists" % pid,
                             "code": "id_exists"}), 400
     else:
         base_slug = _slugify_provider_name(fields.get("name"))
-        pid = _unique_custom_pid(
-            base_slug, set(prov.PROVIDERS) | set(existing) | _custom_provider_reserved_ids())
+        pid = None
+        reserved = set(prov.PROVIDERS) | _custom_provider_reserved_ids()
+        for _attempt in range(50):
+            taken = reserved | set(config.get_custom_providers() or {})
+            candidate = _unique_custom_pid(base_slug, taken)
+            if not candidate:
+                break
+            if config.create_custom_provider(candidate, row):
+                pid = candidate
+                break
+            # Lost a race for `candidate` to a concurrent create -- taken is
+            # re-read fresh on the next loop, so the next candidate skips it.
         if not pid:
             return jsonify({"error": "could not generate an id -- please choose one"}), 400
-    row = dict(fields)
-    row["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    config.set_custom_provider(pid, row)
     with _model_cache_lock:
         _model_cache.pop(pid, None)
         _paid_model_cache.pop(pid, None)
@@ -29319,7 +29341,17 @@ def _validate_settings_import(body):
         if not isinstance(raw, dict):
             return None, "'custom_providers' must be an object of {provider_id: {...}}."
         rows = {}
+        skipped = []
         for pid, row in raw.items():
+            # A later git pull may have shipped a BUILT-IN provider using an
+            # id this export's custom provider once used -- that is not
+            # malformed data, just stale by now (the export was valid when
+            # it was made). Skip just this one entry with a note instead of
+            # failing the WHOLE import (every other section included) over a
+            # single now-reserved id.
+            if isinstance(pid, str) and pid.strip().lower() in prov.PROVIDERS:
+                skipped.append(pid)
+                continue
             try:
                 norm_pid = _validate_custom_provider_id(pid)
             except ValueError as exc:
@@ -29350,6 +29382,8 @@ def _validate_settings_import(body):
                 norm["created_at"] = row["created_at"]
             rows[norm_pid] = norm
         out["custom_providers"] = rows
+        if skipped:
+            out["custom_providers_skipped"] = skipped
     return out, None
 
 
@@ -29438,8 +29472,16 @@ def api_settings_import():
     # it does NOT make the several setter calls below into one filesystem
     # transaction (each is its own already-atomic save_config() call, same as
     # every other multi-field settings change in this app).
+    # custom_providers_skipped rides alongside the "custom_providers" section
+    # key in `sections` (see _validate_settings_import) but is NOT itself a
+    # section _apply_settings_import understands -- pulled out before
+    # computing "imported" so a skipped-id note is never counted as applied.
+    skipped = sections.pop("custom_providers_skipped", None)
     _apply_settings_import(sections)
-    return jsonify({"imported": sorted(sections.keys())})
+    result = {"imported": sorted(sections.keys())}
+    if skipped:
+        result["custom_providers_skipped"] = skipped
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------

@@ -6876,6 +6876,16 @@
     return Math.max(1, m) + 'm';
   }
 
+  // A static provider's signup_url is always a real URL, but a CUSTOM
+  // provider's "where to get a key" field is explicitly free TEXT (per its
+  // own form's placeholder) -- e.g. "ask your admin". Rendering that as
+  // <a href="ask your admin"> would be a dead relative link. Same shape as
+  // pubSafeUrl/ghSafeUrl elsewhere in this file: http(s) only, no stray
+  // whitespace/quotes/angle-brackets.
+  function providerKeyLinkUrl(u){
+    var s = String(u == null ? '' : u).trim();
+    return /^https?:\/\/[^\s<>"']+$/i.test(s) ? s : '';
+  }
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -7038,9 +7048,14 @@
          A "Get a free key" link next to it just sent people to the homepage to
          hunt for something that does not exist. */
       (p.signup_url && p.id !== 'puter' && !p.can_mint_key ?
-        '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
-          '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
-          'Get a free key</a>' : '') +
+        (providerKeyLinkUrl(p.signup_url) ?
+          '<a class="keylink" href="' + esc(providerKeyLinkUrl(p.signup_url)) + '" target="_blank" rel="noopener noreferrer">' +
+            '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
+            'Get a free key</a>' :
+          // A CUSTOM provider's field is explicitly free text (not always a
+          // URL) -- show it as a plain note (reusing the existing .notes
+          // class, no new CSS) instead of a dead relative link.
+          '<div class="notes">' + esc(p.signup_url) + '</div>') : '') +
       /* Vendors whose docs say "keys are free, mint another when one is spent"
          (Dahl) get a real button instead of a link to a signup page — one click
          is the whole flow, no email and no card. */
@@ -7615,8 +7630,14 @@
           '<div class="gstep-top"><span class="gstep-name">' + esc(s.name) + '</span>' + badges + '</div>' +
           (models ? '<div class="gstep-models">' + esc(models) + '</div>' : '') +
           (s.friction ? '<div class="gstep-friction">' + esc(s.friction) + '</div>' : '') +
+          // A custom provider's "where to get a key" field is free text, not
+          // always a URL (same providerKeyLinkUrl guard as the provider card)
+          // -- show it as a note instead of a dead relative link.
+          (!providerKeyLinkUrl(s.signup_url) && s.signup_url ?
+            '<div class="gstep-friction">' + esc(s.signup_url) + '</div>' : '') +
           '<div class="gstep-row">' +
-            '<a class="btn sm" href="' + esc(s.signup_url) + '" target="_blank" rel="noopener noreferrer">Open signup</a>' +
+            (providerKeyLinkUrl(s.signup_url) ?
+              '<a class="btn sm" href="' + esc(providerKeyLinkUrl(s.signup_url)) + '" target="_blank" rel="noopener noreferrer">Open signup</a>' : '') +
             '<input type="password" autocomplete="off" spellcheck="false" placeholder="' +
               esc(s.key_hint ? ('paste key (' + s.key_hint + ')') : 'paste key here') + '">' +
             '<button type="button" class="btn sm primary gstep-save">Save</button>' +
@@ -15093,8 +15114,15 @@
     if (!list) return;
     list.innerHTML = _customProviders.length ? _customProviders.map(function(p){
       var desc = (p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet');
+      // A later update can ship a BUILT-IN provider using this same id --
+      // the built-in then wins and this definition (and its saved key) is
+      // no longer in effect. Shown, never auto-fixed; the user decides
+      // whether to rename or remove it.
+      var warn = p.shadowed ?
+        '<div class="sk-desc">&#9888; A built-in provider now uses this id -- ' +
+        'this definition is not in effect. Rename or remove it.</div>' : '';
       return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(p.name) +
-        ' <code>' + esc(p.id) + '</code></div><div class="sk-desc">' + desc + '</div></div>' +
+        ' <code>' + esc(p.id) + '</code></div><div class="sk-desc">' + desc + '</div>' + warn + '</div>' +
         '<div class="sk-acts">' +
         (disabled ? '' :
           '<button class="btn sm ghost" type="button" data-cp-edit="' + esc(p.id) + '">Edit</button>' +

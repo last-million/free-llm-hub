@@ -6219,3 +6219,77 @@ dir, like `tests/test_provider_out_reason.py`).
   matching the UI description); forcing a reserved-word-free prefix on every
   custom id (a curated reserved-word check against `_virtual_model_ids()`
   was judged sufficient and less invasive than a mandatory prefix).
+- **Exactly which internal readers changed, precisely.** A grep of every
+  `prov.get_provider(`/`prov.PROVIDERS.items(`/`prov.PROVIDERS.get(` call
+  site in app.py (33 hits) found they are ALL `prov.get_provider(...)` --
+  none needed changing (the one non-`get_provider` hit, `_SUB_PROVIDERS.items()`,
+  is an unrelated dict whose name happens to contain the substring
+  "PROVIDERS.items()"). Inside `providers.py` itself, FIVE functions read the
+  static `PROVIDERS` dict directly rather than through `get_provider`/
+  `_lookup`, and each one needed the fix: `is_free_model` (read `PROVIDERS.get`
+  -- the critical one: unfixed, every model of a custom provider reads as
+  "not free" and live discovery drops them all), `base_url_for`, `signup_url`,
+  `is_known_provider`, `list_providers`.
+- **Auto routes to a custom provider exactly like a free one, by design, per
+  the brief.** `free_filter: "all"` + `paid: False` means `is_free_model`
+  returns True for every model a custom provider's `/models` lists and
+  `_auto_provider_mode() == "free"` (the default) will route Auto traffic to
+  it -- correct for a genuinely free BYOK endpoint, but means a PAID custom
+  endpoint is auto-routed too, with no quota/cost signal the hub can see (it
+  has no catalog of its own to check pricing against, same as the registry's
+  generic ad-hoc "custom" entry). The user is the one who typed the base URL
+  in, so this is accepted as the BYOK trust model, not a bug -- flagged here
+  so it is a documented decision, not a surprise.
+- **Hardening found in review (2026-10-24, same day).**
+  - **Atomic create**: `config.create_custom_provider(pid, row)` does the
+    "does it already exist?" check AND the write under ONE `_LOCK`
+    acquisition -- the create route's collision check used to read
+    `get_custom_providers()` and separately call `set_custom_provider()`,
+    a TOCTOU gap a concurrent create of the same id could have raced
+    (`set_custom_provider` itself stays create-OR-replace, for PUT/import,
+    where overwrite is the point). The auto-slug path retries (bounded, 50
+    attempts) against a freshly re-read `taken` set on each loss.
+  - **Shadowing, surfaced not silently fixed.** Static always wins in
+    `providers._lookup`, so a LATER `git pull` that ships a built-in using
+    an id an EXISTING custom provider already took makes `get_provider`
+    switch to the static row -- and because the saved KEY sits in the SAME
+    `providers[pid]` row either definition would use, that key would reach
+    the NEW built-in's real endpoint if it is ever enabled, not the user's
+    intended one. `_custom_provider_definition_view` now reports
+    `"shadowed": pid in prov.PROVIDERS`; the Settings list shows a warning
+    row ("A built-in provider now uses this id..."). Never auto-fixed --
+    renaming or deleting is destructive, so it is the user's call.
+  - **Import no longer fails WHOLE on one stale id.** The same shadowing
+    scenario used to make importing an OLDER, perfectly valid export 400 in
+    full (API keys, flags, everything) the moment one of its
+    `custom_providers` ids happened to match a provider shipped AFTER that
+    export was made (`_validate_custom_provider_id` correctly rejects a
+    static-id collision as a hard error, and the import validator is
+    otherwise all-or-nothing). `_validate_settings_import` now checks a
+    static-registry collision FIRST and SKIPS just that one entry (with a
+    note) instead of failing the whole request; a genuinely malformed id
+    (bad pattern, a RESERVED WORD like `auto`) is still a hard 400, since
+    that is corrupt/hostile data, not merely stale. The route adds
+    `custom_providers_skipped: [ids]` to the response when anything was
+    skipped.
+  - **Free-text "where to get a key" could render as a dead link.** The
+    brief calls `signup_url` "a link/text", so the backend accepts free text
+    (e.g. "ask your admin"), but `cardHTML` and the guided-setup list
+    (`guidedStepHTML`) both rendered it unconditionally as `<a href=...>` --
+    a non-URL note became a dead relative link inside the hub. New helper
+    `providerKeyLinkUrl(u)` (same shape as the existing `pubSafeUrl`/
+    `ghSafeUrl`: `http(s)://` only, no stray whitespace/quotes/angle
+    brackets) gates both render sites; non-URL text now shows as a plain
+    note (`.notes` on the card, `.gstep-friction` in guided setup -- both
+    reused, no new CSS).
+  - **The dashboard page actually renders and its JS is syntactically
+    valid, checked by a test, not just asserted.** `GET /` through the test
+    client (200, `cp-group` present) + every inline `<script>` through
+    `node --check` (node confirmed present on the dev machine; skipped
+    without it, same convention as `test_dashboard_feature_rendering.py`).
+    Also confirmed (one-time, by grep of the rendered script, not a
+    standing test): `loadCustomProviders`/`initCustomProviders`/
+    `renderCustomProviders` and `loadProviders`/`initSkills`/`esc`/`api`
+    all live in the SAME top-level script block -- i.e. the same closure --
+    so a cross-call (my delete/save handlers calling `loadProviders()`)
+    resolves at runtime, not just at parse time.
