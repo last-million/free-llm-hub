@@ -29,6 +29,7 @@ GLM53_FLASH = "z-ai/glm-5.3-flash"
 DSV41_FLASH = "deepseek-ai/deepseek-v4.1-flash"
 GEMINI38_FLASH = "models/gemini-3.8-flash"
 KIMI_K3 = "moonshotai/kimi-k3"
+KIMI_K31 = "moonshotai/kimi-k3.1-pro"       # OWNER DIRECTIVE 2026-10-24: the #1 model
 QWEN_27B = "qwen/qwen3.8-27b"
 SIX = [GLM53, GLM53_FLASH, DSV41_FLASH, GEMINI38_FLASH, KIMI_K3, QWEN_27B]
 
@@ -109,8 +110,10 @@ def test_chat_order_is_not_the_tool_order(_no_penalties):
 
 @pytest.mark.parametrize("newer,older", [
     ("z-ai/glm-5.4", GLM53),
-    ("moonshotai/kimi-k3.5", KIMI_K3),
-    ("moonshotai/kimi-k4", KIMI_K3),
+    # Kimi is now an OWNER-FLOORED family from k3.1 up (2026-10-24), so a newer
+    # kimi lands just above the FLOORED k3.1-pro, not above the unfloored k3.
+    ("moonshotai/kimi-k3.5", KIMI_K31),
+    ("moonshotai/kimi-k4", KIMI_K31),
     ("deepseek-ai/deepseek-v4.2-flash", DSV41_FLASH),
     ("qwen/qwen3.9-27b", QWEN_27B),
 ])
@@ -122,13 +125,60 @@ def test_a_new_version_lands_just_above_its_predecessor(_no_penalties, newer, ol
 
 def test_a_new_version_does_not_vault_past_the_owner_floors():
     assert gen("z-ai/glm-5.4") < app._PREF_FLOORS[5]                # under Claude's 138
-    assert gen("moonshotai/kimi-k4") < app._PREF_FLOORS[12]         # under Space Bunny
+    # kimi k3.1+ is now ITSELF an owner floor (above Space Bunny, OWNER DIRECTIVE
+    # 2026-10-24); a newer kimi stays at the floor, capped, never running away.
+    assert gen("moonshotai/kimi-k4") > app._PREF_FLOORS[12]         # above Space Bunny now
+    assert gen("moonshotai/kimi-k4") <= app._KIMI_K31_CEILING       # but capped
 
 
 def test_the_inherited_row_is_flagged():
     ev = benchmarks.agentic_evidence("z-ai/glm-5.4")
     assert ev and ev.get("inherited_from") == GLM53
     assert benchmarks.agentic_evidence(GLM53).get("inherited_from") is None
+
+
+# --------------------------------------------------------------------------- #
+# 4. OWNER DIRECTIVE 2026-10-24: Kimi K3.1 is the #1 model, above Claude
+# --------------------------------------------------------------------------- #
+
+def _opus(pid="anthropic"):   return gen("claude-opus-5.5", pid)
+def _sonnet(pid="anthropic"): return gen("claude-sonnet-5.5", pid)
+
+
+def test_kimi_k31_is_first_on_the_intelligence_chat_ranking():
+    # Clearly first: outside the auto band above Claude (not merely sorted first).
+    assert gen(KIMI_K31) > _opus()
+    assert gen(KIMI_K31) > _sonnet()
+    assert gen(KIMI_K31) - _opus() > app._AUTO_TOP_BAND
+    assert gen(KIMI_K31) == app._PREF_FLOORS[13]
+
+
+def test_kimi_k31_leads_every_tool_turn(_no_penalties):
+    # Above Opus, Sonnet and GPT-6.1 Sol, and outside the band over the best Claude.
+    for rival in ("claude-opus-5.5", "claude-sonnet-5.5", "gpt-6.1-sol", "gpt-6-astra"):
+        assert tool(KIMI_K31) > tool(rival), rival
+    best_claude = max(tool("claude-opus-5.5"), tool("claude-sonnet-5.5"))
+    assert tool(KIMI_K31) - best_claude > app._AUTO_TOP_BAND
+
+
+def test_only_kimi_k31_and_up_gets_the_floor():
+    # k3.0 and k2.x stay board-/ceiling-placed; a -flash speed cut is not floored.
+    assert gen(KIMI_K3) < app._PREF_FLOORS[5]                       # k3.0 under Claude
+    assert gen("moonshotai/kimi-k2.7") < 120
+    assert gen("moonshotai/kimi-k3.1-flash") < app._PREF_FLOORS[12]  # speed cut, not top band
+
+
+def test_a_relay_copy_of_kimi_k31_stays_behind_first_party_claude():
+    # The g4f relay discount keeps a claimed-name copy under first-party Claude,
+    # while first-party kimi-k3.1 still leads.
+    assert gen(KIMI_K31, "g4f") < _opus()
+    assert gen(KIMI_K31) > _opus()
+
+
+def test_newer_kimi_stays_strictly_above_k31(_no_penalties):
+    assert gen("moonshotai/kimi-k3.2-pro") > gen(KIMI_K31)
+    assert gen("moonshotai/kimi-k4") > gen("moonshotai/kimi-k3.2-pro")
+    assert gen("moonshotai/kimi-k4") <= app._KIMI_K31_CEILING
 
 
 # --------------------------------------------------------------------------- #

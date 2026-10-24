@@ -6330,6 +6330,36 @@ Claude > GPT > Gemini. Flag `gpt_below_claude_tools` (`config.get_flag`, default
 - The flag is read at rebuild, never per candidate (`config.get_flag` re-parses config.json): a flip
   applies within the TTL. Specialist/verifier/planner pools band on chat scores and are not touched.
 
+## Kimi K3.1 is the #1 model (OWNER DIRECTIVE 2026-10-24)
+
+Owner: "if found kimi k3.1 make it the first model in intelligence -- really better than Opus 5.5 at high
+effort, than Sonnet 5.5 at xhigh, and than GPT-6.1 at high." Covered by `tests/test_evidence_ranking.py`
+(section 4) and the ranking files above. This SUPERSEDES, for kimi-k3.1-and-up ONLY, the 2026-10-10
+"Kimi no longer floored" placement and the 2026-10-23 tool-order lines (Kimi near the bottom of the
+agentic order). kimi-k3.0 and kimi-k2.x are untouched (still board-/ceiling-placed).
+
+- **The floor** `_PREF_FLOORS[13]` = 140.6, applied in `_benchmark_score` for a `modelrank.parse` whose
+  family is `kimi` and version `>= (3, 1)`, excluding speed cuts (`_SPEED_VARIANT_RE`). 140.6 is CLEARLY
+  above Claude's 138 -- outside `_AUTO_TOP_BAND` (2.0), not merely sorted first -- so kimi-k3.1 opens the
+  intelligence (tool-free) ranking, and with the agentic bonus on top (`_ev_agentic_bonus` ~7.45) its tool
+  score is ~148.05 vs Opus 144.66 (gap 3.4, also outside the band) so it leads every tool turn. Any
+  provider id shape via `modelrank.parse`; a g4f relay copy still pays the relay discount (chat 136.6,
+  under first-party Claude) so a claimed-name relay never outranks first-party Claude while first-party
+  kimi leads. Version-scaled by `_band_version_bump(maj, min, 3, 1)` and capped by `_KIMI_K31_CEILING`
+  (141.5 = floor + `_BAND_MAX_BUMP`), so k3.2 > k3.1 and k4 > k3.2 strictly, none runs away.
+- **Honest on the evidence** (do not overstate): the AGENTIC boards back the agentic half -- Kimi K3.1 Pro
+  has the TOP Terminal-Bench 4.0 of every model in `benchmarks.py` (67.2) and AutomationBench 73.3 above
+  Opus/Sonnet/GPT (under only Argon's 77.5). The GENERAL board does NOT put it above Claude: AA Index 55 <
+  Opus 58 / Sonnet 56, and it has no LMArena row. So the chat-ranking lift is the OWNER'S CALL, a thumb on
+  the scale (like Claude's 138, hy3, Space Bunny), NOT a measured chat score. Stated plainly so a later
+  reader knows it is a product decision, not a board reading.
+- **Changes nothing until a provider lists it.** MEASURED 2026-10-24: the live catalog had 292 models and
+  NO kimi-k3.1 id (only `nvidia/moonshotai/kimi-k2.6`, which this floor ignores). Like the ox-alpha floor,
+  a preference only orders models that exist; kimi-k3.1 leads the moment any keyed provider serves it, and
+  if it then fails to deliver or call tools the measured machinery demotes it like anything else.
+- `_PREF_FLOORS` gained index 13 (140.6), so `_spread_band` excludes it from the natural-band top exactly
+  like the other floors.
+
 ## Custom providers (user-added) (2026-10-24)
 
 Owner: "add providers manually in Settings -- endpoint, name, where to get the

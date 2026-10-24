@@ -1774,8 +1774,8 @@ def _strong_root_version_excess(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel  bunny
-_PREF_FLOORS = (134.5, 138.1, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6, 137.7)
+#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel  bunny  k3.1
+_PREF_FLOORS = (134.5, 138.1, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6, 137.7, 140.6)
 # OWNER DIRECTIVE 2026-09-30: Kimi K3 "just above GLM 5.3" -- the top free model
 # (index 1: 134.8 -> 138.1). Boards read that day: Arena text kimi-k3-max 1488 >
 # glm-5.3-max 1480; AA Index v4.3.2 GLM-5.3 45 > Kimi K3 44 -- a tie within
@@ -2029,6 +2029,11 @@ _GLM_FLASH_FLOOR = 133.6      # glm-5.3+ -flash: above dsv4-pro (133.5) / minima
 _GLM_FLASH_CEILING = 133.95   # ...never up to the deepseek-v4 flash floor (134)
 _MIMO_PRO_FLOOR = 134.09      # mimo-v2.6+ -pro: level with qwen3.8/3.9 (134.08/.09)
 _MIMO_PRO_CEILING = 134.49    # ...never past hy3 (134.5) on a version bump
+# OWNER DIRECTIVE 2026-10-24: Kimi K3.1 is the #1 model. _PREF_FLOORS[13] (140.6)
+# is its floor -- clearly above Claude's 138, so it opens both the intelligence
+# (chat) ranking and, with the agentic bonus on top, every tool turn. A newer
+# kimi (k3.2, k4) version-bumps just above it, capped here so it never runs away.
+_KIMI_K31_CEILING = 141.5     # _PREF_FLOORS[13] + _BAND_MAX_BUMP (0.9)
 _GEMINI_LITE_FLOOR = 60.0     # gemini-3.5+ flash-lite: above mistral-medium (56)
 # Gemini 3.1+ (Google) — gemini-3.1, gemini-3.5-flash, models/gemini-3.6-flash,
 # google/gemini-4. Version-scaled like gpt-5.x because the user's rule is the
@@ -3087,6 +3092,27 @@ def _benchmark_score(pid, model_id, _rank=True):
     if ("kimi-k2.6" in low or "kimi-k2.7" in low
             or "kimik2.6" in low or "kimik2.7" in low):
         score = min(score, _KIMI_K2_CEILING)
+    # OWNER DIRECTIVE 2026-10-24: "if found kimi k3.1 make it the first model in
+    # intelligence -- really better than Opus 5.5 at high effort, than Sonnet 5.5
+    # at xhigh, and than GPT-6.1 at high." So kimi-k3.1-AND-UP gets a preference
+    # floor (_PREF_FLOORS[13] = 140.6) ABOVE Claude's 138: it is first on the
+    # tool-free (intelligence) ranking, and with the agentic bonus on top it leads
+    # every tool turn. SUPERSEDES the 2026-10-10 "Kimi no longer floored" placement
+    # and the 2026-10-23 tool order FOR k3.1+ only -- k3.0 and k2.x are untouched
+    # and still board-/ceiling-placed. The agentic boards back the agentic half
+    # (Kimi K3.1 Pro has the TOP Terminal-Bench 4.0 of every model here, 67.2, and
+    # AutomationBench 73.3 above Opus/Sonnet/GPT); the general board does NOT (AA
+    # Index 55 < Opus 58 / Sonnet 56, no Arena row) -- this floor is the owner's
+    # call, a thumb on the scale, not a measured chat score. Version-scaled so a
+    # newer kimi stays strictly above (k3.2 > k3.1, k4 > k3.2), capped by
+    # _KIMI_K31_CEILING. Speed cuts (-flash/-air) are excluded (the speed cap below
+    # still orders them). Any provider id shape via modelrank.parse.
+    _k31 = modelrank.parse(low)
+    if (_k31 is not None and _k31.family == "kimi" and _k31.version is not None
+            and _k31.version >= (3, 1) and not _SPEED_VARIANT_RE.search(low)):
+        score = max(score, min(
+            _PREF_FLOORS[13] + _band_version_bump(_k31.version[0], _k31.version[1], 3, 1),
+            _KIMI_K31_CEILING))
     # USER PREFERENCE: Puter's newest GPT flagship — the gpt-5.6-sol(-pro)
     # class — ranks FIRST among equals (user-requested top priority for the
     # puter provider, 2026-07-30): floored one point above hy3 so a keyed
