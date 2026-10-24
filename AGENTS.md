@@ -5884,3 +5884,20 @@ Covered by `tests/test_inception_and_codecraft_providers.py`,
   (`_pair_rest`) and recent failures is IN MEMORY ONLY: only `_outcomes` / `_latencies` are saved
   (perfstats), so every restart -- including every auto-update -- makes it re-discover that nvidia GLM-5.3
   is silent for 30 s by failing again.
+- **A relay's raw `<think>` block no longer reaches the CLI as the answer (2026-10-24).**
+  `_strip_thinking` only served the hub's own calls (recaps, facts, canary); g4f's poe-GLM backends put
+  "<think>...</think>" in the reply text and opencode showed it as the assistant's text.
+  `_strip_leaked_think_msg` / `_strip_leaked_think_data` move a CLOSED block at the very START of a
+  RELAY hop's reply into `reasoning_content` -- only when something else is left to show (text or tool
+  calls), never when the user's prompt is about `<think>` tags, never a mid-reply or unclosed tag.
+  Wired into the three non-stream serving sites and the roles path (which replays to streaming clients);
+  a streamed single-model reply is not rewritten. Flag `strip_leaked_think` (default on). Covered by
+  `tests/test_leaked_think_is_stripped.py` (23 tests incl. all three protocols and the roles path).
+- **Dahl moved to accounts (2026-10-24)**: keys START EMPTY and tokens are ALLOCATED to a key from the
+  account's 100M pool on the "Tokens & keys" page (`inference.dahl.global/docs`); the anonymous
+  `POST /tokens` mint is no longer relied on (no `key_mint_url`, so the card is a plain link to
+  `/account`). The owner's saved key answered HTTP 402 "available tokens exhausted" with
+  `available_tokens: 0` while his dashboard pool showed 100.0M.
+- **OpenCode Zen is in the page's Paid group** (`PURE_PAID`), ZenMux keys must be made on
+  `zenmux.ai/platform/pay-as-you-go`, and FreeModel's card says "Needs Telegram activation to enable
+  the free 1M tokens per month".

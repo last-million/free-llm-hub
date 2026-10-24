@@ -28,7 +28,12 @@ def _auth():
 def test_registered_with_the_verified_endpoints():
     assert P["base_url"] == "https://inference.dahl.global/v1"
     assert P["models_url"] == "https://inference.dahl.global/v1/models"
-    assert P["key_mint_url"] == "https://inference.dahl.global/tokens"
+    # 2026-10-24: Dahl moved to accounts ("account keys start empty"); the anonymous one-click
+    # mint is no longer relied on, so the registry carries no key_mint_url and the card shows a
+    # plain "Get a free key" link to the account page.
+    assert "key_mint_url" not in P
+    assert P["signup_url"] == "https://inference.dahl.global/account"
+    assert P["balance_url"] == "https://inference.dahl.global/tokens/current"
 
 
 def test_only_models_that_actually_answer_are_listed():
@@ -80,8 +85,11 @@ class _Resp:
         return self._payload
 
 
-def test_mint_key_saves_the_key_and_enables_the_provider(client):
+def test_mint_key_saves_the_key_and_enables_the_provider(client, monkeypatch):
     import app
+    # The generic mint route is still supported for a provider that offers anonymous keys;
+    # Dahl no longer does, so give it a mint URL for the duration of this test only.
+    monkeypatch.setitem(P, "key_mint_url", "https://inference.dahl.global/tokens")
     minted = {"available_tokens": 100000000, "token": "dahl_TESTKEY123"}
     with mock.patch.object(app.requests, "post",
                            return_value=_Resp(201, minted)) as post, \
@@ -106,10 +114,31 @@ def test_mint_key_refused_for_providers_that_do_not_offer_it(client):
     assert "instant free keys" in r.get_json()["error"]
 
 
-def test_mint_key_surfaces_an_upstream_failure(client):
+def test_mint_key_surfaces_an_upstream_failure(client, monkeypatch):
     import app
+    monkeypatch.setitem(P, "key_mint_url", "https://inference.dahl.global/tokens")
     with mock.patch.object(app.requests, "post",
                            return_value=_Resp(429, {"error": "too many signup attempts"})):
         r = client.post("/api/providers/dahl/mint-key", json={}, headers=_auth())
     assert r.status_code == 502
     assert "429" in r.get_json()["error"]
+
+
+def test_dahl_no_longer_offers_a_mint_button_so_the_card_shows_a_link(client):
+    """REPORTED 2026-10-24: the card's "Get a free key" did nothing useful -- it was a button
+    that posted to the old anonymous mint. With no key_mint_url the card renders the normal
+    link to signup_url (the account page)."""
+    import app
+    r = client.post("/api/providers/dahl/mint-key", json={}, headers=_auth())
+    assert r.status_code == 400
+    assert "instant free keys" in r.get_json()["error"]
+    row = app._provider_row("dahl", live_models=False)
+    assert row["can_mint_key"] is False
+    assert row["signup_url"] == "https://inference.dahl.global/account"
+
+
+def test_the_notes_explain_that_a_new_key_starts_empty():
+    notes = P["notes"]
+    for needle in ("KEYS START EMPTY", "ALLOCATE", "Tokens & keys", "available tokens exhausted",
+                   "not a dead provider"):
+        assert needle in notes, needle

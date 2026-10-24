@@ -143,14 +143,15 @@ def test_freemodel_frees_only_open_weight_ids_never_a_claimed_claude_or_gpt():
 def test_the_freemodel_card_says_to_activate_with_telegram_first():
     notes = P.PROVIDERS["freemodel"]["notes"]
     assert notes.startswith("ACTIVATE THE FREE TOKENS FIRST")
-    for needle in ("Telegram", "Billing verification failed", "Do not add a payment method",
+    for needle in ("NEEDS TELEGRAM ACTIVATION to enable the free 1M tokens per month", "Telegram",
+                   "Billing verification failed", "Do not add a payment method",
                    "VERIFIED WORKING", "1M TOKENS A MONTH IS SMALL", "do NOT send private code"):
         assert needle in notes, needle
 
 
 def test_the_freemodel_pitch_is_on_the_face_of_the_card():
     src = open("templates/index.html", encoding="utf-8").read()
-    assert "freemodel: 'Activate the free 1M tokens/month first: verify with Telegram'" in src
+    assert "freemodel: 'Needs Telegram activation to enable the free 1M tokens per month'" in src
 
 
 def test_the_freemodel_request_budget_is_unknown_and_monthly():

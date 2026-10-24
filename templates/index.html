@@ -6726,11 +6726,12 @@
   var NEW_TIP = 'Added recently — worth a look';
   var KEY_WARN = 'Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
-  // ONLY these three have no free tier at all (pure paid). Every other provider
+  // ONLY these have no free tier usable from the hub (pure paid). Every other provider
   // has a free tier too, so it shows BOTH a free and a paid badge and sits under
   // "Free providers". (Auto still won't spend on paid models unless you pick the
-  // Paid/Mix mode above — so this is display, not billing.)
-  var PURE_PAID = { openai: 1, anthropic: 1, higgsfield: 1 };
+  // Paid/Mix mode above — so this is display, not billing.) opencode-zen joined on
+  // 2026-10-24: its free models answer HTTP 403 to any client but OpenCode itself.
+  var PURE_PAID = { openai: 1, anthropic: 1, higgsfield: 1, 'opencode-zen': 1 };
 
   function notesCardHTML(n){
     if (n && n.length > 200){
@@ -6762,7 +6763,7 @@
   /* One-line pitch shown on pinned recommended cards (only providers with a
      genuinely distinctive free offer get a line — keep this map tiny). */
   var REC_NOTES = { puter: 'Latest GPT-5.6 + 500 models with one free token',
-                    freemodel: 'Activate the free 1M tokens/month first: verify with Telegram' };
+                    freemodel: 'Needs Telegram activation to enable the free 1M tokens per month' };
   /* Exhausted = the free window is spent, OR every pooled account is empty.
      Shared so the card class, the cross mark and the quota line never disagree. */
   /* A RESEARCHED ZERO (limit_known, limit 0 -- morph bills every model): not

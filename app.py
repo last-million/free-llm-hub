@@ -14097,6 +14097,56 @@ def _strip_thinking(text):
     return out.strip()
 
 
+# A RELAY'S RAW <think> BLOCK MUST NOT REACH THE CLI AS THE ANSWER (2026-10-24).
+# MEASURED: g4f's poe-GLM backends put the scratchpad in the reply text ("<think>\n...</think>
+# \n\nthe answer"), and opencode showed it as the assistant's text. _strip_thinking above is
+# only used for the hub's OWN calls (recaps, facts, canary). This one is for what the CLI gets,
+# and is deliberately narrow because a wrong strip erases an answer: RELAY hops only, a CLOSED
+# block at the very START only, only when something is left to show (text or tool calls), never
+# when the user's own prompt is about <think> tags; the text MOVES to `reasoning_content` (never
+# thrown away). Non-stream paths of all three protocols and the roles path (which replays to a
+# streaming client); a streamed single-model reply is not rewritten. Flag `strip_leaked_think`.
+_LEAKED_THINK_RE = re.compile(r"^\s*<(think|thinking)>(.*?)</\1>\s*", re.S | re.I)
+_THINK_TAG_IN_PROMPT_RE = re.compile(r"<\s*/?\s*think", re.I)
+
+
+def _strip_leaked_think_msg(msg, relay=True, prompt=None):
+    """Move a leaked leading <think> block of `msg["content"]` into
+    `msg["reasoning_content"]`. True when it changed the message. Never raises."""
+    try:
+        if not relay or not isinstance(msg, dict):
+            return False
+        if not config.get_flag("strip_leaked_think", True):
+            return False
+        content = msg.get("content")
+        if not isinstance(content, str):
+            return False
+        m = _LEAKED_THINK_RE.match(content)
+        if not m:
+            return False
+        rest = content[m.end():]
+        has_calls = bool(msg.get("tool_calls"))
+        if not rest.strip() and not has_calls:
+            return False                 # nothing else to show: leave it to the non-answer logic
+        if prompt and _THINK_TAG_IN_PROMPT_RE.search(str(prompt)):
+            return False                 # the user is asking ABOUT these tags
+        if not msg.get("reasoning_content"):
+            msg["reasoning_content"] = m.group(2).strip()
+        msg["content"] = rest if rest.strip() else (None if has_calls else rest)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _strip_leaked_think_data(data, pid, prompt):
+    """_strip_leaked_think_msg for a chat-completions body served by `pid`."""
+    try:
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        return _strip_leaked_think_msg(msg, relay=_is_relay_pid(pid), prompt=prompt)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _recap_text(dropped):
     """The dropped turns as recap input. Tool-call-only turns are one line each
     ("called read_file(...)"): they carry no prose, so they used to vanish from
@@ -42954,6 +43004,7 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
         return None
     spid, smodel, data, msg = served
     _ensure_tool_call_ids(msg)
+    _strip_leaked_think_msg(msg, relay=_is_relay_pid(spid), prompt=_last_user_text_for_check(body))
     # A model that FAILED, STALLED or lost the stall race this turn is not a
     # second opinion -- keep every pair we already dispatched to off the
     # verifier pool (the producer is excluded by verify.pick_verifier anyway).
@@ -42964,6 +43015,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     if corrected:
         spid, smodel, data, msg = corrected
         _ensure_tool_call_ids(msg)
+        _strip_leaked_think_msg(msg, relay=_is_relay_pid(spid),
+                                prompt=_last_user_text_for_check(body))
     if _client_gone():
         return None
     _bandit_remember(msg.get("tool_calls"), spid, smodel, kind)
@@ -45953,6 +46006,7 @@ def _chat_completions_uncached(body):
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
+            _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
             # The CLIENT sees the size of the request it sent, not of the
             # compacted one (usage_history above keeps the real upstream count).
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
@@ -47067,6 +47121,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
+            _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, messages,
@@ -48080,6 +48135,7 @@ def v1_messages():
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
+            _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
             _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, oai_messages,

@@ -160,10 +160,17 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://inference.dahl.global/account",
         "key_hint": "dahl_...",
         # NOT no_key (inference 401s "Missing API token" without a Bearer) and NOT
-        # static_key either: every key owns its OWN private 100M-token pool, so a
-        # key shared in this repo would burn one allowance for all users. The key
-        # is free and instant — see KEY_MINT_URL below.
-        "key_mint_url": "https://inference.dahl.global/tokens",
+        # static_key either: a key shared in this repo would burn one allowance for all
+        # users.
+        # ACCOUNTS (read 2026-10-24, inference.dahl.global/docs + the owner's dashboard):
+        # Dahl moved from anonymous per-key allowances to ACCOUNTS. "Account keys start
+        # empty": you create an account (/account), open "Tokens & keys", create a key and
+        # ALLOCATE tokens to it from your pool (the dashboard showed 100.0M tokens). A key
+        # with nothing allocated answers HTTP 402 "available tokens exhausted" and
+        # GET /tokens/current says available_tokens: 0 -- which is exactly what the owner's
+        # saved key did while his pool was full. The old one-click anonymous mint
+        # (POST /tokens -> a key with 100M) is therefore NOT relied on any more: no
+        # key_mint_url, so the card shows a plain "Get a free key" link to the account page.
         "balance_url": "https://inference.dahl.global/tokens/current",
         # 'all' is CORRECT and must stay: docs state "There is no payment UI yet",
         # the entire 2-model catalog is served from the same free allowance, and
@@ -185,7 +192,7 @@ PROVIDERS: Dict[str, dict] = {
         # "Vision", but a data-URI image is SILENTLY DROPPED — 200 OK,
         # prompt_tokens counts the text only, and the model answers "I cannot see
         # an image". It fails unsafely, so we must not route images here.
-        "notes": "Free 100,000,000 tokens PER KEY (not per month) on the decentralized Gonka network. OpenAI-compatible, streaming works. The key is instant and anonymous — no email, no card. When a key is spent it returns 402 'available tokens exhausted'; mint another. Sends NO rate-limit headers and publishes no per-minute/hour/day request cap (48 concurrent requests all returned 200), so the token pool is the only budget. Check the balance with GET /tokens/current. GLM-5.2 is listed as coming soon but 400s today. Kimi K2.6 256K ctx, MiniMax M2.7 200K ctx (marketing page figures — /v1/models exposes no context field).",
+        "notes": "Free: the first 100,000,000 tokens are free (per account pool, read 2026-10-24). KEYS START EMPTY: create an account at inference.dahl.global/account, open \"Tokens & keys\", create an API key and ALLOCATE tokens to it from your pool. Until you do, every request answers HTTP 402 \"available tokens exhausted\" and GET /tokens/current shows available_tokens: 0 -- that is an empty key, not a dead provider, and a brand-new key is just as empty until you allocate. OpenAI-compatible, streaming works; sends no rate-limit headers and publishes no request cap, so the token pool is the only budget. Context: MiniMax M2.7 200K (marketing page figure; /v1/models exposes no context field)."
     },
     "nvidia": {
         "name": "NVIDIA NIM",
@@ -1480,7 +1487,7 @@ PROVIDERS: Dict[str, dict] = {
         # All four are in the live catalog (read 2026-10-24); open-weight models only.
         "default_free_models": ["deepseek-v4.1-flash", "glm-5.3-flash",
                                 "mimo-v2.6-flash", "qwen3.8-27b"],
-        "notes": "ACTIVATE THE FREE TOKENS FIRST: sign up at freemodel.in, then in your dashboard verify your account with Telegram (join through Telegram as the dashboard asks). Until you do, every request is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models. That is NOT a dead provider. Do not add a payment method. VERIFIED WORKING 2026-10-24: after the Telegram verification the hub's Test ran a real generation on glm-5.3-flash and the canary answered correctly. Free plan = 1,000,000 tokens per month (prompt + reply), same catalog on every plan; 1M TOKENS A MONTH IS SMALL: one coding-agent turn re-sends 30-100K tokens, so expect about 15-30 of those per month, or hundreds of short chats; when it runs out the gateway answers HTTP 402 and the hub parks the provider until it recovers. Best kept for short turns and as a fallback. CAUTION: third-party gateway with no company details, crypto-only payment and a catalog listing Claude Opus 5.5 / Fable / Mythos / GPT-5.6 Sol at about $0.056 per million input tokens, which no genuine resale can sustain: treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes open-weight ids as free. Its /v1/models is public but SLOW (31 s for 53 ids when read), so discovery may fall back to the pinned ids."
+        "notes": "ACTIVATE THE FREE TOKENS FIRST: this provider NEEDS TELEGRAM ACTIVATION to enable the free 1M tokens per month. Sign up at freemodel.in, then in your dashboard verify your account with Telegram (join through Telegram as the dashboard asks). Until you do, every request is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models. That is NOT a dead provider. Do not add a payment method. VERIFIED WORKING 2026-10-24: after the Telegram verification the hub's Test ran a real generation on glm-5.3-flash and the canary answered correctly. Free plan = 1,000,000 tokens per month (prompt + reply), same catalog on every plan; 1M TOKENS A MONTH IS SMALL: one coding-agent turn re-sends 30-100K tokens, so expect about 15-30 of those per month, or hundreds of short chats; when it runs out the gateway answers HTTP 402 and the hub parks the provider until it recovers. Best kept for short turns and as a fallback. CAUTION: third-party gateway with no company details, crypto-only payment and a catalog listing Claude Opus 5.5 / Fable / Mythos / GPT-5.6 Sol at about $0.056 per million input tokens, which no genuine resale can sustain: treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes open-weight ids as free. Its /v1/models is public but SLOW (31 s for 53 ids when read), so discovery may fall back to the pinned ids."
     },
     "puter": {
         "name": "Puter",

@@ -101,3 +101,10 @@ def test_zenmux_keys_are_created_on_the_pay_as_you_go_page():
     z = P.PROVIDERS["zenmux"]
     assert z["signup_url"] == "https://zenmux.ai/platform/pay-as-you-go"
     assert "zenmux.ai/platform/pay-as-you-go" in z["notes"]
+
+
+def test_opencode_zen_sits_in_the_paid_group_on_the_page():
+    # Owner 2026-10-24: its free tier only works inside OpenCode, so it belongs under "Paid".
+    src = open("templates/index.html", encoding="utf-8").read()
+    assert "var PURE_PAID = { openai: 1, anthropic: 1, higgsfield: 1, 'opencode-zen': 1 };" in src
+    assert P.PROVIDERS["opencode-zen"]["paid"] is True
