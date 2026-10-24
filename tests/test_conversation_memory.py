@@ -206,6 +206,38 @@ def test_the_same_text_is_stored_once(tmp_path):
         b.close()
 
 
+def test_memory_survives_a_restart(tmp_path):
+    """OWNER 2026-10-24, persistence #2+#3: reopening a conversation later and
+    surviving a hub restart / auto-update. The archive is a file on disk; a
+    FRESH Archive on the same path (a new hub process after a restart) still has
+    every item and rule and resolves the SAME memory_key -- so a conversation
+    whose old tool output was cleared before the restart can still fetch its
+    originals back, and the model continues with its context intact."""
+    p = str(tmp_path / "persist.db")
+    before = convmem.Archive(lambda: p)
+    try:
+        before.put_many(CONV, [_item(
+            "the deploy command was: npm run build && node server.js")])
+        before.add_rules(CONV, ["Always deploy from the project root.",
+                                "PROJECT = billtrack"])
+        key = before.memory_key(CONV)
+        assert before.stats()["items"] == 1
+    finally:
+        before.close()                           # the hub shuts down / auto-updates
+    after = convmem.Archive(lambda: p)            # a fresh hub process, same file
+    try:
+        assert after.memory_key(CONV) == key                     # same capability key
+        assert after.stats()["items"] == 1                       # the item survived
+        hits = after.search(key, "deploy command")
+        assert hits and any("npm run build" in h["excerpt"] for h in hits)
+        assert "node server.js" in after.get_text(key, hits[0]["id"])
+        rules = after.rules(CONV)
+        assert any("project root" in r for r in rules)
+        assert any("billtrack" in r for r in rules)
+    finally:
+        after.close()
+
+
 def test_the_repeating_history_costs_no_queries(arch, monkeypatch):
     """A CLI resends the whole history every turn; the second look at a text
     already filed must not touch the database."""
