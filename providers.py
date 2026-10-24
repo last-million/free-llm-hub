@@ -1494,12 +1494,14 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://radoxai.com/v1",
         "models_url": "https://radoxai.com/v1/models",
         "signup_url": "https://radoxai.com/register",
-        "key_hint": "sk-...",
+        # Radox keys are "cc_" + 48 characters (docs/getting-started; the owner's own key too) --
+        # the marketing page showed "sk-" placeholders.
+        "key_hint": "cc_...",
         "free_filter": "family",
         "free_families": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-27b", "seed-2.1-turbo"],
         "default_free_models": ["deepseek-v4-flash-0731", "qwen3.8-27b",
                                 "seed-2.1-turbo", "deepseek-v4-pro-0813"],
-        "notes": "Third-party gateway, free plan = 500,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: same page template, model list and claims as codecraftapi.com and freemodel.in, no company details, crypto accepted, and it claims Claude/GPT models it cannot be verified to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids as free; any Claude/GPT id stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test.",
+        "notes": "Third-party gateway, free plan = 500,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: same page template, model list and claims as codecraftapi.com and freemodel.in, no company details, crypto accepted, and it claims Claude/GPT models it cannot be verified to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids as free; any Claude/GPT id stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test. TESTED 2026-10-24 with a real key: it authenticates and lists 33 models, but EVERY generation is refused with HTTP 402 'Billing verification failed. Please check your payment method.' — not the documented 402 insufficient_funds, and against the pricing page's '0.5M tokens, no card required'. Do not add a payment method to unlock it; ask their dashboard support ticket first.",
     },
     "freemodel": {
         "name": "FreeModel",
