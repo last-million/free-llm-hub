@@ -103,50 +103,59 @@ def test_new_rows_carry_their_own_date_and_source_and_exact_figures():
     sonnet = B.agentic_evidence("claude-sonnet-5.5")
     k31 = B.agentic_evidence("moonshotai/kimi-k3.1-pro")
     argon = B.agentic_evidence("gemini-4-argon")
-    assert (opus["tb4"], sonnet["tb4"], k31["tb4"]) == (59.6, 63.6, 67.2)
-    assert (k31["automation"], argon["automation"]) == (73.3, 77.5)
+    assert (opus["tb4"], sonnet["tb4"], k31["tb4"], argon["tb4"]) == (59.6, 63.6, 67.2, 57.1)
+    assert (opus["automation"], sonnet["automation"], k31["automation"], argon["automation"]) == (
+        69.5, 71.8, 73.3, 77.5)
     assert (opus["aa"], sonnet["aa"], k31["aa"], argon["aa"]) == (58, 56, 55, 53)
+    # Kimi K3.1 Pro was last touched on 2026-10-23; the three rows completed from the
+    # pages' embedded chart data carry the day they were read
+    assert k31["date"] == "2026-10-23"
+    for ev in (opus, sonnet, argon):
+        assert ev["date"] == "2026-10-24"
     for ev in (opus, sonnet, k31, argon):
-        assert ev["date"] == "2026-10-23" and "artificialanalysis.ai" in ev["source"]
+        assert "artificialanalysis.ai" in ev["source"]
     # the older rows keep the module-level snapshot stamp
     assert B.agentic_evidence(GLM53)["date"] == B.DATE
 
 
 def test_a_figure_the_page_did_not_show_is_none_never_guessed():
-    # Argon's page showed AutomationBench only. Its Terminal-Bench 4.0 hole is
-    # filled by the rule every newer release follows ("at least as good as the
-    # one it replaces"): the newest OLDER gemini row (3.8 flash, TB4.0 20), and
-    # the row says where the number came from -- it is never a made-up figure.
+    # 2026-10-24: the figures the 10-23 reading called "NOT FOUND" were in the pages'
+    # embedded chart data, so Argon's Terminal-Bench 4.0 is its OWN 57.1 (it used to
+    # borrow gemini-3.8-flash's 20) and Opus / Sonnet carry their AutomationBench.
     argon = B.agentic_evidence("gemini-4-argon")
-    assert argon["tb4"] == 20 and argon["inherited_fields"] == {"tb4": "gemini-3.8-flash"}
-    assert B.agentic_delta(argon) == pytest.approx(B.TB_WEIGHT * 0.20 + B.AUTO_WEIGHT * 0.775)
-    assert A._ev_agentic_bonus("gemini-4-argon") > A._ev_agentic_bonus("gemini-3.8-flash")
-    assert tool("google", "gemini-4-argon") > tool("google", "models/gemini-3.8-flash")
-    # no older Claude row exists, so Claude's AutomationBench hole stays a hole
-    assert B.agentic_evidence("claude-opus-5.5")["automation"] is None
+    assert argon["tb4"] == 57.1 and "inherited_fields" not in argon
+    assert B.agentic_delta(argon) == pytest.approx(B.TB_WEIGHT * 0.571 + B.AUTO_WEIGHT * 0.775)
+    assert A._ev_agentic_bonus("gemini-4-argon") > A._ev_agentic_bonus("gemini-3.8-flash") + 3
+    assert tool("google", "gemini-4-argon") > tool("google", "models/gemini-3.8-flash") + 3
+    # a figure a page really does not show is still None, never guessed
+    assert B.agentic_evidence("gpt-5.6-terra")["automation"] is None       # not on AutomationBench-AA
+    assert B.agentic_evidence("gemini-3.1-pro")["automation"] is None
     assert B.general_evidence("moonshotai/kimi-k3.1-pro")["arena"] is None
-    # NOT FOUND on the AA pages -> no row, the family floor stands
-    for mid in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "claude-fable-5.1",
-                "claude-haiku-5.5", "nvidia/nemotron-3.5-super-vl-120b-a12b"):
+    # NO row on purpose: Sol 6.0 (AA lists no figures) and Nemotron (no modelrank family)
+    for mid in ("gpt-6-sol", "nvidia/nemotron-3.5-super-vl-120b-a12b", "nemotron-3-ultra"):
         assert B.agentic_evidence(mid) is None, mid
+        assert B.general_evidence(mid) is None, mid
+    assert A._ev_agentic_bonus("nvidia/nemotron-3.5-super-vl-120b-a12b") == 0.0
 
 
 def test_claude_now_earns_the_agentic_bonus_glm_has_always_had():
     glm = A._ev_agentic_bonus(GLM53)
-    assert A._ev_agentic_bonus("claude-opus-5.5") == pytest.approx(5.96)
-    assert A._ev_agentic_bonus("claude-sonnet-5.5") == pytest.approx(6.36)
+    assert A._ev_agentic_bonus("claude-opus-5.5") == pytest.approx(5.96 + 0.695)
+    assert A._ev_agentic_bonus("claude-sonnet-5.5") == pytest.approx(6.36 + 0.718)
     assert A._ev_agentic_bonus("claude-opus-5.5") > glm
-    # a 4-point TB4.0 gap Sonnet over Opus is 0.4 -- smaller than the owner's
-    # 0.6 chat gap, so Opus stays ahead of Sonnet on tool turns too
+    # a 4-point TB4.0 gap Sonnet over Opus (+0.023 AutomationBench) is 0.42 --
+    # smaller than the owner's 0.6 chat gap, so Opus stays ahead of Sonnet on tool
+    # turns too (by ~0.18)
     first_party = {m: tool("anthropic", m) for m in ("claude-opus-5.5", "claude-sonnet-5.5")}
     assert first_party["claude-opus-5.5"] > first_party["claude-sonnet-5.5"]
 
 
 def test_new_ids_inherit_their_predecessors_evidence_plus_a_bump():
-    for new, old in (("claude-opus-6", "claude-opus-5.5"), ("claude-sonnet-5.6", "claude-sonnet-5.5"),
-                     ("moonshotai/kimi-k3.2", "moonshotai/kimi-k3.1-pro")):
+    for new, old, day in (("claude-opus-6", "claude-opus-5.5", "2026-10-24"),
+                          ("claude-sonnet-5.6", "claude-sonnet-5.5", "2026-10-24"),
+                          ("moonshotai/kimi-k3.2", "moonshotai/kimi-k3.1-pro", "2026-10-23")):
         ev = B.agentic_evidence(new)
-        assert ev["inherited_from"] == old and ev["date"] == "2026-10-23", new
+        assert ev["inherited_from"] == old and ev["date"] == day, new
         assert B.agentic_delta(ev) == pytest.approx(B.agentic_delta(B.agentic_evidence(old)))
         assert ev["floor_bump"] > 0
     # K3.1 Pro used to inherit K3's tb4=13 (a 54-point understatement)
@@ -313,9 +322,23 @@ def test_lunas_keep_their_own_order_when_the_reachable_flagship_is_older(monkeyp
 
 
 def test_borrowed_figures_are_labelled_in_the_tracking_view():
-    view = A._ev_agentic_evidence_view("gemini-4-argon")
-    assert view["tb4"] == 20 and view["inherited_fields"] == {"tb4": "gemini-3.8-flash"}
-    assert "inherited_fields" not in A._ev_agentic_evidence_view("claude-opus-5.5")
+    # no listed row has a hole any more (Argon's TB4.0 is read), so the fill rule is
+    # exercised on a synthetic one: a newer listed gemini with no TB4.0 figure
+    real = B.TABLE
+    rows = dict(real)
+    rows["gemini-4.1-argon"] = {"tb4": None, "automation": 80.0, "aa": 54, "arena": 1530.0,
+                                "date": "2026-11-01", "source": "synthetic"}
+    B.TABLE = rows
+    B.reset()
+    try:
+        view = A._ev_agentic_evidence_view("gemini-4.1-argon")
+        assert view["tb4"] == 57.1 and view["inherited_fields"] == {"tb4": "gemini-4-argon"}
+        assert view["automation"] == 80.0
+        assert "inherited_fields" not in A._ev_agentic_evidence_view("claude-opus-5.5")
+        assert "inherited_fields" not in A._ev_agentic_evidence_view("gemini-4-argon")
+    finally:
+        B.TABLE = real
+        B.reset()
 
 
 def test_a_small_release_never_anchors_the_flagship_line(monkeypatch):
@@ -461,3 +484,184 @@ def test_aa_finds_a_listed_model_behind_a_relay_prefix_or_a_moe_size_tail(monkey
     # exact keys only: a dense size must never read as the flagship
     assert A._aa_score_for("qwen/qwen3.8-14b") is None
     assert A._aa_score_for("something-else") is None
+
+
+
+# =========================================================================== #
+# 9. 2026-10-24: GPT-6.x, Fable, Haiku and Gemini Pro rows (chart data, not prose)
+# =========================================================================== #
+# id -> (Terminal-Bench 4.0 %, AutomationBench-AA %, AA Index (integer), LMArena).
+# Read from artificialanalysis.ai's embedded chart data (the visible prose names only the
+# top three); the Max / headline variant of each, as Opus and Sonnet 5.5 do.
+NEW_ROWS = {
+    "gpt-6-astra": (59.1, 68.5, 53, 1475.5),
+    "gpt-6.1-sol": (56.1, 64.9, 52, 1479.4),
+    "gpt-6-luna": (12.6, 53.2, 38, 1441.0),
+    "gpt-5.6-terra": (35.4, None, 42, 1467.1),
+    "claude-fable-5.1": (52.0, 59.4, 53, 1502.6),
+    "claude-haiku-5.5": (32.8, 35.4, 43, 1424.6),
+    "gemini-3.1-pro": (4.0, None, 30, 1486.8),
+}
+
+
+@pytest.mark.parametrize("mid", sorted(NEW_ROWS))
+def test_each_new_row_carries_its_exact_figures_date_and_source(mid):
+    tb, auto, aa, arena = NEW_ROWS[mid]
+    ev = B.agentic_evidence(mid)
+    gen = B.general_evidence(mid)
+    assert (ev["tb4"], ev["automation"]) == (tb, auto)
+    assert (gen["aa"], gen["arena"]) == (aa, arena)
+    assert ev["date"] == "2026-10-24" and "inherited_from" not in ev and "inherited_fields" not in ev
+    assert "artificialanalysis.ai/evaluations/terminalbench-4-0" in ev["source"]
+    assert "embedded chart data" in ev["source"]
+    if auto is None:
+        assert "No AutomationBench-AA entry" in ev["source"]
+    else:
+        assert "artificialanalysis.ai/evaluations/automationbench-aa" in ev["source"]
+
+
+def test_the_headline_variant_is_used_never_the_best_scoring_effort_level():
+    # Astra Xhigh reads TB4.0 59.6 and Fable 5.1 Xhigh 55.1; the Max entries the chart
+    # selects by default read 59.1 and 52.0, and those are the rows
+    assert B.agentic_evidence("gpt-6-astra")["tb4"] == 59.1
+    assert B.agentic_evidence("claude-fable-5.1")["tb4"] == 52.0
+    for mid in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "claude-haiku-5.5"):
+        assert "(Max)" in B.agentic_evidence(mid)["source"], mid
+    assert "(Max, Default Fallback)" in B.agentic_evidence("claude-fable-5.1")["source"]
+    # Haiku 5.5 has no Max entry on LMArena: its High entry is labelled as such, with
+    # the (later) board it was pulled from
+    src = B.general_evidence("claude-haiku-5.5")["source"]
+    assert "Claude Haiku 5.5 (High)" in src and "2026-10-22" in src
+
+
+def test_gpt_6_sol_never_borrows_astras_numbers():
+    # gpt-6-astra and gpt-6-sol parse to the same (gpt, '', 6.0); the page lists no
+    # figures for Sol 6.0, so it must not be answered with Astra's
+    assert R.parse("gpt-6-sol") == R.parse("gpt-6-astra")
+    for mid in ("gpt-6-sol", "openai/gpt-6-sol", "srv_ab12cd34ef56:openai/gpt-6-sol"):
+        assert B.agentic_evidence(mid) is None and B.general_evidence(mid) is None, mid
+        assert A._ev_agentic_evidence_view(mid) is None and A._ev_general_evidence_view(mid) is None
+        assert A._ev_agentic_bonus(mid) == 0.0
+    assert A._ev_agentic_evidence_view("gpt-6-astra")["tb4"] == 59.1
+    # the same line from a newer release, or no codename at all, still reads the line's row
+    for mid in ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1"):
+        ev = B.agentic_evidence(mid)
+        assert ev["tb4"] == 56.1, mid
+    assert B.agentic_evidence("gpt-6.2-sol")["inherited_from"] == "gpt-6.1-sol"
+    # the boards' own order (Arena: Sol 6.0 1458.8 under Astra 1475.5) now shows on tool turns
+    assert tool("anthropic", "gpt-6-astra") - tool("anthropic", "gpt-6-sol") > 5
+    assert chat("anthropic", "gpt-6-astra") == pytest.approx(chat("anthropic", "gpt-6-sol"))
+
+
+def test_gpt_6_terra_inherits_the_5_6_terra_row_it_does_not_read_a_figure():
+    ev = B.agentic_evidence("gpt-6-terra")
+    assert ev["inherited_from"] == "gpt-5.6-terra" and ev["tb4"] == 35.4 and ev["floor_bump"] > 0
+    assert A._ev_agentic_evidence_view("gpt-6-terra")["inherited_from"] == "gpt-5.6-terra"
+    assert A._ev_agentic_evidence_view("gpt-5.6-terra").get("inherited_from") is None
+    # ...and still sits under the flagship line (terra is the middle tier)
+    assert tool("anthropic", "gpt-6-terra") < tool("anthropic", "gpt-6-astra")
+
+
+def test_unlisted_newer_versions_inherit_and_rank_above_their_predecessors(monkeypatch):
+    pairs = (("claude-fable-5.2", "claude-fable-5.1"), ("claude-haiku-5.6", "claude-haiku-5.5"),
+             ("gpt-6.2-astra", "gpt-6.1-sol"), ("gpt-6.1-luna", "gpt-6-luna"),
+             ("gpt-5.7-terra", "gpt-5.6-terra"))
+    _fleet(monkeypatch, [i for p in pairs for i in p] + ["claude-opus-5.5", "gpt-6.1-sol"])
+    for new, old in pairs:
+        ev = B.agentic_evidence(new)
+        row = B.agentic_evidence(old)
+        assert ev["inherited_from"] in (old, "gpt-6.1-sol"), new
+        assert ev["floor_bump"] > 0, new
+        assert B.agentic_delta(ev) == pytest.approx(B.agentic_delta(row)), new
+        assert tool("anthropic", new) >= tool("anthropic", old) - 1e-9, (new, old)
+        assert chat("anthropic", new) >= chat("anthropic", old) - 1e-9, (new, old)
+
+
+def test_pro_is_never_scored_under_its_flash_cut_and_3_1_pro_keeps_its_own_row():
+    own = B.agentic_evidence("gemini-3.1-pro")
+    assert own["tb4"] == 4.0 and "inherited_from" not in own
+    assert B.general_evidence("gemini-3.1-pro")["aa"] == 30
+    flash = B.agentic_evidence("gemini-3.8-flash")
+    for pro in ("gemini-3.8-pro", "models/gemini-3.9-pro", "gemini-4-pro"):
+        ev = B.agentic_evidence(pro)
+        assert ev["inherited_from"] == "gemini-3.8-flash", pro
+        assert ev["tb4"] == flash["tb4"] == 20 and B.general_evidence(pro)["aa"] == 41, pro
+        assert A._ev_agentic_bonus(pro) >= A._ev_agentic_bonus("gemini-3.1-pro") + 2, pro
+    # scores of the later pros are the ones they had before the 3.1 Pro row existed
+    assert A._ev_agentic_bonus("gemini-3.8-pro") == pytest.approx(2.6)
+    assert A._ev_agentic_bonus("gemini-3.1-pro") == pytest.approx(0.4)
+
+
+def test_a_stronger_pro_line_wins_over_the_flash_line_for_a_newer_pro():
+    real = B.TABLE
+    rows = dict(real)
+    rows["gemini-3.9-pro"] = {"tb4": 70.0, "automation": 80.0, "aa": 55, "arena": 1520.0,
+                              "date": "2026-11-01", "source": "synthetic"}
+    B.TABLE = rows
+    B.reset()
+    try:
+        exact = B.agentic_evidence("gemini-3.9-pro")
+        assert exact["tb4"] == 70.0 and "inherited_from" not in exact      # an exact pro row is kept
+        newer = B.agentic_evidence("gemini-4-pro")
+        assert newer["inherited_from"] == "gemini-3.9-pro" and newer["tb4"] == 70.0
+    finally:
+        B.TABLE = real
+        B.reset()
+
+
+def test_the_new_rows_never_lift_a_small_tier_in_chat(monkeypatch):
+    # the board floor is a max(): it cannot lift a model whose owner floor already sits
+    # above it. Checked with and without the flagship that anchors the small tier.
+    fleets = (["gpt-6-luna"], ["gpt-6-luna", "gpt-5.4"], ["claude-haiku-5.5"],
+              ["claude-haiku-5.5", "claude-fable-5.1"], ["gpt-5.6-terra"], ["gpt-5.6-terra", "gpt-6-luna"],
+              ["gemini-3.1-pro"], ["gemini-3.1-pro", "gemini-3.8-flash"], ["gemini-3.1-pro", "gemini-3.8-pro"],
+              ["claude-fable-5.1"], ["gpt-6-astra"], ["gpt-6.1-sol"], ["gpt-6.1-sol", "gpt-6-luna", "claude-haiku-5.5"])
+    real = B.TABLE
+    without = {k: v for k, v in real.items() if k not in NEW_ROWS}
+    try:
+        for ids in fleets:
+            got = {}
+            for label, table in (("with", real), ("without", without)):
+                B.TABLE = table
+                B.reset()
+                _fleet(monkeypatch, ids)
+                got[label] = {(m, pid): chat(pid, m) for m in ids for pid in ("anthropic", RELAY)}
+            assert got["with"] == pytest.approx(got["without"]), ids
+    finally:
+        B.TABLE = real
+        B.reset()
+
+
+def test_tool_turn_order_with_the_new_rows():
+    t = {m: tool("anthropic", m) for m in (
+        "claude-opus-5.5", "claude-sonnet-5.5", "claude-fable-5.1", "claude-haiku-5.5", "gpt-6-astra",
+        "gpt-6.1-sol", "gpt-6-luna", "gemini-4-argon", "gemini-3.8-flash", "moonshotai/kimi-k3.1-pro")}
+    assert t["claude-opus-5.5"] > t["claude-sonnet-5.5"]                   # Opus stays over Sonnet
+    assert t["claude-opus-5.5"] - t["claude-sonnet-5.5"] == pytest.approx(0.177, abs=0.01)
+    assert t["claude-opus-5.5"] > max(t["gpt-6-astra"], t["gpt-6.1-sol"], t["claude-fable-5.1"])
+    # Fable has its own Terminal-Bench row now: inside the auto band of Opus instead of ~6 behind
+    assert t["claude-opus-5.5"] - t["claude-fable-5.1"] < A._AUTO_TOP_BAND
+    # the small tiers sit far under their flagships (Haiku under Sonnet, Luna under Astra)
+    assert t["claude-sonnet-5.5"] - t["claude-haiku-5.5"] > 8
+    assert t["gpt-6-astra"] - t["gpt-6-luna"] > 8
+    # Argon's own TB4.0 (57.1, not gemini-3.8-flash's 20) puts it between Kimi K3.1 Pro and GLM 5.3
+    assert t["moonshotai/kimi-k3.1-pro"] > t["gemini-4-argon"] > tool(GLM53_PID, GLM53)
+    assert t["gemini-4-argon"] > t["gemini-3.8-flash"] + 3
+
+
+def test_relay_copies_of_the_new_rows_still_get_no_board_bonus():
+    for mid in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "claude-fable-5.1", "claude-haiku-5.5"):
+        assert tool(RELAY, mid) == pytest.approx(chat(RELAY, mid)), mid
+    seed_healthy(RELAY, "gpt-6-astra")
+    assert A._relay_proven(RELAY, "gpt-6-astra")
+    assert tool(RELAY, "gpt-6-astra") == pytest.approx(tool("anthropic", "gpt-6-astra"))
+
+
+def test_nemotron_figures_are_recorded_not_wired():
+    # modelrank knows no nemotron family, so a benchmarks row would be ignored -- and
+    # a parsed one would lift a 26-point model through the 133.0 board floor
+    for mid in ("nvidia/nemotron-3.5-super-vl-120b-a12b", "nemotron-3-ultra-550b-a55b", "nemotron-3.5-lightning"):
+        assert R.parse(mid) is None
+        assert B.agentic_evidence(mid) is None and B.general_evidence(mid) is None
+        assert chat("nvidia", mid) < 100
+    assert not [m for m, _ in B.rows() if "nemotron" in m]

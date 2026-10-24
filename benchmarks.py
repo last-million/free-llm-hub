@@ -63,51 +63,156 @@ TABLE = {
 
 # Rows read LATER than the snapshot above carry their own source/date (the
 # module-level SOURCE/DATE are only the default). Every number below was read
-# from the page named in "source" on 2026-10-23 -- none is estimated. A field
-# the page did not show is None (never guessed): the model then keeps its
-# family floor for that kind of evidence.
-#   * Terminal-Bench 4.0 (artificialanalysis.ai/evaluations/terminalbench-4-0,
-#     AA harness): the page text exposes ONLY the top three of 32 charted
-#     models -- Kimi K3.1 Pro 67.2, Claude Sonnet 5.5 (Max, Default Fallback)
-#     63.6, Claude Opus 5.5 (Max, Default Fallback) 59.6. No other model's TB4.0
-#     figure was readable (GPT-6.x, Fable, Haiku, Gemini, Nemotron: NOT FOUND, so
-#     they carry no row and keep their family floor).
-#   * AutomationBench-AA (artificialanalysis.ai/evaluations/automationbench-aa):
-#     top three only -- Gemini 4 Argon (High) 77.5, Kimi K3.1 Pro 73.3,
-#     MiniMax-M3.1-Flash 72.5 (MiniMax is a speed cut with no TB4.0/AA figure
-#     read, so it is not listed).
-#   * AA Intelligence Index v4.3.2 (artificialanalysis.ai/leaderboards/models):
-#     Opus 5.5 58 (max, fallback), Sonnet 5.5 56 (max, fallback), Kimi K3.1 Pro
-#     55, Gemini 4 Argon 53 (high). LMArena text (arena.ai board of 2026-10-20,
-#     the hub's arena_scores.json): claude-opus-5-5-(high) 1508.8,
-#     claude-sonnet-5-5-(xhigh) 1477.1, gemini-4-argon-(high) 1523.9; Kimi K3.1
-#     Pro has no Arena row.
+# from the page named in "source" -- none is estimated. A field the page did not
+# show is None (never guessed): the model then keeps its family floor for that
+# kind of evidence.
+#
+# HOW THE FIGURES WERE READ (2026-10-24; this SUPERSEDES the 2026-10-23 note that
+# only the top three of 32 charted models were readable). The visible prose of an
+# artificialanalysis.ai evaluation page names only the top three, but the same
+# page ships the data behind its chart (the Next.js payload: one object per
+# charted model with terminalBench40, automationBenchPartialScore,
+# intelligenceIndex). The top-three sentence the page prints ("Gemini 4 Argon
+# (High) scores the highest on AutomationBench-AA with a score of 77.5%, followed
+# by Kimi K3.1 Pro with 73.3% ...") equals that payload's field to the decimal, so
+# the field IS the board's own score. GPT-6 Astra's 59.1 / 68.5 were found a
+# second time in the payload of its per-model page (artificialanalysis.ai/models/
+# gpt-6-astra, which prints its Index as 53). The variant is the board's HEADLINE
+# one ("Max", the entry the chart selects by default; Opus / Sonnet 5.5 read
+# "(Max, Default Fallback)"), never the best-scoring effort level: Fable 5.1
+# Xhigh reads TB4.0 55.1 against Max 52.0, Astra Xhigh 59.6 against Max 59.1.
+#   * Terminal-Bench 4.0 (artificialanalysis.ai/evaluations/terminalbench-4-0, AA
+#     harness, 32 charted entries): Kimi K3.1 Pro 67.2, Claude Sonnet 5.5 63.6,
+#     Claude Opus 5.5 59.6 (both Max, Default Fallback), GPT-6 Astra (Max) 59.1,
+#     Gemini 4 Argon (High) 57.1, GPT-6.1 Sol (Max) 56.1, Claude Fable 5.1 (Max,
+#     Default Fallback) 52.0, Claude Haiku 5.5 (Max) 32.8, GPT-6 Luna (Max) 12.6.
+#     The models index (artificialanalysis.ai/leaderboards/models, 272 models) adds
+#     GPT-5.6 Terra (Max) 35.4 and Gemini 3.1 Pro Preview 4.0.
+#   * AutomationBench-AA (artificialanalysis.ai/evaluations/automationbench-aa;
+#     the page's "AutomationBench-AA" score = its partial score): Gemini 4 Argon
+#     (High) 77.5, Kimi K3.1 Pro 73.3, Sonnet 5.5 71.8, Opus 5.5 69.5, Astra 68.5,
+#     Sol 6.1 64.9, Fable 5.1 59.4, Luna 53.2, Haiku 5.5 35.4 (MiniMax-M3.1-Flash
+#     72.5 NOT added: a speed cut with no other figure). GPT-5.6 Terra and Gemini
+#     3.1 Pro are not among its 32 charted entries -> None.
+#   * AA Intelligence Index v4.3.2 (artificialanalysis.ai/leaderboards/models),
+#     rounded to the integer the site prints (Opus 5.5 57.6 -> 58): Opus 58,
+#     Sonnet 56, Kimi K3.1 Pro 55, Argon 53, Astra 52.7 -> 53, Fable 5.1 53.4 ->
+#     53, Sol 6.1 51.8 -> 52, Haiku 5.5 43.4 -> 43, Terra 5.6 42.1 -> 42, Luna
+#     38.1 -> 38, Gemini 3.1 Pro 29.7 -> 30.
+#   * LMArena text (the hub's arena_scores.json = lmarena-ai/leaderboard-dataset,
+#     text_style_control, overall, board published 2026-10-20): claude-opus-5-5-
+#     (high) 1508.8, claude-sonnet-5-5-(xhigh) 1477.1, gemini-4-argon-(high)
+#     1523.9, claude-fable-5-1-(max) 1502.6, gpt-6-1-sol-(max) 1479.4,
+#     gpt-6-astra-(max) 1475.5, gpt-6-luna-(max) 1441.0, gpt-5-6-terra-(xhigh)
+#     1467.1, gemini-3-1-pro 1486.8. Claude Haiku 5.5 has no row in that copy; the
+#     same dataset pulled live (datasets-server.huggingface.co/rows, board
+#     published 2026-10-22) lists "Claude Haiku 5.5 (High)" 1424.6 (no Max entry).
+#     Kimi K3.1 Pro has no Arena row.
+# NO ROW on purpose (read 2026-10-24, kept here as a record):
+#   * Nemotron -- AA Index / TB4.0: 3.5 Super VL 26.5 / 0.0 (AutomationBench
+#     14.8), 3 Ultra 550B-A55B 22.9 / 0.5, 3.5 Lightning 12.9 / 0.5, 3.5 Bolt
+#     74B-A9B 21.4 / 0.0; LMArena 3 Ultra 1426.3, 3.5 Super VL 1414.2, 3.5
+#     Lightning 1353.2. modelrank.parse knows no nemotron family, so a row would be
+#     ignored; and were it parsed, the general floor (133.0 at the bottom of the
+#     AA / Arena range) would LIFT a 26-point model into the strong band. Nemotron
+#     keeps the AA-cache path (app._aa_score_for) and its last-resort tail; its
+#     TB4.0 is ~0, so no agentic points are lost.
+#   * GPT-6 Sol 6.0 (AA lists only a "Daybreak Blue" variant with no figures) and
+#     GPT-6 Terra (no such entry on AA or LMArena): no row. _evidence refuses to
+#     answer gpt-6-sol with gpt-6-astra's figures although both parse as (6, 0).
+#   * Claude Haiku 4.5, Fable 5.0: older than a listed row of the same line and
+#     absent from the AA lists.
 _AA_TB4 = "https://artificialanalysis.ai/evaluations/terminalbench-4-0"
 _AA_AUTO = "https://artificialanalysis.ai/evaluations/automationbench-aa"
 _AA_IDX = "https://artificialanalysis.ai/leaderboards/models"
-_ROW_DATE = "2026-10-23"
+_ROW_DATE = "2026-10-23"          # Kimi K3.1 Pro (unchanged since)
+_ROW_DATE_2 = "2026-10-24"        # every row read or completed on 2026-10-24
 TABLE.update({
     "claude-opus-5.5": {
-        "tb4": 59.6, "automation": None, "aa": 58, "arena": 1508.8,
-        "date": _ROW_DATE,
-        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AA Index "
-                  "v4.3.2 %s; LMArena claude-opus-5-5-(high)" % (_AA_TB4, _AA_IDX)},
+        "tb4": 59.6, "automation": 69.5, "aa": 58, "arena": 1508.8,
+        "date": _ROW_DATE_2,
+        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AutomationBench-AA "
+                  "(Max, Default Fallback) %s; AA Index v4.3.2 %s; LMArena "
+                  "claude-opus-5-5-(high)" % (_AA_TB4, _AA_AUTO, _AA_IDX)},
     "claude-sonnet-5.5": {
-        "tb4": 63.6, "automation": None, "aa": 56, "arena": 1477.1,
-        "date": _ROW_DATE,
-        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AA Index "
-                  "v4.3.2 %s; LMArena claude-sonnet-5-5-(xhigh)" % (_AA_TB4, _AA_IDX)},
+        "tb4": 63.6, "automation": 71.8, "aa": 56, "arena": 1477.1,
+        "date": _ROW_DATE_2,
+        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AutomationBench-AA "
+                  "(Max, Default Fallback) %s; AA Index v4.3.2 %s; LMArena "
+                  "claude-sonnet-5-5-(xhigh)" % (_AA_TB4, _AA_AUTO, _AA_IDX)},
     "moonshotai/kimi-k3.1-pro": {
         "tb4": 67.2, "automation": 73.3, "aa": 55, "arena": None,
         "date": _ROW_DATE,
         "source": "AA Terminal-Bench 4.0 %s; AutomationBench-AA %s; AA Index "
                   "v4.3.2 %s" % (_AA_TB4, _AA_AUTO, _AA_IDX)},
     "gemini-4-argon": {
-        "tb4": None, "automation": 77.5, "aa": 53, "arena": 1523.9,
-        "date": _ROW_DATE,
-        "source": "AutomationBench-AA (High) %s; AA Index v4.3.2 (high) %s; "
-                  "LMArena gemini-4-argon-(high). No Terminal-Bench 4.0 figure "
-                  "was readable" % (_AA_AUTO, _AA_IDX)},
+        "tb4": 57.1, "automation": 77.5, "aa": 53, "arena": 1523.9,
+        "date": _ROW_DATE_2,
+        "source": "AA Terminal-Bench 4.0 (High) %s; AutomationBench-AA (High) %s; AA "
+                  "Index v4.3.2 (high) %s; LMArena gemini-4-argon-(high)"
+                  % (_AA_TB4, _AA_AUTO, _AA_IDX)},
+})
+
+# Rows read 2026-10-24 (GPT-6.x, Fable, Haiku, Gemini Pro; see the note above).
+_ARENA_COPY = "LMArena %s (arena_scores.json copy, board published 2026-10-20)"
+_FROM_CHART = " Read from the pages' embedded chart data."
+
+
+def _src(variant, tb=True, auto=True, arena=None, arena_note=_ARENA_COPY):
+    """The source string of a 2026-10-24 row (fields not on a page are left out)."""
+    parts = []
+    if tb:
+        parts.append("AA Terminal-Bench 4.0 (%s) %s" % (variant, _AA_TB4))
+    if auto:
+        parts.append("AutomationBench-AA (%s) %s" % (variant, _AA_AUTO))
+    parts.append("AA Index v4.3.2 %s" % _AA_IDX)
+    if arena:
+        parts.append(arena_note % arena)
+    return "; ".join(parts) + "." + _FROM_CHART
+
+
+TABLE.update({
+    "gpt-6-astra": {
+        "tb4": 59.1, "automation": 68.5, "aa": 53, "arena": 1475.5,
+        "date": _ROW_DATE_2,
+        "source": _src("Max", arena="gpt-6-astra-(max)")
+                  + " GPT-6 Sol 6.0 does not share this row."},
+    "gpt-6.1-sol": {
+        "tb4": 56.1, "automation": 64.9, "aa": 52, "arena": 1479.4,
+        "date": _ROW_DATE_2,
+        "source": _src("Max", arena="gpt-6-1-sol-(max)")},
+    "gpt-6-luna": {
+        "tb4": 12.6, "automation": 53.2, "aa": 38, "arena": 1441.0,
+        "date": _ROW_DATE_2,
+        "source": _src("Max", arena="gpt-6-luna-(max)")},
+    "gpt-5.6-terra": {
+        # GPT-6 Terra does not exist on the boards: this is the 5.6 Terra row, and
+        # a gpt-6-terra would INHERIT it (inherited_from), not read a figure.
+        "tb4": 35.4, "automation": None, "aa": 42, "arena": 1467.1,
+        "date": _ROW_DATE_2,
+        "source": _src("Max", auto=False, arena="gpt-5-6-terra-(xhigh)")
+                  + " No AutomationBench-AA entry."},
+    "claude-fable-5.1": {
+        "tb4": 52.0, "automation": 59.4, "aa": 53, "arena": 1502.6,
+        "date": _ROW_DATE_2,
+        "source": _src("Max, Default Fallback", arena="claude-fable-5-1-(max)")},
+    "claude-haiku-5.5": {
+        "tb4": 32.8, "automation": 35.4, "aa": 43, "arena": 1424.6,
+        "date": _ROW_DATE_2,
+        "source": _src("Max", arena="Claude Haiku 5.5 (High)",
+                       arena_note="LMArena %s (same dataset pulled live, board "
+                                  "published 2026-10-22; no Max entry)")},
+    "gemini-3.1-pro": {
+        # The Preview. Not on the AutomationBench-AA page -> None. A newer pro
+        # (3.8 / 4) never reads this row when its own flash line scores higher
+        # (see _evidence): pro >= flash is the owner's rule.
+        "tb4": 4.0, "automation": None, "aa": 30, "arena": 1486.8,
+        "date": _ROW_DATE_2,
+        "source": "AA Terminal-Bench 4.0 (Gemini 3.1 Pro Preview) %s; AA Index v4.3.2 "
+                  "%s; LMArena %s.%s No AutomationBench-AA entry."
+                  % (_AA_TB4, _AA_IDX,
+                     "gemini-3-1-pro (arena_scores.json copy, board published "
+                     "2026-10-20)", _FROM_CHART)},
 })
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +350,57 @@ def _fill_from_older(out, parsed, size, ver):
         pass
 
 
+_LINE_CODENAMES = ("astra", "sol")
+
+
+def _line_codename(low):
+    """The GPT flagship-line codename an id names ('astra' / 'sol'), else None.
+    modelrank reads both as ONE untiered line, so gpt-6-astra and gpt-6-sol parse
+    to the same (family, tier, version)."""
+    try:
+        toks = set(re.split(r"[^a-z0-9]+", low or ""))
+        for name in _LINE_CODENAMES:
+            if name in toks:
+                return name
+    except Exception:
+        pass
+    return None
+
+
+def _resolve(group, parsed, low, size):
+    """Evidence for `parsed` from ONE version group -> (row id, evidence dict) or
+    None: its exact row, the newest row plus a version bump for a newer unlisted
+    release, or None (older / between rows)."""
+    ver = tuple(parsed.version)
+    if ver in group:
+        mid, ev = group[ver]
+        if parsed.family == "gpt" and not parsed.tier:
+            # gpt-6-sol is NOT gpt-6-astra: the same (6, 0) key, but the page
+            # that gave Astra its figures lists none for Sol 6.0. Answering with
+            # Astra's numbers would present them as Sol's (/api/tracking) and
+            # settle the owner's open Sol-vs-Astra call by accident.
+            a, b = _line_codename(low), _line_codename(str(mid).lower())
+            if a and b and a != b:
+                return None
+        out = dict(ev)
+        out.setdefault("source", SOURCE)
+        out.setdefault("date", DATE)
+        out["floor_bump"] = 0.0
+        _fill_from_older(out, parsed, size, ver)
+        return mid, out
+    newest = max(group)                             # highest listed version
+    if ver > newest:                                # a newer, unlisted release
+        mid, ev = group[newest]
+        out = dict(ev)
+        out.setdefault("source", SOURCE)
+        out.setdefault("date", DATE)
+        out.update(inherited_from=mid,
+                   floor_bump=max(0.0, min((_vnum(ver) - _vnum(newest))
+                                           * _INHERIT_PER_VERSION, _INHERIT_MAX)))
+        return mid, out
+    return None                                     # older / between -> no evidence
+
+
 def _evidence(model_id):
     """The raw evidence row for a model id, with inheritance. Returns a dict
     {tb4, automation, aa, arena, source, date[, inherited_from, floor_bump]} or
@@ -254,37 +410,31 @@ def _evidence(model_id):
         if p is None:
             return None
         low = str(model_id or "").lower()
-        gkey = (p.family, p.tier, _size_of(low))
-        group = _groups().get(gkey)
-        if not group and p.tier == "pro":
+        size = _size_of(low)
+        groups = _groups()
+        group = groups.get((p.family, p.tier, size))
+        hit = _resolve(group, p, low, size) if group else None
+        if p.tier == "pro":
             # A vendor's PRO cut is never ranked under its own FLASH cut (owner
-            # rule: "gemini pro is better than gemini flash"). With no row for
-            # the pro line, it takes the flash line's evidence -- the least the
-            # boards support, and nothing invented: without this a pro id scored
-            # NOTHING on a tool turn while its flash sibling scored +2.6.
-            group = _groups().get((p.family, "flash", gkey[2]))
-        if not group:
-            return None
-        ver = tuple(p.version)
-        if ver in group:
-            mid, ev = group[ver]
-            out = dict(ev)
-            out.setdefault("source", SOURCE)
-            out.setdefault("date", DATE)
-            out["floor_bump"] = 0.0
-            _fill_from_older(out, p, gkey[2], ver)
-            return out
-        newest = max(group)                         # highest listed version
-        if ver > newest:                            # a newer, unlisted release
-            mid, ev = group[newest]
-            out = dict(ev)
-            out.setdefault("source", SOURCE)
-            out.setdefault("date", DATE)
-            out.update(inherited_from=mid,
-                       floor_bump=max(0.0, min((_vnum(ver) - _vnum(newest))
-                                               * _INHERIT_PER_VERSION, _INHERIT_MAX)))
-            return out
-        return None                                 # older / between -> no evidence
+            # rule: "gemini pro is better than gemini flash"). The flash line's
+            # evidence is the least the boards support for a pro id of the same
+            # or a later release, and nothing is invented: without this a pro id
+            # scored NOTHING on a tool turn while its flash sibling scored +2.6.
+            # A pro row listed from an OLDER generation (Gemini 3.1 Pro: TB4.0
+            # 4.0) must not drag a newer pro (3.8 / 4) under that flash cut, so
+            # an unlisted pro takes whichever line is stronger on EITHER kind of
+            # evidence; an EXACT pro row always keeps its own figures.
+            flash_group = groups.get((p.family, "flash", size))
+            fhit = _resolve(flash_group, p, low, size) if flash_group else None
+            if fhit is not None:
+                exact_pro = hit is not None and "inherited_from" not in hit[1]
+                if not exact_pro and (
+                        hit is None
+                        or agentic_delta(fhit[1]) > agentic_delta(hit[1])
+                        or (general_rank(fhit[1]) or 0.0) > (general_rank(hit[1]) or 0.0)):
+                    hit = (fhit[0], dict(fhit[1]))
+                    hit[1].setdefault("inherited_from", fhit[0])
+        return hit[1] if hit is not None else None
     except Exception:
         return None
 

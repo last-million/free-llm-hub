@@ -5695,11 +5695,18 @@ rank right automatically."
   row (`_fill_from_older`, recorded in `inherited_fields`): Argon takes
   gemini-3.8-flash's TB 20, so a newer Gemini no longer scores under its older
   sibling. A pro cut with no row takes its flash line's evidence (pro >= flash).
+  SUPERSEDED 2026-10-24 (see "Board rows for GPT-6.x, Fable, Haiku and Gemini Pro" just
+  below): the pages' chart data carries all 32 models, so "top 3 only" and
+  "NOT FOUND" no longer hold for GPT-6.x, Fable, Haiku or Gemini Pro (only Nemotron stays
+  unwired), and Argon reads its own TB4.0 57.1 instead of borrowing 20.
 - **Tool-turn order now** (first-party / healthy): Opus 5.5 144.0 > Sonnet 5.5
   143.8 (Opus stays 0.2 over Sonnet) > Kimi K3.1 Pro 141.8 > GLM 5.3 138.9 > GLM
   5.3 Flash 137.5 > Gemini 4 Argon 137.1 > Gemini 3.8 Flash 136.7. Unlisted newer
   ids inherit their predecessor's evidence + a bump (claude-opus-6,
   claude-sonnet-5.6, kimi-k3.2, glm-5.4 ...).
+  SUPERSEDED 2026-10-24: Opus 144.7 > Sonnet 144.5 (0.18 apart) > GPT-6 Astra 143.6 >
+  Fable 143.5 > Sol 6.1 143.5 > Kimi K3.1 Pro 141.8 > Argon 140.8 > GLM 5.3 138.9 > GLM
+  5.3 Flash 137.5 > Gemini 3.8 Flash 136.7 (table in the 2026-10-24 section).
 - **GPT codename tiers** (`modelrank`): `luna` = the small tier, `terra` =
   middle, matched as whole tokens; sol / astra / `gpt-N.M` are one flagship line;
   an unknown codename gets no tier (version only, no invented score). Luna sits
@@ -5759,6 +5766,8 @@ rank right automatically."
   `agentic_evidence` now carries `inherited_fields` so it is never shown as a page
   reading. Without it Argon would trail 3.8 Flash on tool turns (135.1 vs 136.7);
   drop the fill if you prefer that order.
+  SUPERSEDED 2026-10-24: Argon's own TB4.0 (57.1) was read; nothing is borrowed any more.
+  `_fill_from_older` stays for a future listed row with a hole.
 - **Owner's world vs the tables**: the table below scores every copy as reachable.
   With the production anchor filter and the owner's ledger loaded (dead stubs are
   not anchors), the relay flagships sit at tool 126-129 (reliability penalty), the
@@ -5772,6 +5781,8 @@ rank right automatically."
   Arena #1 and AA 53 (= Astra) yet sits at 134.3 under the gpt ladder per the
   2026-07-31 "claude > gpt > gemini" order; Fable (AA 53 < Sonnet 56) has no TB
   row so it trails Opus/Sonnet by ~6 on tool turns.
+  SUPERSEDED 2026-10-24 for Fable: its own TB4.0 52.0 / AutomationBench 59.4 are read, so it
+  now sits inside the auto band of Opus on tool turns.
 
 | id (chat / tool) | first-party | g4f relay, untried |
 | --- | --- | --- |
@@ -5783,6 +5794,105 @@ rank right automatically."
 | gemini-4-argon | 134.07 / 134.07 -> 134.30 / 137.08 | 130.3 |
 | z-ai/glm-5.3 (nvidia) | 134.03 / 138.85 (same) | 130.03 / 134.85 |
 | kimi-k3.1-pro | 134.1 / 136.0 -> 134.3 / 141.8 | - |
+
+## Board rows for GPT-6.x, Fable, Haiku and Gemini Pro (2026-10-24)
+
+Covered by `tests/test_ranking_frontier.py` section 9 (hermetic; no network). Owner:
+"fill the missing benchmark figures for GPT-6.x, Fable, Haiku, Gemini pro and Nemotron
+where a public figure exists" -- only numbers read from a real page.
+
+- **The 10-23 "top 3 of 32 only" claim is SUPERSEDED.** The visible prose of an
+  artificialanalysis.ai evaluation page names three models, but the same page ships
+  the data behind its chart (the Next.js payload: one object per charted model with
+  `terminalBench40`, `automationBenchPartialScore`, `intelligenceIndex`). Checked three
+  ways: (1) the printed sentence "Gemini 4 Argon (High) scores the highest on
+  AutomationBench-AA with a score of 77.5%, followed by Kimi K3.1 Pro 73.3% ..." equals
+  the payload's partial score to the decimal, and the Terminal-Bench top three (67.2 /
+  63.6 / 59.6) equal `terminalBench40`; (2) every Terminal-Bench / AutomationBench / Index
+  figure the 10-23 worker typed in matches the payload; (3) GPT-6 Astra's 59.1 / 68.5 appear again in the payload of its per-model
+  page, which prints its Index as 53 (payload 52.7). The 32 entries of the
+  Terminal-Bench 4.0 page all carry both scores; `artificialanalysis.ai/leaderboards/models`
+  (272 models) carries `terminalBench40` for 133 of them and the Index for nearly all, but
+  no AutomationBench.
+- **Rows added** (variant = the board's headline "Max" entry the chart selects by default,
+  never the best-scoring effort level: Fable 5.1 Xhigh would read TB 55.1 against Max
+  52.0, Astra Xhigh 59.6 against Max 59.1; AA Index rounded to the integer the site prints;
+  Arena from the hub's `arena_scores.json`, board published 2026-10-20, except Haiku):
+
+| id | TB4.0 | AutomationBench-AA | AA | LMArena | variant |
+| --- | --- | --- | --- | --- | --- |
+| gpt-6-astra | 59.1 | 68.5 | 53 | 1475.5 | Max |
+| gpt-6.1-sol | 56.1 | 64.9 | 52 | 1479.4 | Max |
+| gpt-6-luna | 12.6 | 53.2 | 38 | 1441.0 | Max |
+| gpt-5.6-terra | 35.4 | - | 42 | 1467.1 | Max (Arena xHigh) |
+| claude-fable-5.1 | 52.0 | 59.4 | 53 | 1502.6 | Max, Default Fallback |
+| claude-haiku-5.5 | 32.8 | 35.4 | 43 | 1424.6 (High, board of 2026-10-22) | Max |
+| gemini-3.1-pro | 4.0 | - | 30 | 1486.8 | Preview |
+
+  Completed in rows that already existed: Opus 5.5 AutomationBench 69.5, Sonnet 5.5 71.8
+  (were empty), and **Gemini 4 Argon's Terminal-Bench 4.0 is its own 57.1** (it borrowed
+  gemini-3.8-flash's 20 through `_fill_from_older`; the fill rule stays, exercised on a
+  synthetic row). Those three rows are re-dated 2026-10-24.
+- **Recorded, not wired: Nemotron.** AA Index / TB4.0: 3.5 Super VL 26.5 / 0.0
+  (AutomationBench 14.8), 3 Ultra 550B 22.9 / 0.5, 3.5 Lightning 12.9 / 0.5, 3.5 Bolt
+  74B-A9B 21.4 / 0.0; LMArena 3 Ultra 1426.3, 3.5 Super VL 1414.2, 3.5 Lightning 1353.2.
+  `modelrank.parse` knows no nemotron family, so a `benchmarks` row would be silently
+  ignored, and a parsed one would LIFT a 26-point model through the 133.0 board floor.
+  Nemotron keeps the AA-cache path and the last-resort tail; TB4.0 ~0 means no agentic
+  points are lost (`test_nemotron_figures_are_recorded_not_wired`).
+- **No row, on purpose.** GPT-6 Sol 6.0 (AA lists only a "Daybreak Blue" variant with no
+  figures; Arena 1458.8), GPT-6 Terra (no such entry on AA or LMArena: `gpt-6-terra`
+  INHERITS the 5.6 Terra row with a bump, shown as `inherited_from`), Claude Haiku 4.5 and
+  Fable 5.0 (older than a listed row, absent from the AA lists), MiniMax-M3.1-Flash (a
+  speed cut). Gemini 3.8 Pro / any 4 Pro: AA lists no Pro after 3.1.
+- **Two guards in `benchmarks._evidence`** (the rows would have broken both rules):
+  1. *Codename*: `gpt-6-astra` and `gpt-6-sol` parse to the same (gpt, '', 6.0) key. Sol
+     6.0 must not be answered with Astra's figures (and shown so in `/api/tracking`), so
+     an exact-version hit whose id names the OTHER line codename is no evidence. A newer
+     release of either codename still inherits the newest line row (`gpt-6.2-sol` ->
+     `gpt-6.1-sol`), and so does a codename-less `gpt-6.1`.
+  2. *Pro >= flash*: with a Gemini 3.1 Pro row listed, an unlisted newer pro (3.8 / 3.9 /
+     4) would inherit that weak row (TB 4.0, AA 30) and score under its own flash sibling
+     (owner rule). An exact pro row always keeps its own figures; an unlisted pro takes
+     whichever of the pro line and the flash line is stronger on EITHER the agentic or the
+     general measure, marked `inherited_from`. Gemini 3.8-pro / 3.9-pro / 4-pro score
+     exactly what they did before.
+- **Effect (first-party, healthy fleet; sandbox import, nothing live touched).** Chat
+  scores are UNCHANGED for every model, in the full fleet and in anchor-less fleets (Luna
+  without a flagship, Haiku without Opus / Sonnet, Terra, 3.1 Pro alone): the board floor
+  is a `max()` and every owner floor already sits above it (`test_the_new_rows_never_lift_a_small_tier_in_chat`).
+  Tool turns move by the new bonus only; relay copies still get no board bonus unless
+  proven:
+
+| id | tool before -> after |
+| --- | --- |
+| claude-opus-5.5 | 143.96 -> 144.66 |
+| claude-sonnet-5.5 | 143.76 -> 144.48 (Opus stays 0.18 over Sonnet) |
+| gpt-6-astra | 137.0 -> 143.60 |
+| claude-fable-5.1 | 137.7 -> 143.49 (was ~6 behind Opus; now inside the 2.0 auto band) |
+| gpt-6.1-sol | 137.2 -> 143.46 |
+| moonshotai/kimi-k3.1-pro | 141.75 (same) |
+| gemini-4-argon | 137.08 -> 140.79 |
+| z-ai/glm-5.3 | 138.85 (same) |
+| gpt-5.6-terra / gpt-6-terra (inherited) | 133.3 -> 136.84 / 136.0 -> 139.54 |
+| claude-haiku-5.5 | 131.4 -> 135.03 |
+| gpt-6-luna | 131.0 -> 132.79 |
+| gemini-3.1-pro | 131.37 -> 131.77 |
+| gpt-6-sol (no row) | 137.0 (same; now 6.6 under Astra, the boards' own order) |
+
+- **Other places looked.** tbench.ai/leaderboard: the Terminal-Bench 4.0 table showed its
+  header and no data rows to the fetch tool (it may fill in client-side), so nothing was
+  taken from it. zapier.com/benchmarks (seen only in a search summary, not fetched): a
+  different AutomationBench scoring (strict, private held-out set, older models) -- not
+  mixed with AA's partial score.
+  The LMArena figures come from `lmarena-ai/leaderboard-dataset` (text_style_control,
+  overall) via the hub's cache; the live pull of 2026-10-22 moved Argon 1523.9 -> 1517.2 and
+  Opus / Sonnet by under 0.5 (existing rows left as read).
+- **Open owner call.** On tool turns GPT-6 Astra (143.60) and Sol 6.1 (143.46) now sit
+  within 1.2 points of Opus and level with Fable, because TB4.0 / AutomationBench rate
+  them there (Astra TB4.0 59.1 against Opus 59.6). The chat order (Claude 138 > GPT ladder) is
+  unchanged; if tool turns should also keep "Claude above GPT" regardless of the boards,
+  that needs a cap, not a figure.
 
 ## New providers, Together removed, and why cards read "all models dead" (2026-10-24)
 
