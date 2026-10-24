@@ -41,7 +41,7 @@ from typing import Optional
 _log = logging.getLogger("migrations")
 
 # The schema version this hub migrates UP TO. Bump when you add a step below.
-LATEST = 4
+LATEST = 5
 
 # Providers removed from the registry whose rows (and any keys) are carried
 # forward under ``retired_providers`` rather than left in the active map. Only
@@ -55,6 +55,9 @@ RETIRED_PROVIDERS = ("tokenrouter", "agentrouter")
 # the official billing docs say no free trial and a $5 minimum purchase), so the
 # owner had it removed. A separate tuple, because each retire step is version-gated.
 RETIRED_PROVIDERS_V4 = ("together",)
+# Retired by the v5 step (2026-10-24): CodeCraft and Radox AI. Their free tokens were never
+# activated (HTTP 402 "Billing verification failed"), so the owner had them removed.
+RETIRED_PROVIDERS_V5 = ("codecraft", "radoxai")
 
 # Remembered for the status route; set by the last run_migrations() of the
 # process (boot). Never holds a key value — counts and a backup path only.
@@ -151,11 +154,18 @@ def _to_v4(raw: dict) -> dict:
     return _retire_removed_providers(raw, RETIRED_PROVIDERS_V4)
 
 
+def _to_v5(raw: dict) -> dict:
+    """Release 2026-10-24: codecraft and radoxai left the registry; a saved row (and its
+    keys) moves to ``retired_providers`` verbatim, like v3 and v4."""
+    return _retire_removed_providers(raw, RETIRED_PROVIDERS_V5)
+
+
 # Ordered (target_version, id, fn). A step runs when the config's effective
 # start version is below target_version.
 _STEPS = (
     (3, "v3:rename_cli_multi_approval+retire_providers", _to_v3),
     (4, "v4:retire_together", _to_v4),
+    (5, "v5:retire_codecraft_radoxai", _to_v5),
 )
 
 

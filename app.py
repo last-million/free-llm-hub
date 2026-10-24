@@ -1818,11 +1818,11 @@ def _band_version_bump(major, minor, base_major, base_minor):
 # floors (see the end of _benchmark_score) — a bias added earlier would be wiped
 # by max(score, floor), which is exactly why g4f's relayed 'claude-sonnet-4'
 # inherited claude's full 138 and owned the top slot.
-# codecraft (2026-10-23): a pay-gateway with no company details that CLAIMS Claude
-# and GPT ids. Same class as g4f: discounted, and (via _rp_claim_pair) a claimed
-# Claude/GPT earns the discount-free lead only with a MEASURED healthy record.
-# radoxai / freemodel (2026-10-24): the same white-label gateway kit as codecraft.
-_RELAY_DISCOUNT = {"g4f": 4.0, "codecraft": 4.0, "radoxai": 4.0, "freemodel": 4.0}
+# freemodel (2026-10-24): a pay-gateway kit with no company details that CLAIMS Claude and GPT ids.
+# Same class as g4f: discounted, and (via _rp_claim_pair) a claimed Claude/GPT earns the
+# discount-free lead only with a MEASURED healthy record. (codecraft / radoxai, the same kit,
+# were removed the same day: their free tokens were never activated.)
+_RELAY_DISCOUNT = {"g4f": 4.0, "freemodel": 4.0}
 
 # PROVEN RELAY COPIES OF CLAUDE / GPT (2026-10-23, flag `relay_proven_lead`).
 # The relay discount says "a relay serves an id, it does not guarantee the
@@ -5121,6 +5121,35 @@ def _clear_provider_timeouts(pid):
     """One real answer means it is alive; the streak starts again from zero."""
     with _provider_dead_lock:
         _provider_timeout_fail.pop(pid, None)
+
+
+def _unpark_after_verified_generation(pid, ok_models=()):
+    """A Test made a REAL generation succeed: lift the provider-level park, the failure
+    counters that led to it, and the dead marks of the models that just answered.
+
+    REPORTED 2026-10-24 (ZenMux): the card said "Parked - back in 25m - parked 30 min after
+    4 consecutive failures (4xx)" next to "Key OK". All four saved keys answered HTTP 200
+    on both free models; the park dated from the old pay-as-you-go keys that 403'd, and a
+    passing Test only RECORDED its result. A verified generation is the strongest evidence
+    the hub gets, so it must not leave the provider sidelined. Only called on a PASSING Test
+    (a failing one lifts nothing); live traffic re-parks after four more hard failures.
+    Flag `test_unparks_provider` (default on). Never raises."""
+    try:
+        if not pid or not config.get_flag("test_unparks_provider", True):
+            return
+        with _provider_dead_lock:
+            _dead_providers.pop(pid, None)
+            _dead_provider_why.pop(pid, None)
+            _provider_consec_fail.pop(pid, None)
+            _provider_authfail.pop(pid, None)
+            _provider_keyfail.pop(pid, None)
+            _provider_timeout_fail.pop(pid, None)
+        with _dead_lock:
+            for m in (ok_models or ()):
+                if isinstance(m, str):
+                    _dead_models.pop((pid, m), None)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _is_provider_dead(pid):
@@ -10454,7 +10483,7 @@ _TOOL_PROVIDER_SHARE = 0.5           # of the request deadline, per provider
 _TOOL_PROVIDER_SHARE_HUGE = 0.75     # ...for a prompt past STREAM_HUGE_REQUEST_TOKENS
 _TOOL_PROVIDER_MIN_SECONDS = 60.0    # never a smaller per-provider allowance
 _TOOL_PROVIDER_MIN_HOP = 20.0        # never squeeze a capped hop below this
-_TOOL_RELAY_PIDS = ("g4f", "codecraft", "radoxai", "freemodel")
+_TOOL_RELAY_PIDS = ("g4f", "freemodel")
 _TOOL_RELAY_MAX_HOPS = 3             # relay hops per tool chain / walk
 _RELAY_TOOL_FAIL_TTL = 900.0         # seconds a relay-server failure is remembered
 _RELAY_TOOL_FAIL_LIMIT = 2           # failures in the TTL -> skipped on tool turns
@@ -18449,7 +18478,7 @@ _NEW_PROVIDER_IDS = frozenset((
     "deepinfra", "hyperbolic", "nebius", "cohere",
     "scaleway", "stepfun", "aion", "sealion", "requesty",
     "dahl",
-    "inception", "codecraft", "radoxai", "freemodel",       # added 2026-10-23/24
+    "inception", "freemodel",       # added 2026-10-23/24
     # Not a new provider, but newly NEEDING SETUP: g4f.space ended anonymous
     # access on 2026-08-06 (keyless chat now 402s "No cake credits"), so it
     # went from working-out-of-the-box to needing a free key from
@@ -18462,7 +18491,7 @@ _NEW_PROVIDER_IDS = frozenset((
 # the page sorts these ahead of every other Recommended card. A subset of the list above on
 # purpose -- the older "new" badges (g4f needing a key, the 2026-08 batch) keep their label
 # but no longer jump the queue.
-_FRESH_PROVIDER_IDS = frozenset(("inception", "codecraft", "radoxai", "freemodel"))
+_FRESH_PROVIDER_IDS = frozenset(("inception", "freemodel"))
 
 
 def _provider_quality_score(pid, free_models):
@@ -19113,6 +19142,8 @@ def api_test_provider(pid):
                 _log.debug("[test-cache] record failed for %s", pid, exc_info=True)
                 payload["new_models"] = []
                 payload["stale_models"] = []
+        if ok and cache:
+            _unpark_after_verified_generation(pid, [m for m, good in attempted if good])
         return jsonify(payload)
 
     # A provider mapped in _PROVIDER_RELAY_SUB_PID (empty since 2026-07-31)

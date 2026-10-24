@@ -5856,3 +5856,31 @@ Covered by `tests/test_inception_and_codecraft_providers.py`,
   Lesson: a 402 "Billing verification failed" from this gateway kit means ACTIVATE THE FREE TIER,
   it is not a dead provider -- do not remove one on that error alone. (A removal patch was written
   and discarded before commit; nothing was pushed.)
+- **DECISION, same day: CodeCraft and Radox AI removed, FreeModel kept.** Owner: "they don't give
+  free tokens anymore ... keep only FreeModel, and say on its card to activate with Telegram". Both
+  removed providers were the SAME kit as FreeModel and showed the same 402 until the free tokens are
+  activated; the owner chose not to activate them. Migration **v5** (`migrations.LATEST` 5) moves a
+  saved `codecraft` / `radoxai` row to `retired_providers` with its keys verbatim (FreeModel's row is
+  untouched). `_RELAY_DISCOUNT` is `{g4f, freemodel}`, `_TOOL_RELAY_PIDS` `(g4f, freemodel)`,
+  `_FRESH_PROVIDER_IDS` `{inception, freemodel}`. FreeModel's card notes START with "ACTIVATE THE FREE
+  TOKENS FIRST" (Telegram verification; a 402 "Billing verification failed" before it is not a dead
+  provider and is not fixed by a payment method), and the page's one-line pitch (`REC_NOTES`) says the
+  same on the face of the card. Providers in the registry: 61. The OpenCode CLI-relay provider was
+  declined by the owner.
+- **A passing Test lifts the provider's park (2026-10-24, ZenMux).** The card read "Parked - back in
+  25m - parked 30 min after 4 consecutive failures (4xx)" beside "Key OK"; all four saved keys answered
+  HTTP 200 on both free models. The park came from the old pay-as-you-go keys that 403'd, and a passing
+  Test only RECORDED its result. `_unpark_after_verified_generation` (called from the Test route's
+  `_finish` when `ok`) now clears `_dead_providers`, `_dead_provider_why`, the consecutive / auth / key /
+  timeout counters and the dead marks of the models that answered. A FAILING Test lifts nothing, and live
+  traffic re-parks after four more hard failures. Flag `test_unparks_provider` (default on). Covered by
+  `tests/test_a_passing_test_lifts_the_park.py`.
+- **Measured 2026-10-24 on the roles path (why "actor: no answer in time" repeats):** 8 big tool turns,
+  all answered, but 13 of 21 upstream calls (62%) were wasted. Request size is NOT the problem (median 49K
+  tokens, ~195 KB; the owner's uplink measured 53 KB/s, ~4 s per hop; `sent_tokens` in turn-roles.jsonl is
+  the SUM over a turn's calls, not one request). The 7 failed hops: 2 GLM-5.3 not answering in time, 2 on
+  the out-of-budget g4f backend `srv_mr9dda21...` (budget notices), 1 empty 200, 1 HTTP 500, 1 HTTP 404 (a
+  model that left the catalog). What the hub learns about slow first responses (`_tool_ttft`), resting pairs
+  (`_pair_rest`) and recent failures is IN MEMORY ONLY: only `_outcomes` / `_latencies` are saved
+  (perfstats), so every restart -- including every auto-update -- makes it re-discover that nvidia GLM-5.3
+  is silent for 30 s by failing again.

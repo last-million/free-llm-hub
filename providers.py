@@ -1048,15 +1048,17 @@ PROVIDERS: Dict[str, dict] = {
         "name": "ZenMux",
         "base_url": "https://zenmux.ai/api/v1",
         "models_url": "https://zenmux.ai/api/v1/models",
-        "signup_url": "https://zenmux.ai/settings/keys",
+        "signup_url": "https://zenmux.ai/platform/pay-as-you-go",
         "key_hint": "sk-...",
         "free_filter": "pricing_zero",
         # 2026-10-24: kimi-k2.7-code-free and glm-5.2-free no longer exist; the live
         # catalog's free ones are the two below (the per-key Test answered correctly
-        # on glm-4.6v-flash-free). Several keys on this provider are PAYG keys that
-        # 403 "no permission" on free models -- the Test shows which keys work.
+        # on glm-4.6v-flash-free). KEYS MUST COME FROM https://zenmux.ai/platform/pay-as-you-go
+        # (owner, 2026-10-24: the keys made there all answer HTTP 200 on both free models; the
+        # older keys made elsewhere got 403 "no permission", whose text says api_key_source: payg).
+        # The Test shows which of your keys work.
         "default_free_models": ["z-ai/glm-4.6v-flash-free", "z-ai/glm-4.7-flash-free"],
-        "notes": "Model router with free '-free' variants (GLM flash today). Free = zero-priced models. A key created as pay-as-you-go (api_key_source: payg) gets HTTP 403 'no permission' on the free models; press Test to see which of your keys work and remove the rest.",
+        "notes": "Model router with free '-free' variants (GLM flash today). Free = zero-priced models. Create the API key on https://zenmux.ai/platform/pay-as-you-go (keys made on other pages answered HTTP 403 'no permission' on the free models); press Test to see which of your keys work and remove the rest.",
     },
     "unorouter": {
         "name": "UnoRouter",
@@ -1444,65 +1446,27 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["mercury-3"],
         "notes": "Official API of Inception Labs, maker of the Mercury DIFFUSION LLMs (they generate many tokens in parallel, so replies are very fast). Every new key starts with 100,000,000 free tokens (one-time, no card required) and the free tier allows 1,000 requests/min, 1M input and 100K output tokens/min (docs checked 2026-10-23). Only zero-priced models are routed as free: today that is mercury-3 (1M context, tool calling). mercury-2 and mercury-2.5 (tool calling too) are billed models the free credit also covers — pin inception/mercury-2.5 to use them. If you add a card on the Billing page, the priced ones become billable. Quality: fast but mid-tier on the public boards (Artificial Analysis 60 for mercury-2, 61.5 for mercury-2.5; Arena 1342), so the hub uses it for quick turns and as a fast fallback, not as a flagship.",
     },
-    # ADDED 2026-10-23 at owner request ("add codecraftapi.com as provider, in the
-    # recommended list"). READ from codecraftapi.com the same day -- and this is a
-    # judgment call the owner made over these red flags, recorded so it is not lost:
-    #   * a paid, token-based OpenAI-compatible gateway ("33 models", only six shown);
-    #     base https://codecraftapi.com/v1, keys start "cc_", "1M tokens free every
-    #     month, no card" (prompt + reply combined), plans differ only in volume;
-    #   * NO company name/address/contact on the site, pays via crypto (Binance
-    #     Pay), claims frontier models (Claude Opus 4.8, Claude Fable 5, GPT-5.6
-    #     Luna) at gateway prices, and a web search found nothing independent about
-    #     the domain. Treat every claimed proprietary id as unproven.
-    #   * GET /v1/models answers 401 without a key, so the ids below come from the
-    #     marketing page, NOT from the API -- they are unverified until a key is added.
-    # So: relay class (see app._RELAY_DISCOUNT / _TOOL_RELAY_PIDS: 4-point discount,
-    # notice and dead-end gates, no board bonus for a claimed Claude/GPT until a
-    # MEASURED healthy record exists), and the free list is the open-weight ids only.
-    "codecraft": {
-        "name": "CodeCraft API",
-        # Hand-curated Recommended zone at the owner's explicit request.
-        "recommended": True,
-        "base_url": "https://codecraftapi.com/v1",
-        "models_url": "https://codecraftapi.com/v1/models",
-        "signup_url": "https://codecraftapi.com/register",
-        "key_hint": "cc_...",
-        "free_filter": "family",
-        "free_families": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-27b",
-                          "seed-2.1-turbo"],
-        "default_free_models": ["deepseek-v4-flash-0731", "qwen3.8-27b",
-                                "seed-2.1-turbo", "deepseek-v4-pro-0813"],
-        "notes": "Third-party gateway, free plan = 1,000,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: the site shows no company details, accepts crypto payments and claims Claude/GPT models it cannot be verified to be authorised to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids below as free; any Claude/GPT id it lists stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test, and if discovery shows different ids the free_families need updating. FREE TOKENS MUST BE ENABLED FIRST: in the provider's dashboard, verify your account with Telegram. Until then every generation is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models (no docs page mentions this step; confirmed on FreeModel 2026-10-24 by the owner, whose key then generated). Do not add a payment method.",
-    },
-    # ADDED 2026-10-24 at owner request ("add radoxai.com ... and freemodel.in, show
-    # them first in Recommended, labelled New"). READ from the two sites the same day.
-    # BOTH ARE THE SAME PRODUCT AS codecraftapi.com: identical page template, the same
-    # six model cards (gemma-2-2b, deepseek-v4-flash-0731, gpt-5.6-luna, deepseek-v4-pro-0813,
-    # qwen3.8-27b, seed-2.1-turbo), the same "31-33 models" claim, the same claude-opus-4.8
-    # sample and plan structure -- on DIFFERENT servers (radoxai.com and codecraftapi.com
-    # behind Cloudflare, freemodel.in on its own host), so one white-label gateway kit, not
-    # provably one operator. None names a company; crypto is accepted (freemodel.in: crypto
-    # only). freemodel.in's public /v1/models lists 53 ids incl. claude-opus-5-5,
-    # claude-fable-5-1, claude-mythos-preview, gpt-5.6-sol and gpt-6-luna at ~$0.056 per
-    # MILLION input tokens -- a price no genuine Opus/Sol resale can sustain, so every
-    # claimed Claude/GPT id is treated as unproven. Its catalog also took 31 s to download.
-    # Same handling as codecraft: relay class (app._RELAY_DISCOUNT / _TOOL_RELAY_PIDS) and
-    # only open-weight ids as free.
-    "radoxai": {
-        "name": "Radox AI",
-        "recommended": True,
-        "base_url": "https://radoxai.com/v1",
-        "models_url": "https://radoxai.com/v1/models",
-        "signup_url": "https://radoxai.com/register",
-        # Radox keys are "cc_" + 48 characters (docs/getting-started; the owner's own key too) --
-        # the marketing page showed "sk-" placeholders.
-        "key_hint": "cc_...",
-        "free_filter": "family",
-        "free_families": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-27b", "seed-2.1-turbo"],
-        "default_free_models": ["deepseek-v4-flash-0731", "qwen3.8-27b",
-                                "seed-2.1-turbo", "deepseek-v4-pro-0813"],
-        "notes": "Third-party gateway, free plan = 500,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: same page template, model list and claims as codecraftapi.com and freemodel.in, no company details, crypto accepted, and it claims Claude/GPT models it cannot be verified to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids as free; any Claude/GPT id stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test. FREE TOKENS MUST BE ENABLED FIRST: in the provider's dashboard, verify your account with Telegram. Until then every generation is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models (no docs page mentions this step; confirmed on FreeModel 2026-10-24 by the owner, whose key then generated). Do not add a payment method.",
-    },
+    # REMOVED 2026-10-24 at explicit owner request ("remove CodeCraft and Radox AI, they don't give
+    # free tokens anymore; keep only FreeModel"): codecraft (codecraftapi.com) and radoxai
+    # (radoxai.com). With a real key each authenticated, listed 33 models (all owned_by
+    # "cleanapis") and was even recognised as a free-plan account (X-Ratelimit-Limit 100 / 80),
+    # but EVERY generation was refused HTTP 402 {"code":"insufficient_quota","type":
+    # "insufficient_funds","message":"Billing verification failed. Please check your payment
+    # method."} -- five models, the hub's Test, and Bearer / x-api-key / both alike (a wrong key is
+    # 401, so it is not an auth-scheme problem). The cause is the same hidden activation step that
+    # FreeModel needed (Telegram verification of the free tokens, undocumented); the owner chose
+    # to drop the two rather than activate them. A saved key moves to config's `retired_providers`
+    # (migrations v5), never deleted. To re-add, start from: base_urls https://codecraftapi.com/v1
+    # and https://radoxai.com/v1; keys are "cc_" + 48 chars; free plans 1M and 0.5M tokens/month;
+    # free_filter family with open-weight ids only; relay class like freemodel below.
+    #
+    # KEPT: freemodel (freemodel.in), the same white-label kit on its own server (no company
+    # details, crypto-only payment; its public /v1/models lists 53 ids incl. claude-opus-5-5,
+    # claude-fable-5-1, gpt-5.6-sol at ~$0.056 per MILLION input tokens -- a price no genuine
+    # resale sustains, so every claimed Claude/GPT id is treated as unproven; the catalog took
+    # 31 s to download). VERIFIED WORKING 2026-10-24 once the owner enabled the free tokens with
+    # Telegram verification: a real generation on glm-5.3-flash, canary correct. Relay class
+    # (app._RELAY_DISCOUNT / _TOOL_RELAY_PIDS) and open-weight ids only as free.
     "freemodel": {
         "name": "FreeModel",
         "recommended": True,
@@ -1516,7 +1480,7 @@ PROVIDERS: Dict[str, dict] = {
         # All four are in the live catalog (read 2026-10-24); open-weight models only.
         "default_free_models": ["deepseek-v4.1-flash", "glm-5.3-flash",
                                 "mimo-v2.6-flash", "qwen3.8-27b"],
-        "notes": "Third-party gateway, free plan = 1,000,000 tokens per month (prompt + reply), no card, same catalog on every plan; usage beyond it bills your balance (empty balance = HTTP 402). Its /v1/models is public but SLOW (31 s for 53 ids when read), so discovery may fall back to the pinned ids. CAUTION: same page template, model list and claims as codecraftapi.com and radoxai.com, no company details, payment in crypto only, and a catalog of Claude Opus 5.5 / Fable / Mythos / GPT-5.6 Sol at ~$0.056 per million input tokens, which no genuine resale can sustain — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes open-weight ids as free. 1M TOKENS A MONTH IS SMALL (owner, 2026-10-24): one coding-agent turn re-sends 30-100K tokens, so expect about 15-30 of those per month, or hundreds of short chats; when it runs out the gateway answers HTTP 402 and the hub parks the provider until it recovers. Best kept for short turns and as a fallback. VERIFIED WORKING 2026-10-24: after the owner enabled the free tokens with Telegram verification, the hub's Test ran a real generation on glm-5.3-flash and the canary answered correctly. FREE TOKENS MUST BE ENABLED FIRST: in the provider's dashboard, verify your account with Telegram. Until then every generation is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models (no docs page mentions this step; confirmed on FreeModel 2026-10-24 by the owner, whose key then generated). Do not add a payment method.",
+        "notes": "ACTIVATE THE FREE TOKENS FIRST: sign up at freemodel.in, then in your dashboard verify your account with Telegram (join through Telegram as the dashboard asks). Until you do, every request is refused HTTP 402 \"Billing verification failed. Please check your payment method.\" even though the key authenticates and lists models. That is NOT a dead provider. Do not add a payment method. VERIFIED WORKING 2026-10-24: after the Telegram verification the hub's Test ran a real generation on glm-5.3-flash and the canary answered correctly. Free plan = 1,000,000 tokens per month (prompt + reply), same catalog on every plan; 1M TOKENS A MONTH IS SMALL: one coding-agent turn re-sends 30-100K tokens, so expect about 15-30 of those per month, or hundreds of short chats; when it runs out the gateway answers HTTP 402 and the hub parks the provider until it recovers. Best kept for short turns and as a fallback. CAUTION: third-party gateway with no company details, crypto-only payment and a catalog listing Claude Opus 5.5 / Fable / Mythos / GPT-5.6 Sol at about $0.056 per million input tokens, which no genuine resale can sustain: treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes open-weight ids as free. Its /v1/models is public but SLOW (31 s for 53 ids when read), so discovery may fall back to the pinned ids."
     },
     "puter": {
         "name": "Puter",

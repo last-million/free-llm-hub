@@ -127,7 +127,7 @@ def test_apply_is_idempotent():
 
 def test_schema_version_is_bumped_to_latest():
     new, _ = migrations.apply(old_config())
-    assert new["schema_version"] == migrations.LATEST == 4
+    assert new["schema_version"] == migrations.LATEST == 5
 
 
 def test_a_newer_config_is_not_downgraded():
@@ -184,7 +184,7 @@ def test_run_writes_backs_up_first_and_keeps_keys(cfgfile):
     report = migrations.run_migrations()
 
     assert report["ok"] and report["changed"]
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
     assert report["keys_count"] == 5
     # the pre-migration backup holds the ORIGINAL bytes -> it was taken first
     assert report["last_backup"] and os.path.isfile(report["last_backup"])
@@ -208,7 +208,7 @@ def test_run_is_idempotent_and_takes_no_second_backup(cfgfile):
     report2 = migrations.run_migrations()
 
     assert report2["ok"] and not report2["changed"]
-    assert report2["schema_version"] == 4
+    assert report2["schema_version"] == 5
     assert open(cfgfile, "rb").read() == bytes_after_first      # not rewritten
     backups_after_second = sorted(os.listdir(os.path.join(os.path.dirname(cfgfile),
                                                           "backups")))
@@ -232,7 +232,7 @@ def test_run_on_a_corrupt_file_leaves_it_untouched(cfgfile):
 
 
 def test_run_on_a_fresh_latest_config_does_nothing(cfgfile):
-    write_raw(cfgfile, {"schema_version": 4, "providers": {}, "cli_multi_approval": "off"})
+    write_raw(cfgfile, {"schema_version": 5, "providers": {}, "cli_multi_approval": "off"})
     before = open(cfgfile, "rb").read()
     report = migrations.run_migrations()
     assert report["ok"] and not report["changed"]
@@ -283,7 +283,7 @@ def test_config_reads_the_migrated_values(cfgfile):
     assert config.get_setting("cli_multi_approval") == "off"
     cfg = config.load_config()                                  # loads cleanly
     assert "groq" in cfg["providers"]
-    assert cfg["schema_version"] == 4
+    assert cfg["schema_version"] == 5
     assert set(cfg.get("retired_providers") or {}) == {"tokenrouter", "agentrouter"}
 
 
@@ -303,7 +303,7 @@ def test_status_has_the_four_fields(cfgfile):
     migrations.run_migrations()
     st = migrations.status()
     assert set(("schema_version", "applied", "last_backup", "keys_count")) <= set(st)
-    assert st["schema_version"] == 4
+    assert st["schema_version"] == 5
     assert st["keys_count"] == 5
 
 
@@ -373,3 +373,58 @@ def test_the_floor_in_config_stays_below_latest_so_an_early_save_cannot_skip_v4(
     # config stamps its own floor on every save; if that floor were already 4 a
     # save between boot and the migration would make the retirement look done.
     assert config.SCHEMA_VERSION < migrations.LATEST
+
+
+# --------------------------------------------------------------------------- #
+# v5 (2026-10-24): CodeCraft and Radox AI left the registry, their keys must not #
+# --------------------------------------------------------------------------- #
+REMOVED_V5 = ("codecraft", "radoxai")
+
+
+def v5_config(version=4):
+    return {"schema_version": version,
+            "providers": {"groq": {"api_keys": ["enc.v1:GROQ1"]},
+                          "codecraft": {"api_keys": ["enc.v1:CC1"], "enabled": True},
+                          "radoxai": {"api_keys": ["enc.v1:RX1", "enc.v1:RX2"]},
+                          "freemodel": {"api_keys": ["enc.v1:FM1"], "enabled": True}}}
+
+
+def test_v5_moves_codecraft_and_radoxai_to_retired_with_every_key():
+    new, applied = migrations.apply(v5_config())
+    retired = new["retired_providers"]
+    assert set(retired) == set(REMOVED_V5)
+    assert retired["codecraft"]["api_keys"] == ["enc.v1:CC1"]
+    assert retired["radoxai"]["api_keys"] == ["enc.v1:RX1", "enc.v1:RX2"]
+    assert applied == ["v5:retire_codecraft_radoxai"]
+    assert new["schema_version"] == migrations.LATEST
+
+
+def test_v5_leaves_freemodel_which_the_owner_kept_untouched():
+    new, _ = migrations.apply(v5_config())
+    assert new["providers"]["freemodel"] == {"api_keys": ["enc.v1:FM1"], "enabled": True}
+    assert "freemodel" not in new.get("retired_providers", {})
+    assert set(new["providers"]) == {"groq", "freemodel"}
+
+
+def test_v5_never_loses_a_key_and_is_idempotent():
+    cfg = v5_config()
+    before = migrations.key_fingerprint(cfg)
+    once, _ = migrations.apply(cfg)
+    twice, applied2 = migrations.apply(once)
+    assert twice == once and applied2 == []
+    assert migrations._keys_preserved(before, migrations.key_fingerprint(twice))
+
+
+def test_a_config_without_them_is_untouched_by_v5():
+    new, applied = migrations.apply({"schema_version": 4,
+                                     "providers": {"groq": {"api_keys": ["enc.v1:G"]}}})
+    assert applied == [] and "retired_providers" not in new
+
+
+def test_an_old_config_gets_v3_v4_and_v5_in_one_boot():
+    raw = old_config()
+    raw["providers"]["together"] = {"api_keys": ["enc.v1:T"]}
+    raw["providers"]["codecraft"] = {"api_keys": ["enc.v1:C"]}
+    new, _ = migrations.apply(raw)
+    assert set(new["retired_providers"]) == {"tokenrouter", "agentrouter", "together", "codecraft"}
+    assert "codecraft" not in new["providers"] and "together" not in new["providers"]

@@ -93,3 +93,11 @@ def test_together_is_gone_from_the_registry_and_the_badges():
     assert "together" not in P.PROVIDERS
     assert "together" not in A._NEW_PROVIDER_IDS
     assert P.get_provider("together") is None
+
+
+def test_zenmux_keys_are_created_on_the_pay_as_you_go_page():
+    # Owner 2026-10-24: only keys made at /platform/pay-as-you-go work on the free models; the
+    # card's "Get a free key" link and its note must send people there.
+    z = P.PROVIDERS["zenmux"]
+    assert z["signup_url"] == "https://zenmux.ai/platform/pay-as-you-go"
+    assert "zenmux.ai/platform/pay-as-you-go" in z["notes"]
