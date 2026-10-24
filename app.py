@@ -14881,11 +14881,20 @@ def _cmem_note_on():
     return _cmem_on() and _cmem_flag("conversation_memory_note")
 
 
+# The conversation key lives on Flask's `g`, which a FRESH thread (empty context)
+# does not have: _dispatch_chat_with_deadline -- the hop of the roles actor legs,
+# the swarm stages and the verifier -- starts one. It carries the key across in
+# this ContextVar, the way it carries _PIPELINE_MODE.
+_CMEM_CONV_VAR = contextvars.ContextVar("cmem_conv", default=None)
+
+
 def _cmem_conv():
     """The CLI's conversation key for this request (set by _ctx_begin), or None.
     Deliberately NOT the head-hash fallback the recap uses: that one changes
     every turn, which would orphan earlier stubs."""
     c = _ctx_g("_ctx_conv")
+    if not (isinstance(c, str) and c):
+        c = _CMEM_CONV_VAR.get()
     return c if isinstance(c, str) and c else None
 
 
@@ -14975,7 +14984,8 @@ def _cmem_items(messages, turns=None):
         elif role == "user":
             text = ctxwin.instruction_text(ctxwin.message_text(m))
             if (len(text) >= _CMEM_MIN_CALL_CHARS
-                    and not text.startswith(_CMEM_BRIEF_PREFIX)):
+                    and not text.startswith(_CMEM_BRIEF_PREFIX)
+                    and not ctxwin.is_compaction_request([m])):   # a CLI's own "summarise" prompt
                 items.append({"text": text, "kind": "user", "tool": "", "turn": turn})
     return items
 
@@ -39866,10 +39876,13 @@ def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     # A fresh thread starts with an EMPTY context: carry the pipeline's mode
     # across, so nothing below this hop can fall back to the global mode.
     mode = _PIPELINE_MODE.get()
+    cmem_conv = _cmem_conv()          # conversation memory: the key rides along too
 
     def _call():
         if mode is not None:
             _PIPELINE_MODE.set(mode)
+        if cmem_conv:
+            _CMEM_CONV_VAR.set(cmem_conv)
         try:
             box["resp"] = _dispatch_chat(pid, payload, False)
         except (requests.RequestException, RuntimeError) as exc:

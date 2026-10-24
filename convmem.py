@@ -403,6 +403,8 @@ class Archive:
         """True once the conversation has archived anything. Cheap."""
         if not conv:
             return False
+        if self._db is not None and self._db_path == self._path() and self._has.get(conv):
+            return True                     # the common case: no lock, no query
         with self._lock:
             db = self._conn()
             if db is None:
@@ -450,50 +452,64 @@ class Archive:
             return ids
 
     def _put_many(self, conv, items, ids):
+        # Phase 0, no lock: look at the items and hash them.
+        cands = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            text = it.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if text.startswith(ARCHIVE_LABEL) or text.startswith(
+                    "[tool output cleared by the hub"):
+                continue
+            cands.append((content_id(text), text, it))
+        if not cands:
+            return ids
+        # Phase 1, a brief lock: which of them does the archive not know yet?
         todo = []
         with self._lock:
             db = self._conn()               # first: a changed path resets the caches
             if db is None:
                 return ids
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                text = it.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                if text.startswith(ARCHIVE_LABEL) or text.startswith(
-                        "[tool output cleared by the hub"):
-                    continue
-                cid = content_id(text)
+            for cid, text, it in cands:
                 if (conv, cid) in self._seen:
                     self._seen.move_to_end((conv, cid))
                     ids.add(cid)
-                    continue
-                todo.append((cid, text, it))
-            if not todo:
+                else:
+                    todo.append((cid, text, it))
+        if not todo:
+            return ids
+        # Phase 2, no lock: the expensive text work (cap, credential redaction,
+        # encoding, chunking) for the new items only -- so one conversation's
+        # first big archive does not hold up every other conversation's calls.
+        rows = []
+        for cid, text, it in todo:
+            try:
+                body, withheld = self._redact(_cap_item(text))
+                body = body.encode("utf-8", "replace").decode("utf-8")
+                rows.append((cid, body, withheld, it, len(body.encode("utf-8", "replace")),
+                             _chunks(body)))
+            except Exception:                                    # noqa: BLE001
+                continue                    # cannot redact -> store nothing
+        if not rows:
+            return ids
+        # Phase 3, the lock: one transaction for the whole batch.
+        with self._lock:
+            db = self._conn()
+            if db is None:
                 return ids
             now = self._clock()
-            rows = []                       # prepared outside the transaction
-            for cid, text, it in todo:
-                try:
-                    body, withheld = self._redact(_cap_item(text))
-                    body = body.encode("utf-8", "replace").decode("utf-8")
-                except Exception:                                # noqa: BLE001
-                    continue                # cannot redact -> store nothing
-                rows.append((cid, body, withheld, it))
-            if not rows:
-                return ids
             try:
                 db.execute("BEGIN IMMEDIATE")
                 self._ensure_conv(db, conv, now)
                 added_bytes = 0
                 added_n = 0
                 fresh = []
-                for cid, body, withheld, it in rows:
+                for cid, body, withheld, it, nbytes, parts in rows:
                     kind = str(it.get("kind") or "text")[:24]
                     tool = str(it.get("tool") or "")[:200]
                     turn = it.get("turn")
-                    nbytes = len(body.encode("utf-8", "replace"))
                     cur = db.execute(
                         "INSERT OR IGNORE INTO items(conv, id, kind, tool, turn, ts, nchars, "
                         "nbytes, withheld) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -503,7 +519,7 @@ class Archive:
                         meta = (kind + " " + tool).strip()
                         db.executemany(
                             "INSERT INTO chunks(conv, id, seq, text, meta) VALUES(?,?,?,?,?)",
-                            [(conv, cid, i, ch, meta) for i, ch in enumerate(_chunks(body))])
+                            [(conv, cid, i, ch, meta) for i, ch in enumerate(parts)])
                         added_bytes += nbytes
                         added_n += 1
                     fresh.append(cid)

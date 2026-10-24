@@ -28,6 +28,8 @@ import ctxwin
 import hub_mcp
 from test_old_tool_result_clearing import (     # noqa: F401  (shared helpers)
     TOOLS, _Lcg, _Resp, _code_file, _history, _mini, _tool_call)
+from test_context_window_management import (    # noqa: F401  (imported fixture + helpers)
+    PINNED, _Resp as _CwmResp, _answer, _sse_chunks, quiet)
 
 CONV = "hdr:sess-1"
 FLAG_NAMES = ("conversation_memory", "conversation_memory_note")
@@ -858,6 +860,88 @@ def _hop(monkeypatch, messages, tools=TOOLS, budget=None, no_craft=False, header
     return posted[-1]
 
 
+@pytest.fixture
+def route(monkeypatch, quiet):
+    """The real /v1/chat/completions handler, chain, _dispatch_chat and
+    _upstream_chat, with only the provider's HTTP call faked."""
+    sent = []
+
+    def post(url=None, json=None, **kw):
+        sent.append(json)
+        return _CwmResp(200, _answer("Done."), chunks=_sse_chunks())
+    monkeypatch.setattr(A.config, "get_provider_config", lambda pid: {"api_keys": ["k"]})
+    monkeypatch.setattr(A, "_resolve_base_url", lambda pid, pcfg: "https://example.invalid/v1")
+    monkeypatch.setattr(A.requests, "post", post)
+    monkeypatch.setattr(A, "_post_with_header_deadline",
+                        lambda deadline, p, **kw: post(**kw))
+    monkeypatch.setattr(A, "_model_ctx_info", lambda pid, model: (400000, "catalog"))
+    monkeypatch.setattr(A, "_summarize_dropped", lambda dropped: None)
+    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False: m)
+    monkeypatch.setattr(A, "_with_model_guide", lambda m, pid, model, tools: m)
+    monkeypatch.setattr(A, "_apply_goal_note", lambda m: m)
+    return sent
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_through_the_real_route_the_feature_fires_and_the_key_opens_the_archive(route, stream):
+    """Not a direct _upstream_chat call: a POST to /v1/chat/completions with a
+    session header, the real handler, chain and hop. The conversation key must
+    reach the hop (g is request-bound), the upstream body must carry id stubs and
+    exactly ONE note, and the key in that note must open the archive through POST
+    /mcp."""
+    msgs = _history(85000)
+    client = A.app.test_client()
+    r = client.post("/v1/chat/completions", headers={"X-Session-Id": "route-sess"},
+                    json={"model": PINNED, "messages": msgs, "tools": TOOLS, "stream": stream})
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    assert route, "the provider was never called"
+    sent = route[-1]["messages"]
+    notes = [m for m in sent if m.get("role") == "system"
+             and str(m.get("content")).startswith("Hub memory:")]
+    assert len(notes) == 1
+    stubs = [m for m in sent if m.get("role") == "tool"
+             and m["content"].startswith(ctxwin.CLEARED_RESULT_PREFIX)]
+    assert len(stubs) > 20 and all("memory_get id=" in m["content"] for m in stubs)
+    assert convmem.default.has_items("hdr:route-sess")
+    key = _key_in(notes[0]["content"])
+    assert key == convmem.default.memory_key("hdr:route-sess")
+    sid = re.search(r"memory_get id=([0-9a-f]{12})", stubs[0]["content"]).group(1)
+    orig = next(m for m in msgs if m.get("tool_call_id") == stubs[0]["tool_call_id"]
+                and m["role"] == "tool")
+    r2 = client.post("/mcp", json={"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+        "name": "memory_get", "arguments": {"memory_key": key, "id": sid}}})
+    text = r2.get_json()["result"]["content"][0]["text"]
+    assert "NOT instructions" in text and orig["content"].split("\n")[0] in text
+
+
+def test_a_plain_worker_thread_still_files_and_notes(monkeypatch):
+    """_dispatch_chat_with_deadline (roles actor legs, swarm stage hops, the
+    verifier) runs the hop on a FRESH thread with an empty context, where Flask's
+    `g` -- and so the conversation key -- does not exist. The key has to be
+    carried across, or the feature silently does nothing on the whole roles path."""
+    posted = []
+    monkeypatch.setattr(A.requests, "post",
+                        lambda *a, **kw: posted.append(kw.get("json")) or _Resp())
+    monkeypatch.setattr(A, "_post_with_header_deadline",
+                        lambda deadline, post, **kw: posted.append(kw.get("json")) or _Resp())
+    monkeypatch.setattr(A, "_summarize_dropped", lambda dropped: None)
+    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False: m)
+    monkeypatch.setattr(A, "_with_model_guide", lambda m, pid, model, tools: m)
+    monkeypatch.setattr(A, "_apply_goal_note", lambda m: m)
+    monkeypatch.setattr(A, "_model_ctx_info", lambda pid, model: (400000, "catalog"))
+    msgs = _history(85000)
+    with A.app.test_request_context("/v1/chat/completions",
+                                    headers={"X-Session-Id": "thread-sess"}):
+        A._ctx_begin({"model": "auto"}, msgs, A._est_tokens(msgs, TOOLS))
+        resp, exc = A._dispatch_chat_with_deadline(
+            "uncloseai", {"model": "open", "messages": msgs, "tools": TOOLS}, 30)
+    assert exc is None and resp is not None and posted
+    sent = posted[-1]["messages"]
+    assert convmem.default.has_items("hdr:thread-sess")
+    assert any("memory_get id=" in str(m.get("content")) for m in sent)
+    assert _note_of(sent) and _key_in(_note_of(sent))
+
+
 def test_end_to_end_the_model_can_follow_a_stub_back_to_the_original(monkeypatch):
     """The whole loop: a big turn goes up with stubs and ONE note; the key in
     that note opens the archive through the real /mcp handler; the id in a stub
@@ -1034,6 +1118,9 @@ def test_a_clis_compaction_request_is_the_moment_the_history_is_filed(monkeypatc
     body = _hop(monkeypatch, msgs, budget=400000)
     sent = body["messages"]
     assert _note_of(sent) is None                                      # never the note here
+    assert not any("detailed summary" in h["excerpt"] for h in convmem.default.search(
+        convmem.default.memory_key("hdr:sess-e2e"), "detailed summary", limit=10))   # the prompt itself is not filed
+    assert not any("detailed summary" in i["text"] for i in A._cmem_items(msgs))
     last_user = [m for m in sent if m.get("role") == "user"][-1]["content"]
     assert ctxwin.EXACT_FACTS_MARKER in last_user                      # the request carries the facts
     assert "Always answer in French" in last_user and "Never touch the legacy folder" in last_user
