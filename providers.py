@@ -1973,7 +1973,11 @@ def is_free_model(provider_id: str, model_id: Optional[str],
         return False
     if not model_id:
         return False
-    prov = PROVIDERS.get(provider_id)
+    # Routed through _lookup (not a raw PROVIDERS.get) so a user-added custom
+    # provider's models are judged by its own free_filter ('all', set by
+    # app.py's _custom_provider_row) instead of silently reading as "unknown
+    # provider -> never free" and having every discovered id filtered out.
+    prov = _lookup(provider_id)
     if not prov:
         return False
     if prov.get("paid"):
@@ -2079,10 +2083,63 @@ def filter_models(model_ids: List[str]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Custom providers (user-added, Settings -> "Add a provider", 2026-10-24).
+#
+# PROVIDERS above is a module-level constant baked into this GIT-TRACKED file,
+# so it is overwritten by every `git pull`. A provider the user types in by
+# hand (name + endpoint + where to get a key) has to live somewhere a `git
+# pull` never touches -- that is config.json, outside this module entirely.
+#
+# This module stays import-light (still "pure stdlib: only re and typing", per
+# the module docstring): app.py registers a CALLBACK here instead of this file
+# importing config.py, mirroring craft.set_skill_source / publish's
+# set_guards(...) elsewhere in this codebase. Unregistered (a fresh import, a
+# test that never calls set_custom_source, the callback raising) = no custom
+# providers at all, i.e. today's behaviour byte for byte.
+#
+# `fn()` must return {provider_id: row} where each row is ALREADY SHAPED like a
+# PROVIDERS entry (name/base_url/models_url/signup_url/key_hint/notes/
+# free_filter/paid/default_free_models, plus `custom: True`) -- app.py's
+# `_custom_provider_row` builds that shape from the user's stored definition
+# and sensible defaults. This module never guesses defaults itself.
+# --------------------------------------------------------------------------- #
+_CUSTOM_SOURCE = None
+
+
+def set_custom_source(fn) -> None:
+    global _CUSTOM_SOURCE
+    _CUSTOM_SOURCE = fn
+
+
+def _custom_rows() -> Dict[str, dict]:
+    if _CUSTOM_SOURCE is None:
+        return {}
+    try:
+        rows = _CUSTOM_SOURCE()
+    except Exception:                                              # noqa: BLE001
+        return {}
+    if not isinstance(rows, dict):
+        return {}
+    return {pid: row for pid, row in rows.items()
+            if isinstance(pid, str) and pid and isinstance(row, dict)}
+
+
+def _lookup(provider_id: str) -> Optional[dict]:
+    """The ONE place that resolves a provider id: the static registry first
+    (never shadowed by a user-added id -- a future PROVIDERS entry always
+    wins), a user-added custom provider otherwise. Every accessor below reads
+    through here instead of touching PROVIDERS directly, so a custom provider
+    is transparent to routing, discovery, the provider routes, Test, etc."""
+    if provider_id in PROVIDERS:
+        return PROVIDERS[provider_id]
+    return _custom_rows().get(provider_id)
+
+
+# --------------------------------------------------------------------------- #
 # Accessors
 # --------------------------------------------------------------------------- #
 def get_provider(provider_id: str) -> Optional[dict]:
-    return PROVIDERS.get(provider_id)
+    return _lookup(provider_id)
 
 
 def list_providers(include_custom: bool = False) -> List[dict]:
@@ -2091,11 +2148,16 @@ def list_providers(include_custom: bool = False) -> List[dict]:
         if pid == "custom" and not include_custom:
             continue
         out.append({"id": pid, **meta})
+    # User-added providers are always real, named providers (unlike the
+    # generic ad-hoc "custom" placeholder above, which is hidden by default)
+    # -- `include_custom` never applies to them.
+    for pid, meta in _custom_rows().items():
+        out.append({"id": pid, **meta})
     return out
 
 
 def signup_url(provider_id: str) -> Optional[str]:
-    p = PROVIDERS.get(provider_id)
+    p = _lookup(provider_id)
     return p.get("signup_url") if p else None
 
 
@@ -2114,10 +2176,13 @@ def base_url_for(provider_id: str, custom_base: Optional[str] = None) -> Optiona
     """
     if isinstance(custom_base, str) and custom_base.strip():
         return custom_base.strip()
-    if provider_id == "custom" or (provider_id not in PROVIDERS):
+    if provider_id == "custom":
         return custom_base
-    return PROVIDERS[provider_id].get("base_url")
+    p = _lookup(provider_id)
+    if p is None:
+        return custom_base
+    return p.get("base_url")
 
 
 def is_known_provider(provider_id: str) -> bool:
-    return provider_id in PROVIDERS
+    return provider_id in PROVIDERS or provider_id in _custom_rows()

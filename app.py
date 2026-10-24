@@ -18826,6 +18826,9 @@ def _provider_row(pid, live_models=False):
         "quality_score": _provider_quality_score(pid, p.get("default_free_models")),
         "new": pid in _NEW_PROVIDER_IDS,
         "fresh": pid in _FRESH_PROVIDER_IDS,
+        # User-added via Settings -> Custom providers (providers.set_custom_source
+        # merge point) -- never true for a static providers.PROVIDERS entry.
+        "custom": bool(p.get("custom")),
     }
 
 
@@ -19061,6 +19064,304 @@ def api_provider_reveal_key(pid, idx):
     if idx < 0 or idx >= len(keys):
         return jsonify({"error": "no key at index %d" % idx}), 404
     return jsonify({"api_key": keys[idx]})
+
+
+# ---------------------------------------------------------------------------
+# Custom providers (user-added) -- Settings -> "Add a provider" (2026-10-24)
+#
+# Owner request: add ANY OpenAI-compatible endpoint by hand (name + base URL +
+# where to get a key), have it survive `git pull` (providers.py's PROVIDERS
+# dict is a GIT-TRACKED constant, overwritten on every auto-update -- see its
+# own module docstring), and have it ride export/import like a real
+# provider's key.
+#
+# Storage split (see config.py's own comment on `custom_providers` for the
+# reasoning): the DEFINITION lives in config.json's new top-level
+# `custom_providers` block; the KEY reuses the ORDINARY providers[<pid>]
+# row via config.get_provider_config/set_provider_config/add_provider_key --
+# the exact same path a real provider's key takes, so it is already
+# encrypted (config._encrypt_secrets/_decrypt_secrets walk `providers` by
+# whatever pids are PRESENT, never a hardcoded static list), already masked
+# in logs/errors (_secret_values walks `cfg["providers"].values()` the same
+# way), already exported/imported by the EXISTING "api_keys" settings
+# section (which deep-copies `cfg["providers"]` wholesale), and already
+# covered by the migration key-safety fingerprint
+# (migrations._iter_key_strings walks `raw["providers"]` generically too) --
+# all with ZERO changes to those four systems.
+#
+# Merge point: providers.set_custom_source(_custom_provider_rows), registered
+# at the bottom of this section (same injection pattern as
+# craft.set_skill_source / ghpush.default.set_guards elsewhere in this file),
+# makes providers.get_provider/list_providers/base_url_for/signup_url/
+# is_known_provider/is_free_model see a user-added provider transparently --
+# every one of the ~32 real `prov.get_provider(...)` call sites across this
+# file (routing, discovery, the provider routes themselves, /v1/models, Test,
+# ...) needed NO changes at all.
+# ---------------------------------------------------------------------------
+# 2-40 chars of lowercase letters/digits/hyphens, never starting or ending in
+# a hyphen (that cosmetic restriction doubles as a correctness one: without
+# it `-x`/`x-` are both accepted AND distinct from `x`, cluttering ids for no
+# benefit -- a leading/trailing hyphen is never a real identity, only a typo).
+_CUSTOM_PID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
+
+
+def _custom_providers_enabled():
+    return config.get_flag("custom_providers_manual", True)
+
+
+def _custom_provider_reserved_ids():
+    """Ids a custom provider must never take.
+
+    `_resolve_model` (app.py ~10052) and the vision-pin check (~12621) both
+    treat a bare '<head>/<rest>' model string's head as a provider pin
+    whenever `prov.get_provider(head)` is truthy -- so a custom id that
+    SHADOWS one of the hub's own virtual model ids (auto/best/swarm/multi/a
+    category/a crew) would silently break ordinary routing for anyone who
+    happens to send that word. `_virtual_model_ids()` is the single
+    authoritative list of those ids, so this reservation stays correct as
+    that list grows with no change needed here."""
+    return frozenset(_virtual_model_ids()) | {"custom", "hub", "none", "default"}
+
+
+def _slugify_provider_name(name):
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
+    s = s[:40]
+    if len(s) < 2:
+        s = (s + "provider")[:2] if s else "provider"
+    return s[:40]
+
+
+def _unique_custom_pid(base, taken):
+    base = base[:40] or "provider"
+    if base not in taken:
+        return base
+    for n in range(2, 1000):
+        suffix = "-%d" % n
+        cand = (base[:40 - len(suffix)] + suffix)
+        if cand not in taken:
+            return cand
+    return None  # practically unreachable (1000 collisions on one slug)
+
+
+def _validate_custom_provider_id(pid):
+    """Raise ValueError with a plain message, or return the normalized id.
+    Does NOT check collision against an EXISTING custom provider -- callers
+    that care (create) check that separately against the live config."""
+    if not isinstance(pid, str) or not pid.strip():
+        raise ValueError("id is required")
+    pid = pid.strip().lower()
+    if not _CUSTOM_PID_RE.match(pid):
+        raise ValueError("id must be 2-40 characters of lowercase letters, "
+                          "digits and hyphens")
+    if pid.startswith("sub-"):
+        raise ValueError("id '%s' is reserved" % pid)
+    if pid in _custom_provider_reserved_ids():
+        raise ValueError("id '%s' is reserved" % pid)
+    if pid in prov.PROVIDERS:
+        raise ValueError("'%s' is already a built-in provider id" % pid)
+    return pid
+
+
+def _custom_provider_row(pid, row):
+    """Shape a stored custom-provider DEFINITION into a full provider-registry
+    row -- the same shape a static providers.PROVIDERS entry carries, with
+    sensible defaults for everything a custom provider cannot state:
+    free_filter 'all' (it is the user's own key on the user's own account --
+    the hub has no catalog of its own to verify "free" against, same as the
+    generic ad-hoc "custom" entry), paid False, default_free_models []
+    (nothing is pinned until a key is saved and discovery/Test runs). No
+    key_mint_url/driver_api/static_key/exclude_families/vision_models/etc --
+    every one of those is read with .get() elsewhere, so simply absent here
+    is the correct "this provider has none of that" answer."""
+    base_url = (row.get("base_url") or "").strip().rstrip("/") or None
+    models_url = (row.get("models_url") or "").strip() or None
+    if not models_url and base_url:
+        # OpenAI-compatible convention. Harmless if wrong: discovery just gets
+        # a 404/connection error and falls back to the (empty) defaults below
+        # -- the same outcome as having no models_url at all (see
+        # provider_free_models), at the cost of one wasted network call.
+        models_url = base_url + "/models"
+    return {
+        "name": row.get("name") or pid,
+        "base_url": base_url,
+        "models_url": models_url,
+        "signup_url": row.get("signup_url") or None,
+        "key_hint": row.get("key_hint") or "any",
+        "notes": row.get("notes") or "",
+        "free_filter": "all",
+        "paid": False,
+        "default_free_models": [],
+        "custom": True,          # tells the dashboard card to offer Edit/Remove
+    }
+
+
+def _custom_provider_rows():
+    """providers.set_custom_source callback. Never raises -- providers.py
+    already treats an exception here as "no custom providers" (see
+    set_custom_source), but every caller of config.get_custom_providers
+    already fails open too, so this is defence in depth, not the only guard."""
+    out = {}
+    try:
+        rows = config.get_custom_providers() or {}
+    except Exception:                                            # noqa: BLE001
+        return out
+    for pid, row in rows.items():
+        if isinstance(pid, str) and pid and isinstance(row, dict):
+            out[pid] = _custom_provider_row(pid, row)
+    return out
+
+
+prov.set_custom_source(_custom_provider_rows)
+
+
+def _custom_provider_definition_view(pid, row):
+    """The shape GET/POST/PUT /api/custom-providers show for ONE definition --
+    deliberately NOT the full provider-card shape (/api/providers already
+    gives every provider, custom ones included via the merge point above, the
+    full card: status/quota/keys/etc); this is just what the add/edit form
+    needs back."""
+    return {
+        "id": pid,
+        "name": row.get("name") or pid,
+        "base_url": row.get("base_url") or "",
+        "models_url": row.get("models_url") or "",
+        "signup_url": row.get("signup_url") or "",
+        "key_hint": row.get("key_hint") or "",
+        "notes": row.get("notes") or "",
+        "created_at": row.get("created_at") or "",
+        "has_key": bool(config.get_provider_config(pid).get("api_keys")),
+    }
+
+
+@app.route("/api/custom-providers", methods=["GET"])
+def api_custom_providers_list():
+    rows = config.get_custom_providers() or {}
+    out = [_custom_provider_definition_view(pid, rows[pid] or {})
+           for pid in sorted(rows)]
+    return jsonify({"enabled": _custom_providers_enabled(), "providers": out})
+
+
+def _custom_provider_body_fields(body, creating):
+    """Validate the shared name/base_url/models_url/signup_url/key_hint/notes
+    fields from a create/edit request body. Returns (fields, error_or_None);
+    `fields` holds only the keys actually PRESENT in `body` (PUT semantics:
+    anything omitted is left unchanged), except on create where name and
+    base_url are required."""
+    fields = {}
+    if "name" in body or creating:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None, "name is required and must be a non-empty string"
+        fields["name"] = name.strip()[:120]
+    if "base_url" in body or creating:
+        try:
+            base = _validate_custom_base_url(body.get("base_url"))
+        except ValueError as exc:
+            return None, "base_url: %s" % exc
+        if not base:
+            return None, "base_url is required"
+        fields["base_url"] = base
+    if "models_url" in body:
+        raw = body.get("models_url")
+        if raw in (None, ""):
+            fields["models_url"] = None
+        else:
+            try:
+                murl = _validate_custom_base_url(raw)
+            except ValueError as exc:
+                return None, "models_url: %s" % exc
+            fields["models_url"] = murl
+    for key, limit in (("signup_url", 2000), ("key_hint", 80), ("notes", 1000)):
+        if key in body:
+            v = body.get(key)
+            if v is None:
+                fields[key] = None
+            elif isinstance(v, str):
+                fields[key] = v.strip()[:limit] or None
+            else:
+                return None, "%s must be a string or null" % key
+    return fields, None
+
+
+@app.route("/api/custom-providers", methods=["POST"])
+def api_custom_provider_create():
+    if not _custom_providers_enabled():
+        return jsonify({"error": "Custom providers are switched off.",
+                        "code": "disabled"}), 403
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    fields, err = _custom_provider_body_fields(body, creating=True)
+    if err:
+        return jsonify({"error": err}), 400
+    existing = config.get_custom_providers() or {}
+    raw_id = body.get("id")
+    if raw_id:
+        try:
+            pid = _validate_custom_provider_id(raw_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if pid in existing:
+            return jsonify({"error": "a custom provider '%s' already exists" % pid,
+                            "code": "id_exists"}), 400
+    else:
+        base_slug = _slugify_provider_name(fields.get("name"))
+        pid = _unique_custom_pid(
+            base_slug, set(prov.PROVIDERS) | set(existing) | _custom_provider_reserved_ids())
+        if not pid:
+            return jsonify({"error": "could not generate an id -- please choose one"}), 400
+    row = dict(fields)
+    row["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    config.set_custom_provider(pid, row)
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)
+        _paid_model_cache.pop(pid, None)
+    return jsonify(_provider_row(pid)), 201
+
+
+@app.route("/api/custom-providers/<pid>", methods=["PUT"])
+def api_custom_provider_update(pid):
+    if not _custom_providers_enabled():
+        return jsonify({"error": "Custom providers are switched off.",
+                        "code": "disabled"}), 403
+    existing = config.get_custom_provider(pid)
+    if existing is None:
+        return jsonify({"error": "unknown custom provider '%s'" % pid}), 404
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    fields, err = _custom_provider_body_fields(body, creating=False)
+    if err:
+        return jsonify({"error": err}), 400
+    row = dict(existing)
+    row.update(fields)
+    row["created_at"] = existing.get("created_at") or time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    config.set_custom_provider(pid, row)
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)       # base/models URL may have changed -> rediscover
+        _paid_model_cache.pop(pid, None)
+    return jsonify(_provider_row(pid))
+
+
+@app.route("/api/custom-providers/<pid>", methods=["DELETE"])
+def api_custom_provider_delete(pid):
+    if not _custom_providers_enabled():
+        return jsonify({"error": "Custom providers are switched off.",
+                        "code": "disabled"}), 403
+    if config.get_custom_provider(pid) is None:
+        return jsonify({"error": "unknown custom provider '%s'" % pid}), 404
+    body = request.get_json(force=True, silent=True)
+    body = body if isinstance(body, dict) else {}
+    if body.get("confirm") is not True:
+        return jsonify({"error": ("Deleting '%s' also removes its saved key(s) -- "
+                                  "send {\"confirm\": true} to proceed." % pid),
+                        "code": "confirm_required"}), 400
+    config.delete_custom_provider(pid)
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)
+        _paid_model_cache.pop(pid, None)
+    return jsonify({"deleted": pid})
 
 
 def _run_relay_model_test(pid):
@@ -28829,7 +29130,13 @@ def api_agent_history_list_checkpoints(session_id):
 
 # Every section this pair understands. "all" (the sections=... shortcut, and
 # the default when the param is omitted) expands to exactly this tuple.
-_SETTINGS_SECTIONS = ("api_keys", "flags", "default", "local_api_key", "media", "images")
+# "custom_providers" (2026-10-24) carries only the DEFINITIONS (name/base_url/
+# models_url/signup_url/key_hint/notes/created_at) of user-added providers --
+# their saved KEYS already ride in "api_keys" for free, since a custom
+# provider's key lives in the same providers[<pid>] row a real provider's
+# does (see config.py's own comment on custom_providers for why).
+_SETTINGS_SECTIONS = ("api_keys", "flags", "default", "local_api_key", "media",
+                      "images", "custom_providers")
 
 # cfg top-level keys that are NEVER auto-detected as a "flag" (see
 # _export_settings's "flags" branch below) -- each already has its own named
@@ -28839,7 +29146,7 @@ _SETTINGS_SECTIONS = ("api_keys", "flags", "default", "local_api_key", "media", 
 _SETTINGS_RESERVED_KEYS = {
     "schema_version", "providers", "default", "local_api_key",
     "hub_mode", "runtime", "media", "images", "control_token",
-    "artificial_analysis_api_key",
+    "artificial_analysis_api_key", "custom_providers",
 }
 
 
@@ -28877,6 +29184,12 @@ def _export_settings(sections):
         i = cfg.get("images") or {}
         out["images"] = {"priority_mode": i.get("priority_mode"),
                          "manual_priority": list(i.get("manual_priority") or [])}
+    if "custom_providers" in sections:
+        # DEFINITIONS only (name/base_url/models_url/signup_url/key_hint/
+        # notes/created_at) -- no secret lives here. The matching KEY, if
+        # any, is already exported above: it sits in cfg["providers"][pid],
+        # which "api_keys" already deep-copies wholesale.
+        out["custom_providers"] = copy.deepcopy(cfg.get("custom_providers") or {})
     return out
 
 
@@ -28997,6 +29310,46 @@ def _validate_settings_import(body):
                     return None, "'%s.manual_priority' must be an array of strings." % section
                 norm["manual_priority"] = mp
             out[section] = norm
+    if "custom_providers" in present:
+        # Reuses the exact same acceptance rules the create route enforces
+        # (_validate_custom_provider_id / _validate_custom_base_url) --
+        # import is the untrusted-JSON path, so it must never be looser than
+        # the API that would otherwise reject the same data.
+        raw = body["custom_providers"]
+        if not isinstance(raw, dict):
+            return None, "'custom_providers' must be an object of {provider_id: {...}}."
+        rows = {}
+        for pid, row in raw.items():
+            try:
+                norm_pid = _validate_custom_provider_id(pid)
+            except ValueError as exc:
+                return None, "'custom_providers.%s': %s" % (pid, exc)
+            if not isinstance(row, dict):
+                return None, "'custom_providers.%s' must be an object." % pid
+            name = row.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return None, "'custom_providers.%s.name' must be a non-empty string." % pid
+            try:
+                base = _validate_custom_base_url(row.get("base_url"))
+            except ValueError as exc:
+                return None, "'custom_providers.%s.base_url': %s" % (pid, exc)
+            if not base:
+                return None, "'custom_providers.%s.base_url' is required." % pid
+            norm = {"name": name.strip()[:120], "base_url": base}
+            if row.get("models_url"):
+                try:
+                    murl = _validate_custom_base_url(row["models_url"])
+                except ValueError as exc:
+                    return None, "'custom_providers.%s.models_url': %s" % (pid, exc)
+                norm["models_url"] = murl
+            for key, limit in (("signup_url", 2000), ("key_hint", 80), ("notes", 1000)):
+                v = row.get(key)
+                if isinstance(v, str) and v.strip():
+                    norm[key] = v.strip()[:limit]
+            if isinstance(row.get("created_at"), str) and row["created_at"]:
+                norm["created_at"] = row["created_at"]
+            rows[norm_pid] = norm
+        out["custom_providers"] = rows
     return out, None
 
 
@@ -29031,9 +29384,20 @@ def _apply_settings_import(sections):
     """Merge each present, already-VALIDATED section back into the live
     config via config.py's existing setters (add_provider_key/
     clear_provider_keys/set_provider_config/set_flag/set_default/
-    clear_default/set_local_api_key/update_media_state/update_images_state)
-    -- every one of these already does its own atomic save_config() write
-    (see config.py), so no new persistence mechanism is introduced here."""
+    clear_default/set_local_api_key/update_media_state/update_images_state/
+    set_custom_provider) -- every one of these already does its own atomic
+    save_config() write (see config.py), so no new persistence mechanism is
+    introduced here."""
+    if "custom_providers" in sections:
+        # Applied BEFORE "api_keys" so a definition exists before its key
+        # lands in the ordinary providers[pid] row (not load-bearing --
+        # config.py's setters never check one against the other -- just the
+        # logical order).
+        for pid, row in sections["custom_providers"].items():
+            config.set_custom_provider(pid, row)
+        with _model_cache_lock:
+            for pid in sections["custom_providers"]:
+                _model_cache.pop(pid, None)
     if "api_keys" in sections:
         for pid, row in sections["api_keys"].items():
             if "api_keys" in row:
