@@ -6312,3 +6312,395 @@ Claude > GPT > Gemini. Flag `gpt_below_claude_tools` (`config.get_flag`, default
   strictly monotone, so newest-first order among GPT ids survives (gpt-7 > gpt-6.2 > astra).
 - The flag is read at rebuild, never per candidate (`config.get_flag` re-parses config.json): a flip
   applies within the TTL. Specialist/verifier/planner pools band on chat scores and are not touched.
+
+## Custom providers (user-added) (2026-10-24)
+
+Owner: "add providers manually in Settings -- endpoint, name, where to get the
+key. Save it, survive updates, and include it in export/import, keys too."
+`providers.py`'s `PROVIDERS` dict is a GIT-TRACKED constant, overwritten by
+every auto-update, so a hand-added provider cannot live there. Covered by
+`tests/test_custom_providers.py` (hermetic: `FREE_LLM_HUB_CONFIG` + a temp
+dir, like `tests/test_provider_out_reason.py`).
+
+- **Storage split.** The DEFINITION (`name`, `base_url`, `models_url?`,
+  `signup_url?`, `key_hint?`, `notes?`, `created_at`) lives in a NEW top-level
+  config.json block, `custom_providers`, keyed by the provider's own id --
+  `config.get_custom_providers/get_custom_provider/set_custom_provider/
+  delete_custom_provider`. It sits OUTSIDE `providers` for the same reasoning
+  the GitHub token sits outside `providers` (see "GitHub push for Build
+  projects" above, the "Token." paragraph): it holds no secret, so it has no
+  business going through `_encrypt_secrets`/`_decrypt_secrets` (which only
+  ever look at `providers`), and keeping it separate means
+  `_normalize_provider_row` never has to learn these fields. The KEY is a
+  different story ON PURPOSE: it is saved through the ORDINARY
+  `set_provider_config`/`add_provider_key`/`remove_provider_key` calls, keyed
+  by the custom provider's own id, landing in the exact same
+  `providers[<pid>]` row a real provider's key would -- there is no second
+  key-storage path anywhere.
+- **Merge point: `providers.set_custom_source(fn)`** (mirrors
+  `craft.set_skill_source`/`ghpush.default.set_guards`'s injection pattern --
+  providers.py stays import-light, "pure stdlib: only re and typing", never
+  importing config.py). `fn()` returns `{pid: row}`, already shaped like a
+  static entry; providers.py's `_lookup(pid)` (static registry first, then
+  this) is the ONE place every accessor reads through --
+  `get_provider`/`list_providers`/`base_url_for`/`signup_url`/
+  `is_known_provider`/`is_free_model`. A grep of every real
+  `prov.get_provider(...)`/`prov.list_providers(...)` call site in app.py
+  (~32, routing/discovery/the provider routes themselves/`/v1/models`/Test/
+  ...) found NONE that needed changing: they already all go through
+  `get_provider`/`list_providers`, so the merge point alone makes a custom
+  provider work everywhere a static one does. `is_free_model` was the one
+  INTERNAL providers.py function that read `PROVIDERS.get(pid)` directly
+  (bypassing the new merge point) -- unfixed, live discovery would have
+  filtered OUT every model a custom provider's `/models` returned, because
+  "unknown provider" short-circuits to "never free". Fixed to read through
+  `_lookup` too. `app._custom_provider_row(pid, row)` fills in the defaults a
+  custom provider cannot state: `free_filter: "all"` (the user's own key on
+  the user's own account -- there is no catalog of ours to verify "free"
+  against), `paid: False`, `default_free_models: []`, and (new) an auto-
+  derived `models_url = base_url + "/models"` when the user left it blank
+  (OpenAI-compatible convention; harmless if wrong -- discovery just gets a
+  404 and falls back to the empty defaults, same as having none at all).
+- **Reserved ids.** `_resolve_model` (app.py ~10052) and the vision-pin check
+  (~12621) both treat a `<head>/<rest>` model string's head as a provider pin
+  whenever `prov.get_provider(head)` is truthy, so a custom id that shadowed
+  one of the hub's own virtual model ids (auto/best/swarm/multi/a
+  category/a crew) would silently break ordinary routing for anyone who sent
+  that word. `app._custom_provider_reserved_ids()` reserves
+  `app._virtual_model_ids()` (the single authoritative list of those ids, so
+  this stays correct as it grows) plus `custom`/`hub`/`none`/`default`, and
+  any id starting with `sub-` (the subscription-relay namespace). Checked on
+  create (explicit id or auto-generated slug) and on import.
+- **Routes** (`/api/*`, so the ordinary control-token + dashboard-header
+  guard applies like every other route): `GET /api/custom-providers` (list
+  definitions; never gated by the flag -- harmless), `POST
+  /api/custom-providers` (`{id?, name, base_url, models_url?, signup_url?,
+  key_hint?, notes?}`; auto-slugs the name when `id` is omitted, deduping
+  with a numeric suffix), `PUT /api/custom-providers/<id>` (same fields,
+  partial -- only what is present changes; id is immutable), `DELETE
+  /api/custom-providers/<id>` (needs `{"confirm": true}` in the body, same
+  convention as Publish's `confirm_required`; removes the definition AND the
+  `providers[<id>]` row, i.e. its saved key too). Every mutating route 403s
+  `{"code": "disabled"}` while the flag is off. After create/edit, the
+  EXISTING per-provider routes (`/api/providers/<id>`, `/keys`,
+  `/keys/<idx>`, `/keys/<idx>/reveal`) work completely unchanged for the new
+  id -- proven in tests by saving a key through `/api/providers/<id>/keys`
+  and confirming Test/discovery/`_enabled_keyed` see it, not a parallel path.
+  `_provider_row` gained one field, `"custom": bool`; `cardHTML` shows a
+  small "Custom" badge on it (same `.badge` class as Recommended/New) so a
+  user-added row is identifiable on the Providers page -- Edit/Remove
+  themselves live in the Settings list (`renderCustomProviders`), next to
+  that row's own key field, not on the card. Route count: 194 -> 198.
+- **Export/import.** A new section, `"custom_providers"`, in
+  `_SETTINGS_SECTIONS` (also added to `_SETTINGS_RESERVED_KEYS`, so a crafted
+  `flags` payload can never clobber it). `_export_settings` deep-copies
+  `cfg["custom_providers"]`, definitions only. The matching KEY needs NO new
+  export code: `"api_keys"` already deep-copies `cfg["providers"]` wholesale,
+  and a custom provider's key already lives there -- so it rides along for
+  free, in PLAINTEXT, exactly like a real provider's key does today (the
+  SAME documented stance this file already had; nothing new was decided for
+  custom ones). The dashboard's export modal pairs `custom_providers` with
+  the `api_keys` checkbox (`_EXPORT_SECTION_MAP.api`), because a key with no
+  definition would import onto an id the target machine's registry knows
+  nothing about. `_validate_settings_import`'s new `custom_providers` branch
+  reuses the EXACT SAME `_validate_custom_provider_id`/
+  `_validate_custom_base_url` the create route enforces (import is the
+  untrusted-JSON path, so it must never be looser than the API). Applied
+  before `api_keys` in `_apply_settings_import` (not load-bearing, just the
+  logical order: a definition before its key).
+- **Migration-safety decision: already covered, by construction.** A custom
+  provider's key sits in `providers[<pid>]`, the exact same shape a real
+  provider's key does -- and `migrations._iter_key_strings`/
+  `key_fingerprint`/`_keys_preserved` already walk `raw["providers"]`
+  GENERICALLY, by whatever pids are PRESENT, never a hardcoded static list.
+  So the key-safety check covers a custom provider's key with ZERO code
+  changes to `migrations.py`. The `custom_providers` DEFINITION block holds
+  no key string, so it is correctly OUTSIDE the fingerprint (like `github`'s
+  token, for the same reason) -- and since `migrations.apply()` only ever
+  touches `cli_multi_confirm`/`cli_multi_approval` and named retired-provider
+  ids inside `providers`/`retired_providers`, the whole `custom_providers`
+  block passes through `apply()` byte-for-byte untouched. No `LATEST` bump,
+  no new step. Proven in a test: a custom provider's key survives
+  `migrations.apply()`/`run_migrations()` under a real schema bump
+  (fingerprint before == after, `custom_providers` block unchanged on disk).
+- **Flag** `custom_providers_manual` (`config.get_flag`, default ON): off ->
+  create/edit/delete 403 `disabled`; `GET` still lists what already exists
+  (harmless); the dashboard's add form hides and existing rows show no
+  Edit/Remove buttons.
+- **UI** (`templates/index.html`): a "Custom providers" group in Settings,
+  right after the Skills group, reusing the Skills list+form's EXACT CSS
+  classes (`sk-list`/`sk-row`/`sk-txt`/`sk-name`/`sk-desc`/`sk-acts`/
+  `sk-form`/`sk-inline`/`sk-err` -- zero new CSS). A created/edited provider
+  needs no separate rendering path on the Providers page: `/api/providers`
+  already includes it via the merge point, and `renderGrid()`'s zone filters
+  (recommended/keyless/trial/pure-paid/free-key) are an exhaustive partition
+  with `freeKeyG` as the catch-all for "no special flag" -- a custom row
+  (`paid: false`, no `trial`, no `no_key`) always lands there, never dropped.
+- **Safety**: no SSRF-specific handling beyond what `_validate_custom_base_url`
+  already enforces for every OTHER provider's base-URL override (http only on
+  loopback, no credentials/query/fragment in the URL) -- a custom provider's
+  base_url goes through the exact same check, and models_url now does too
+  (previously unchecked for the generic ad-hoc "custom" entry's per-request
+  override). Dispatch is the SAME `_upstream_chat` path every provider uses,
+  so it inherits existing timeouts; logging/error masking needs no new code
+  (`_secret_values` already walks `cfg["providers"].values()` generically,
+  so a custom provider's key is masked by `_sanitize` exactly like a real
+  one's -- proven in a test).
+- **Deliberately left out**: a dedicated on/off switch for the
+  `custom_providers_manual` flag in the Settings UI (the codebase's
+  convention for a kill-switch flag with no owner-facing toggle --
+  `old_tool_result_clearing`, `context_grow_guard`, etc. -- none of those get
+  a UI switch either); validating `signup_url` as a strict URL (the brief
+  calls it "a link/text", so it is free text, trimmed and length-capped,
+  matching the UI description); forcing a reserved-word-free prefix on every
+  custom id (a curated reserved-word check against `_virtual_model_ids()`
+  was judged sufficient and less invasive than a mandatory prefix).
+- **Exactly which internal readers changed, precisely.** A grep of every
+  `prov.get_provider(`/`prov.PROVIDERS.items(`/`prov.PROVIDERS.get(` call
+  site in app.py (33 hits) found they are ALL `prov.get_provider(...)` --
+  none needed changing (the one non-`get_provider` hit, `_SUB_PROVIDERS.items()`,
+  is an unrelated dict whose name happens to contain the substring
+  "PROVIDERS.items()"). Inside `providers.py` itself, FIVE functions read the
+  static `PROVIDERS` dict directly rather than through `get_provider`/
+  `_lookup`, and each one needed the fix: `is_free_model` (read `PROVIDERS.get`
+  -- the critical one: unfixed, every model of a custom provider reads as
+  "not free" and live discovery drops them all), `base_url_for`, `signup_url`,
+  `is_known_provider`, `list_providers`.
+- **Auto routes to a custom provider exactly like a free one, by design, per
+  the brief.** `free_filter: "all"` + `paid: False` means `is_free_model`
+  returns True for every model a custom provider's `/models` lists and
+  `_auto_provider_mode() == "free"` (the default) will route Auto traffic to
+  it -- correct for a genuinely free BYOK endpoint, but means a PAID custom
+  endpoint is auto-routed too, with no quota/cost signal the hub can see (it
+  has no catalog of its own to check pricing against, same as the registry's
+  generic ad-hoc "custom" entry). The user is the one who typed the base URL
+  in, so this is accepted as the BYOK trust model, not a bug -- flagged here
+  so it is a documented decision, not a surprise.
+- **Hardening found in review (2026-10-24, same day).**
+  - **Atomic create**: `config.create_custom_provider(pid, row)` does the
+    "does it already exist?" check AND the write under ONE `_LOCK`
+    acquisition -- the create route's collision check used to read
+    `get_custom_providers()` and separately call `set_custom_provider()`,
+    a TOCTOU gap a concurrent create of the same id could have raced
+    (`set_custom_provider` itself stays create-OR-replace, for PUT/import,
+    where overwrite is the point). The auto-slug path retries (bounded, 50
+    attempts) against a freshly re-read `taken` set on each loss.
+  - **Shadowing, surfaced not silently fixed.** Static always wins in
+    `providers._lookup`, so a LATER `git pull` that ships a built-in using
+    an id an EXISTING custom provider already took makes `get_provider`
+    switch to the static row -- and because the saved KEY sits in the SAME
+    `providers[pid]` row either definition would use, that key would reach
+    the NEW built-in's real endpoint if it is ever enabled, not the user's
+    intended one. `_custom_provider_definition_view` now reports
+    `"shadowed": pid in prov.PROVIDERS`; the Settings list shows a warning
+    row ("A built-in provider now uses this id..."). Never auto-fixed --
+    renaming or deleting is destructive, so it is the user's call.
+  - **Import no longer fails WHOLE on one stale id.** The same shadowing
+    scenario used to make importing an OLDER, perfectly valid export 400 in
+    full (API keys, flags, everything) the moment one of its
+    `custom_providers` ids happened to match a provider shipped AFTER that
+    export was made (`_validate_custom_provider_id` correctly rejects a
+    static-id collision as a hard error, and the import validator is
+    otherwise all-or-nothing). `_validate_settings_import` now checks a
+    static-registry collision FIRST and SKIPS just that one entry (with a
+    note) instead of failing the whole request; a genuinely malformed id
+    (bad pattern, a RESERVED WORD like `auto`) is still a hard 400, since
+    that is corrupt/hostile data, not merely stale. The route adds
+    `custom_providers_skipped: [ids]` to the response when anything was
+    skipped.
+  - **Free-text "where to get a key" could render as a dead link.** The
+    brief calls `signup_url` "a link/text", so the backend accepts free text
+    (e.g. "ask your admin"), but `cardHTML` and the guided-setup list
+    (`guidedStepHTML`) both rendered it unconditionally as `<a href=...>` --
+    a non-URL note became a dead relative link inside the hub. New helper
+    `providerKeyLinkUrl(u)` (same shape as the existing `pubSafeUrl`/
+    `ghSafeUrl`: `http(s)://` only, no stray whitespace/quotes/angle
+    brackets) gates both render sites; non-URL text now shows as a plain
+    note (`.notes` on the card, `.gstep-friction` in guided setup -- both
+    reused, no new CSS).
+  - **The dashboard page actually renders and its JS is syntactically
+    valid, checked by a test, not just asserted.** `GET /` through the test
+    client (200, `cp-group` present) + every inline `<script>` through
+    `node --check` (node confirmed present on the dev machine; skipped
+    without it, same convention as `test_dashboard_feature_rendering.py`).
+    Also confirmed (one-time, by grep of the rendered script, not a
+    standing test): `loadCustomProviders`/`initCustomProviders`/
+    `renderCustomProviders` and `loadProviders`/`initSkills`/`esc`/`api`
+    all live in the SAME top-level script block -- i.e. the same closure --
+    so a cross-call (my delete/save handlers calling `loadProviders()`)
+    resolves at runtime, not just at parse time.
+
+- **Second hardening pass (same day, review of the hardening commit itself).**
+  - **A REAL unescaped-innerHTML bug, found and fixed.**
+    `renderCustomProviders` put `p.base_url` into a row's innerHTML WITHOUT
+    `esc()` (name/id were escaped, base_url was not). `_validate_custom_base_url`
+    checks scheme/host/credentials/query/fragment but NOT path characters, so
+    `https://x.example.com/<img src=x onerror=alert(1)>` is a valid base_url
+    that would have carried a payload straight through -- reachable via a
+    direct create, an edit, or an import. Fixed: `esc(p.base_url || '')`.
+    `tests/test_custom_providers.py::test_render_custom_providers_escapes_every_field_including_base_url`
+    extracts `esc`+`renderCustomProviders` from the rendered template and runs
+    them under `node`, same shape as `test_dashboard_feature_rendering.py`'s
+    own XSS checks; verified it FAILS with the bug reintroduced (raw `<img`
+    in the output) and passes with the fix.
+  - **Negative controls run against the COMMITTED files, not scratch
+    scripts.** Reverting `prov.set_custom_source(_custom_provider_rows)`'s
+    registration call: 25 of 76 tests in `tests/test_custom_providers.py`
+    failed. Reverting `is_free_model`'s `_lookup(provider_id)` back to the
+    original `PROVIDERS.get(provider_id)`: exactly 2 failed --
+    `test_is_free_model_true_for_a_custom_provider_model` and
+    `test_live_discovery_actually_lists_models` -- confirming those two
+    tests, and only those two, actually guard that fix. Both reverts were
+    restored and `git diff` on `app.py`/`providers.py` confirmed clean
+    before continuing.
+  - **`[hidden]` CSS precedence, checked, not assumed.** `grep -n
+    "\[hidden\]" templates/index.html` confirms a global `[hidden]
+    {display:none !important}` rule (line ~123, with its own comment
+    explaining exactly this failure mode: a normal-priority author
+    `display:` class rule would otherwise beat the UA stylesheet's
+    `[hidden]{display:none}`). So `$('#cp-form').hidden = disabled` DOES
+    hide the form despite `.sk-form{display:flex}` -- no separate fix
+    needed, just confirmed.
+  - **A skipped id's KEY is now also dropped on import.** The
+    skip-with-note fix above (a now-built-in id is skipped, not written) had
+    a gap: if the SAME upload also carried that id's `api_keys` row (the
+    custom provider's own saved key from before the collision), it still
+    landed on the now-built-in provider's `providers[pid]` row -- the exact
+    misdirection "shadowed" exists to warn about, just reached a different
+    way. `api_settings_import` now drops `sections["api_keys"][pid]` for
+    every id in `custom_providers_skipped` before applying.
+  - **One more direct proof of dispatch, one layer below the Test route.**
+    `test_upstream_chat_posts_to_the_custom_providers_own_base_url_and_key`
+    calls `app._upstream_chat("my-test-provider", ...)` directly (mocking
+    only `requests.post`/`quota.record`/`quota.observe_headers`, NOT
+    `_resolve_base_url`) and asserts the posted URL is the definition's own
+    `base_url + "/chat/completions"` and the bearer is its own saved key --
+    the same call shape `tests/test_per_key_test.py`'s
+    `test_upstream_chat_pins_to_exactly_the_requested_key` proves for a real
+    provider.
+  - **Flag-off decision, stated plainly (not a new decision, just said
+    explicitly here since it was flagged as ambiguous):** with
+    `custom_providers_manual` off, an ALREADY-EXISTING custom provider keeps
+    routing and keeps showing as an ordinary card -- only create/edit/delete
+    (the admin/management surface) and the Settings add-form are disabled.
+    This is a deliberate reading of "the dashboard shows nothing new" as "no
+    new ADMIN capability", not "the feature regresses to not existing" --
+    the provider's own `enabled` row field is what already controls whether
+    IT routes, and flipping an unrelated management flag should not silently
+    stop a working, already-configured provider or remove its card.
+  - **The dashboard JS was syntax-checked, not executed in a browser.** The
+    `node --check` test proves no syntax error; a separate ad hoc run of the
+    WHOLE script under a hand-rolled Node DOM shim threw on a null element,
+    but that was the shim's own minimal `document.querySelector` always
+    returning null for every selector (every OTHER init function in this
+    file would throw identically against that shim) -- not evidence of a
+    real bug, and not something a standing test asserts either way. No
+    Playwright/browser check was run (would need a throwaway local server,
+    out of scope given "do not start/stop the hub").
+  - **Deleting a provider that has keys logs loudly, on purpose, pre-
+    existing.** `DELETE /api/custom-providers/<id>` with `confirm: true`
+    drops the key pool via the ordinary `providers[pid]` write path, which
+    trips config.py's existing `RECORDING A KEY WIPE` ERROR-level log line
+    (a key-count-to-zero save). That log line predates this feature (see
+    `save_config`'s own comment, 2026-09-05) and is deliberately loud for
+    ANY provider's key wipe, custom or real -- expected, not a regression,
+    but worth knowing it will appear in hub.log after every custom-provider
+    delete that had a key.
+
+- **Third hardening pass (same day, review of the second hardening commit).**
+  - **Brief step 5's key field was only half built -- fixed.** The brief
+    asks for the Settings list to show existing providers "each with its
+    own key field ... and a Remove button". The first two commits built
+    Edit/Remove but no key field: a key could only be pasted on the
+    Providers-page card. `renderCustomProviders` now gives each row its own
+    `<form class="keyrow cp-key-form">` (reusing the card's OWN
+    `.keyrow`/`.kwrap`/`.key-input` CSS -- no new CSS) that POSTs
+    `{api_key}` to the EXISTING `/api/providers/<id>/keys` route through
+    `api()`, then reloads both lists. No new route, no second key-storage
+    path -- same discipline as everything else in this feature.
+  - **The dashboard card now shows a "Custom" badge.** `_provider_row`'s
+    `custom: bool` field was added in the first commit but nothing read it
+    anywhere in the template -- an unreported deviation from what AGENTS.md
+    claimed. `cardHTML` now adds a `<span class="badge">Custom</span>` (same
+    class as Recommended/New) when `p.custom`, so a user-added row is
+    visually identifiable on the Providers page; Edit/Remove/the key field
+    stay in the Settings list, which is the right place to manage a
+    DEFINITION (the card is about keys/testing/enabling, which it already
+    handles for a custom provider transparently via the merge point).
+  - **Wider-boundary escaping audit (no new bug found, confirmed clean).**
+    `grep -n "p\.name\|p\.key_hint\|p\.notes"` across every OTHER renderer
+    that was already reading these fields for a REAL provider (`cardHTML`'s
+    name/key-input-placeholder/aria-label, `notesCardHTML`, `openNotesModal`,
+    `guidedStepHTML`'s name/key-hint-placeholder) -- every hit already runs
+    through `esc()`; those fields were simply hard-coded registry strings
+    before this feature and are user text now, but the existing escaping
+    discipline already covers them. `window.confirm(...)` and `.textContent`
+    sites (`toast`, `err.textContent`) are not innerHTML and need no `esc()`.
+  - **Auto routing treats every custom model as genuinely free, by design
+    (documented, not changed) -- but a custom provider claiming a FLAGSHIP
+    id was getting MORE trust than a known relay claiming the same id, which
+    WAS a real gap, now closed.** `_RELAY_DISCOUNT`/`_TOOL_RELAY_PIDS`/
+    `_is_relay_pid` key on a hardcoded pid tuple (`g4f`, `freemodel`) -- a
+    custom provider id is never in it, so a custom provider whose `/models`
+    listed `claude-opus-5.5` scored the FULL undiscounted owner floor (138)
+    for that id, MEASURED higher than a g4f/freemodel relay's DISCOUNTED
+    claim to the exact same id (134), with no skepticism applied at all (an
+    arbitrary user-typed endpoint is at least as unverifiable as a named
+    community relay -- more so, since g4f/freemodel at least have an
+    aggregate track record). `_rp_claim_pair` (the shared gate
+    `_relay_discount` AND `_rp_withholds_evidence` both read) now also
+    recognizes a custom provider (`_is_custom_provider_pid`, via the merge
+    point's `custom: True` tag) claiming a claude/gpt-family id
+    (`_RP_FAMILIES`); `_relay_discount` applies the SAME table value (not an
+    invented number) for that case. Deliberately NOT special-cased away from
+    `_relay_proven`'s escape hatch: a custom provider that measurably,
+    reliably delivers a tool-capable claude/gpt-shaped response over real
+    use earns back the discount exactly as a proven g4f pair does -- never
+    on name alone, always on measured behaviour, same bar, no new one
+    invented. An open-weight family claim (glm/kimi/deepseek/...) is
+    untouched -- the risk this closes is identity-spoofing a FLAGSHIP name,
+    not general over-trust of BYOK endpoints (which Auto's `free_filter:
+    "all"` treatment already accepts as the documented BYOK trust model).
+    All 180 tests across every test file that exercises `_rp_claim_pair`/
+    `_relay_discount`/`_relay_proven`/`_RP_FAMILIES`/`relay_proven_lead`
+    stayed green; a negative control (reverting the membership check) failed
+    exactly the one new test written to guard it, then was restored.
+  - **Import can no longer bypass the `custom_providers_manual` flag.** The
+    flag gated the three REST routes; a settings-import upload was a second,
+    ungated door to the same definitions -- switching the feature off did
+    not actually stop a new custom provider from arriving via a backup
+    upload. `api_settings_import` now folds every id in an import's
+    `custom_providers` section into the SAME `custom_providers_skipped`
+    list (with the same key-protection) when the flag is off, while the
+    rest of that same upload (flags, api_keys for ids NOT skipped, ...)
+    still lands.
+  - **A stale "Advanced: custom base URL" card override could make an Edit
+    silently not apply.** Every provider card (static or custom) has a
+    second base-URL field -- `providers[pid].base_url`, the per-provider
+    override originally built for Cloudflare's account-id templating and a
+    generic per-provider base-URL override -- and `_resolve_base_url` checks
+    it BEFORE the registry/definition value. If a user ever used that
+    generic card field on their OWN custom provider instead of the Settings
+    Edit form, a later Edit that changed `base_url` would update the
+    DEFINITION (the Settings list would show the new value) while dispatch
+    kept silently using the STALE override forever. `PUT
+    /api/custom-providers/<id>` now clears that override (`base_url=""`,
+    config.py's own documented "clear" convention) whenever the request
+    BODY carries a `base_url` key at all (`"base_url" in fields` -- presence
+    in the submitted body, not a check against the previously stored value;
+    an edit that omits the key entirely, e.g. a direct API call sending only
+    `{"notes": ...}`, leaves the override untouched). The dashboard's own
+    Edit form always sends `base_url` (pre-filled with the current value, so
+    even a notes-only edit through that form clears the override) --
+    deliberately: pressing Save in Edit is the escape hatch for a
+    stale-override mismatch, and comparing against the stored value first
+    would remove that escape hatch for the exact case this fix exists for.
+  - **Every fix in this pass has its own test, and the two most load-
+    bearing (the ranking discount, the import key-drop) were negative-
+    controlled against the committed file**: reverting the discount's
+    membership check failed exactly
+    `test_custom_provider_claiming_a_flagship_id_gets_the_relay_discount`;
+    disabling the key-drop loop failed exactly
+    `test_import_skip_also_drops_that_ids_api_key_so_it_never_misdirects`.
+    Both reverted cleanly (`git diff` on `app.py` confirmed clean) before
+    continuing.

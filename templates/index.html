@@ -4931,6 +4931,33 @@
       </details>
     </div>
 
+    <div class="sd-group sd-wide" id="cp-group">
+      <div class="sd-models-head">
+        <b>Custom providers</b>
+      </div>
+      <p class="sd-help">Add any OpenAI-compatible endpoint by name and base URL. It survives updates, shows up as an ordinary provider card, and its saved key is handled exactly like a real provider's.</p>
+      <p class="sd-help" id="cp-disabled-note" hidden>Custom providers are switched off (<code>custom_providers_manual</code>).</p>
+      <div class="sk-list" id="cp-list"></div>
+      <form class="sk-form" id="cp-form" autocomplete="off">
+        <input type="hidden" id="cp-id">
+        <div class="sk-inline">
+          <input type="text" id="cp-name" maxlength="120" placeholder="Provider name, e.g. My Company LLM" aria-label="Provider name" spellcheck="false">
+          <input type="text" id="cp-base-url" placeholder="Base URL, e.g. https://api.example.com/v1" aria-label="Base URL" spellcheck="false">
+        </div>
+        <div class="sk-inline">
+          <input type="text" id="cp-models-url" placeholder="Models URL (optional) &mdash; defaults to <base URL>/models" aria-label="Models URL" spellcheck="false">
+          <input type="text" id="cp-key-hint" maxlength="80" placeholder="Key format hint (optional), e.g. sk-..." aria-label="Key format hint" spellcheck="false">
+        </div>
+        <input type="text" id="cp-signup-url" maxlength="2000" placeholder="Where to get a key (optional) &mdash; a URL or a short note" aria-label="Where to get a key" spellcheck="false">
+        <textarea id="cp-notes" maxlength="1000" placeholder="Notes (optional)" aria-label="Notes"></textarea>
+        <div class="sk-err" id="cp-err" role="alert" hidden></div>
+        <div class="sd-actions">
+          <button class="btn sm" type="submit" id="cp-save">Add provider</button>
+          <button class="btn sm ghost" type="button" id="cp-cancel" hidden>Cancel edit</button>
+        </div>
+      </form>
+    </div>
+
     <div class="sd-group">
       <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
         <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
@@ -6849,6 +6876,16 @@
     return Math.max(1, m) + 'm';
   }
 
+  // A static provider's signup_url is always a real URL, but a CUSTOM
+  // provider's "where to get a key" field is explicitly free TEXT (per its
+  // own form's placeholder) -- e.g. "ask your admin". Rendering that as
+  // <a href="ask your admin"> would be a dead relative link. Same shape as
+  // pubSafeUrl/ghSafeUrl elsewhere in this file: http(s) only, no stray
+  // whitespace/quotes/angle-brackets.
+  function providerKeyLinkUrl(u){
+    var s = String(u == null ? '' : u).trim();
+    return /^https?:\/\/[^\s<>"']+$/i.test(s) ? s : '';
+  }
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -6856,6 +6893,10 @@
     var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
     if (p.recommended) badges += '<span class="badge recommended" title="' + esc(REC_TIP) + '">' + STAR_SVG + 'Recommended</span>';
     if (p['new']) badges += '<span class="badge new-provider" title="' + esc(NEW_TIP) + '">' + NEW_SVG + 'New</span>';
+    // Added by the owner in Settings -> Custom providers. Edit/Remove live
+    // there (next to its key field), not on this card -- the badge is just
+    // the identity marker so it is obvious which cards are user-added.
+    if (p.custom) badges += '<span class="badge" title="Added by you in Settings -> Custom providers; edit or remove it there">Custom</span>';
     // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
     // free tier; every other provider has one, so it shows BOTH free + paid.
     /* No free tier (morph): its catalog still lists models, but none is free
@@ -7011,9 +7052,14 @@
          A "Get a free key" link next to it just sent people to the homepage to
          hunt for something that does not exist. */
       (p.signup_url && p.id !== 'puter' && !p.can_mint_key ?
-        '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
-          '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
-          'Get a free key</a>' : '') +
+        (providerKeyLinkUrl(p.signup_url) ?
+          '<a class="keylink" href="' + esc(providerKeyLinkUrl(p.signup_url)) + '" target="_blank" rel="noopener noreferrer">' +
+            '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
+            'Get a free key</a>' :
+          // A CUSTOM provider's field is explicitly free text (not always a
+          // URL) -- show it as a plain note (reusing the existing .notes
+          // class, no new CSS) instead of a dead relative link.
+          '<div class="notes">' + esc(p.signup_url) + '</div>') : '') +
       /* Vendors whose docs say "keys are free, mint another when one is spent"
          (Dahl) get a real button instead of a link to a signup page — one click
          is the whole flow, no email and no card. */
@@ -7588,8 +7634,14 @@
           '<div class="gstep-top"><span class="gstep-name">' + esc(s.name) + '</span>' + badges + '</div>' +
           (models ? '<div class="gstep-models">' + esc(models) + '</div>' : '') +
           (s.friction ? '<div class="gstep-friction">' + esc(s.friction) + '</div>' : '') +
+          // A custom provider's "where to get a key" field is free text, not
+          // always a URL (same providerKeyLinkUrl guard as the provider card)
+          // -- show it as a note instead of a dead relative link.
+          (!providerKeyLinkUrl(s.signup_url) && s.signup_url ?
+            '<div class="gstep-friction">' + esc(s.signup_url) + '</div>' : '') +
           '<div class="gstep-row">' +
-            '<a class="btn sm" href="' + esc(s.signup_url) + '" target="_blank" rel="noopener noreferrer">Open signup</a>' +
+            (providerKeyLinkUrl(s.signup_url) ?
+              '<a class="btn sm" href="' + esc(providerKeyLinkUrl(s.signup_url)) + '" target="_blank" rel="noopener noreferrer">Open signup</a>' : '') +
             '<input type="password" autocomplete="off" spellcheck="false" placeholder="' +
               esc(s.key_hint ? ('paste key (' + s.key_hint + ')') : 'paste key here') + '">' +
             '<button type="button" class="btn sm primary gstep-save">Save</button>' +
@@ -15050,6 +15102,119 @@
     skillsTriggerSync();
   }
 
+  /* ---------- custom providers (Settings -> "Add a provider", 2026-10-24) ----------
+     Mirrors the Skills list+form above (same sk-list/sk-row/sk-form classes --
+     no new CSS). A created/edited provider ALSO shows up as an ordinary card
+     on the Providers page: /api/providers already includes it (the backend
+     merge point), so renderGrid() there needs no changes at all. */
+  var _customProviders = [];
+  function renderCustomProviders(r){
+    if (!r) return;
+    var disabled = !r.enabled;
+    var note = $('#cp-disabled-note'); if (note) note.hidden = !disabled;
+    var form = $('#cp-form'); if (form) form.hidden = disabled;
+    _customProviders = r.providers || [];
+    var list = $('#cp-list');
+    if (!list) return;
+    list.innerHTML = _customProviders.length ? _customProviders.map(function(p){
+      var desc = esc(p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet');
+      // A later update can ship a BUILT-IN provider using this same id --
+      // the built-in then wins and this definition (and its saved key) is
+      // no longer in effect. Shown, never auto-fixed; the user decides
+      // whether to rename or remove it.
+      var warn = p.shadowed ?
+        '<div class="sk-desc">&#9888; A built-in provider now uses this id -- ' +
+        'this definition is not in effect. Rename or remove it.</div>' : '';
+      // Its own key field, right here -- reuses the provider card's
+      // key-entry classes (.keyrow/.kwrap/.key-input, already styled) and
+      // the EXISTING /api/providers/<id>/keys route (no new route, no
+      // second key-storage path).
+      var keyField = disabled ? '' :
+        '<form class="keyrow cp-key-form" data-cp-key-pid="' + esc(p.id) + '">' +
+          '<div class="kwrap"><input type="password" class="key-input" autocomplete="off" ' +
+            'spellcheck="false" placeholder="' + esc(p.key_hint || (p.has_key ? 'paste another key to add' : 'paste API key')) + '" ' +
+            'aria-label="API key for ' + esc(p.name) + '"></div>' +
+          '<button type="submit" class="btn sm">Save key</button>' +
+        '</form>';
+      return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(p.name) +
+        ' <code>' + esc(p.id) + '</code></div><div class="sk-desc">' + desc + '</div>' + warn +
+        keyField + '</div>' +
+        '<div class="sk-acts">' +
+        (disabled ? '' :
+          '<button class="btn sm ghost" type="button" data-cp-edit="' + esc(p.id) + '">Edit</button>' +
+          '<button class="btn sm ghost" type="button" data-cp-del="' + esc(p.id) + '">Remove</button>') +
+        '</div></div>';
+    }).join('') : '<p class="sd-help">None yet. Add a name and base URL below.</p>';
+  }
+  function loadCustomProviders(silent){
+    return api('/api/custom-providers').then(renderCustomProviders)
+      .catch(function(e){ if (!silent) toast('Custom providers: ' + e.message, true); });
+  }
+  function cpFormReset(){
+    $('#cp-id').value = ''; $('#cp-name').value = ''; $('#cp-base-url').value = '';
+    $('#cp-models-url').value = ''; $('#cp-key-hint').value = ''; $('#cp-signup-url').value = '';
+    $('#cp-notes').value = ''; $('#cp-save').textContent = 'Add provider';
+    $('#cp-cancel').hidden = true; $('#cp-err').hidden = true;
+  }
+  function initCustomProviders(){
+    var group = $('#cp-group');
+    if (!group) return;
+    group.addEventListener('click', function(ev){
+      var t = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+      if (!t) return;
+      var del = t.getAttribute('data-cp-del'), ed = t.getAttribute('data-cp-edit');
+      if (del){
+        var p = _customProviders.filter(function(x){ return x.id === del; })[0];
+        if (!p || !window.confirm('Remove the provider "' + p.name + '"? This also deletes its saved key.')) return;
+        api('/api/custom-providers/' + encodeURIComponent(del), { method: 'DELETE', body: { confirm: true } })
+          .then(function(){ toast('Provider removed'); loadCustomProviders(); loadProviders(); if ($('#cp-id').value === del) cpFormReset(); })
+          .catch(function(e){ toast('Custom providers: ' + e.message, true); });
+      } else if (ed){
+        var p2 = _customProviders.filter(function(x){ return x.id === ed; })[0];
+        if (!p2) return;
+        $('#cp-id').value = p2.id; $('#cp-name').value = p2.name;
+        $('#cp-base-url').value = p2.base_url || ''; $('#cp-models-url').value = p2.models_url || '';
+        $('#cp-key-hint').value = p2.key_hint || ''; $('#cp-signup-url').value = p2.signup_url || '';
+        $('#cp-notes').value = p2.notes || '';
+        $('#cp-save').textContent = 'Save changes'; $('#cp-cancel').hidden = false;
+        $('#cp-name').focus();
+      }
+    });
+    // Per-row key save -- goes through the EXISTING /api/providers/<id>/keys
+    // route (the one a real provider's card key field already uses), not a
+    // second key-storage path.
+    group.addEventListener('submit', function(ev){
+      var form = ev.target && ev.target.closest ? ev.target.closest('.cp-key-form') : null;
+      if (!form) return;
+      ev.preventDefault();
+      var pid = form.getAttribute('data-cp-key-pid');
+      var input = form.querySelector('.key-input');
+      var key = input ? input.value.trim() : '';
+      if (!key){ toast('Enter a key first', true); return; }
+      var btn = form.querySelector('button');
+      if (btn) btn.disabled = true;
+      api('/api/providers/' + encodeURIComponent(pid) + '/keys', { method: 'POST', body: { api_key: key } })
+        .then(function(){ toast('Key saved'); loadCustomProviders(); loadProviders(); })
+        .catch(function(e){ toast('Custom providers: ' + e.message, true); })
+        .then(function(){ if (btn) btn.disabled = false; });
+    });
+    $('#cp-cancel').addEventListener('click', cpFormReset);
+    $('#cp-form').addEventListener('submit', function(ev){
+      ev.preventDefault();
+      var err = $('#cp-err'), btn = $('#cp-save'), id = $('#cp-id').value;
+      var body = { name: $('#cp-name').value, base_url: $('#cp-base-url').value,
+                   models_url: $('#cp-models-url').value, key_hint: $('#cp-key-hint').value,
+                   signup_url: $('#cp-signup-url').value, notes: $('#cp-notes').value };
+      err.hidden = true; btn.disabled = true;
+      var req = id ? api('/api/custom-providers/' + encodeURIComponent(id), { method: 'PUT', body: body })
+                   : api('/api/custom-providers', { method: 'POST', body: body });
+      req.then(function(){ toast(id ? 'Provider saved' : 'Provider added'); cpFormReset();
+                           loadCustomProviders(); loadProviders(); })
+        .catch(function(e){ err.textContent = e.message; err.hidden = false; })
+        .then(function(){ btn.disabled = false; });
+    });
+  }
+
   /* ---------- enhance-opening-prompts toggle (Settings drawer) ---------- */
   function loadPromptEnhance(silent){
     return api('/api/prompt-enhance').then(function(r){
@@ -16039,6 +16204,7 @@
     try { loadPromptEnhance(silent); } catch (e) {}
     try { loadReasoning(silent); } catch (e) {}
     try { loadSkills(silent); } catch (e) {}
+    try { loadCustomProviders(silent); } catch (e) {}
     try { loadLowres(silent); } catch (e) {}
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
@@ -16052,7 +16218,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true); loadReasoning(true); loadSkills(true); loadLowres(true); loadHeartbeats(true);
+    loadPromptEnhance(true); loadReasoning(true); loadSkills(true); loadCustomProviders(true); loadLowres(true); loadHeartbeats(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -16090,7 +16256,14 @@
      explicitly out of scope server-side, see app.py's own comment on that), so this
      bundles the real remaining sections into one "Other settings" checkbox and says
      so plainly instead of offering a checkbox that would silently no-op. */
-  var _EXPORT_SECTION_MAP = { api: ['api_keys'], other: ['flags', 'default', 'local_api_key', 'media', 'images'] };
+  // custom_providers rides with "api_keys": a custom provider's KEY lives in
+  // the SAME providers[pid] row a real provider's does (api_keys already
+  // carries it), but WITHOUT its definition (name/base_url/...) that key
+  // would import onto an id the target machine's registry knows nothing
+  // about -- orphaned and never routed. Exporting them together keeps a
+  // custom provider's key and its endpoint definition inseparable.
+  var _EXPORT_SECTION_MAP = { api: ['api_keys', 'custom_providers'],
+                              other: ['flags', 'default', 'local_api_key', 'media', 'images'] };
   function openExportModal(){
     var body = frag();
     var opts = document.createElement('div'); opts.className = 'export-opts';
@@ -16778,6 +16951,7 @@
   initPromptEnhance();
   initReasoning();
   initSkills();
+  initCustomProviders();
   initLowres();
   initHeartbeats();
   initWhatsNewButton();

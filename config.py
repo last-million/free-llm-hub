@@ -826,6 +826,98 @@ def clear_provider_keys(pid: str) -> None:
         save_config(cfg)
 
 
+# --------------------------------------------------------------------------- #
+# Custom providers (user-added, Settings -> "Add a provider", 2026-10-24).
+#
+# A NEW top-level block, `custom_providers`, deliberately OUTSIDE `providers`:
+# it holds the DEFINITION (name/base_url/models_url/signup_url/key_hint/notes/
+# created_at) -- no secret ever lives here, so it has no business going
+# through _encrypt_secrets/_decrypt_secrets (which only ever look at
+# `providers`) and config.py's per-provider-row normalization
+# (_normalize_provider_row) never has to learn these extra fields. This is the
+# same reasoning that keeps the GitHub push feature's OAuth token under its own
+# top-level `github` key instead of inside `providers` -- see AGENTS.md
+# "GitHub push for Build projects", the "Token." paragraph -- applied here for
+# a plain-data block instead of a secret.
+#
+# A custom provider's KEY is a different story on purpose: it is saved through
+# the ORDINARY set_provider_config/add_provider_key/remove_provider_key calls
+# above, keyed by the custom provider's own id, landing in the exact same
+# `providers[<pid>]` row (and therefore the same encryption, masking, export
+# and migration-safety machinery) a real provider's key would. There is no
+# separate "custom provider key" storage path anywhere in this module.
+# --------------------------------------------------------------------------- #
+def get_custom_providers() -> dict:
+    """{pid: {name, base_url, models_url, signup_url, key_hint, notes,
+    created_at}} for every user-added custom provider. Cheap: backed by
+    get_setting's (mtime, size)-keyed cache, so a hot read-heavy caller (every
+    providers.get_provider lookup, transitively) never re-decrypts the whole
+    config on every call. Never raises; a corrupt/missing block reads as {}."""
+    v = get_setting("custom_providers", {})
+    return v if isinstance(v, dict) else {}
+
+
+def get_custom_provider(pid: str) -> Optional[dict]:
+    """One custom provider's definition, or None if it does not exist."""
+    row = get_custom_providers().get(pid)
+    return dict(row) if isinstance(row, dict) else None
+
+
+def set_custom_provider(pid: str, row: dict) -> None:
+    """Create or REPLACE one custom provider's definition (edit / import
+    semantics -- overwrite IS the point). Never touches its saved key(s) --
+    those live in providers[pid], untouched by this call."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cur = cfg.get("custom_providers")
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        cur[pid] = dict(row or {})
+        cfg["custom_providers"] = cur
+        save_config(cfg)
+
+
+def create_custom_provider(pid: str, row: dict) -> bool:
+    """Atomically create a BRAND NEW custom provider -- False (nothing
+    written) if `pid` already has one. Closes a TOCTOU gap: a caller that
+    reads get_custom_providers() to check for a collision, then separately
+    calls set_custom_provider(), could race a concurrent create of the same
+    id between the read and the write; this does the check-and-write under
+    ONE lock acquisition."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cur = cfg.get("custom_providers")
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        if pid in cur:
+            return False
+        cur[pid] = dict(row or {})
+        cfg["custom_providers"] = cur
+        save_config(cfg)
+        return True
+
+
+def delete_custom_provider(pid: str) -> bool:
+    """Remove the definition AND its saved key pool (providers[pid]) in one
+    atomic write. Returns True iff anything was actually removed."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        removed = False
+        cur = cfg.get("custom_providers")
+        if isinstance(cur, dict) and pid in cur:
+            cur = dict(cur)
+            cur.pop(pid, None)
+            cfg["custom_providers"] = cur
+            removed = True
+        provs = cfg.get("providers")
+        if isinstance(provs, dict) and pid in provs:
+            provs = dict(provs)
+            provs.pop(pid, None)
+            cfg["providers"] = provs
+            removed = True
+        if removed:
+            save_config(cfg)
+        return removed
+
+
 def get_default() -> Optional[dict]:
     """Return {'provider': pid, 'model': str} or None."""
     with _LOCK:

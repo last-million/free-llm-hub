@@ -50,7 +50,7 @@ def test_export_default_includes_all_sections(isolated_config):
     assert resp.status_code == 200
     body = resp.get_json()
     assert set(body["sections"]) == {"api_keys", "flags", "default", "local_api_key",
-                                     "media", "images"}
+                                     "media", "images", "custom_providers"}
     assert body["api_keys"]["groq"]["api_keys"] == ["key-one", "key-two"]
     assert body["api_keys"]["groq"]["enabled"] is True
     assert body["api_keys"]["cloudflare"]["base_url"] == \
@@ -142,7 +142,8 @@ def test_import_round_trips_full_export(isolated_config, tmp_path, monkeypatch):
     resp = fresh_client.post("/api/settings/import", json=exported, headers=_DASH)
     assert resp.status_code == 200
     assert set(resp.get_json()["imported"]) == {"api_keys", "flags", "default",
-                                                 "local_api_key", "media", "images"}
+                                                 "local_api_key", "media", "images",
+                                                 "custom_providers"}
 
     reimported = fresh_client.get("/api/settings/export?sections=all").get_json()
     assert reimported["api_keys"] == exported["api_keys"]
