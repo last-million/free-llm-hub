@@ -84,7 +84,9 @@ def test_tools_list_exposes_the_three_crew_tools():
                           "swarm_windows_stop",
                           # third family (PUBLISH-CLI): publish_*, wired by app.py
                           "publish_start", "publish_status", "publish_stop",
-                          "publish_renew"}
+                          "publish_renew",
+                          # fourth family (conversation memory), wired by app.py
+                          "memory_search", "memory_get"}
 
 
 def test_crew_run_sync(fake_runner):
