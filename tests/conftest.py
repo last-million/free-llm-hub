@@ -402,6 +402,39 @@ def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _conversation_memory_off_unless_tested(request, monkeypatch, tmp_path):
+    """DURABLE CONVERSATION MEMORY (app `_cmem_*`, convmem.py, flags
+    `conversation_memory` / `conversation_memory_note`) is default ON
+    (2026-10-24): it files what the hub clears or drops in a SQLite archive and
+    changes the stub text and adds a system note. Every other test file pins the
+    behaviour without it, byte for byte, and must never write a database into
+    the shared hub-state folder; the feature's own file turns it back on.
+    Either way the default archive points at a per-test temp file.
+
+    To run ANY test file with the feature on (what a fresh install gets), set
+    CMEM_TEST_ON=1 -- a way to check that the rest of the suite still passes
+    with the real defaults."""
+    import convmem
+    import os as _os
+    monkeypatch.setattr(convmem, "PATH", str(tmp_path / "conversation-memory.db"))
+    convmem.default.close()
+    mod = getattr(request.node, "module", None)
+    if _os.environ.get("CMEM_TEST_ON"):
+        yield
+        convmem.default.close()
+        return
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_conversation_memory":
+        try:
+            import app
+            monkeypatch.setattr(app, "_cmem_on", lambda: False)
+            monkeypatch.setattr(app, "_cmem_note_on", lambda: False)
+        except Exception:
+            pass
+    yield
+    convmem.default.close()
+
+
+@pytest.fixture(autouse=True)
 def _weak_models_not_force_verified(request, monkeypatch):
     """Tests written with low fake scores (10-100) are about their own subject;
     the "weak actor is always verified" wiring has its own test file."""

@@ -443,11 +443,26 @@ def looks_failed(text):
     return bool(_FAILED_CS_RE.search(probe) or _FAILED_CI_RE.search(probe))
 
 
-def cleared_stub(text):
+def mem_id(text):
+    """The id the hub's conversation archive files `text` under (the first 12
+    hex chars of its SHA-256; convmem.content_id is the same function, a test
+    pins them equal). Kept here too so this module stays import-free."""
+    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def cleared_stub(text, archived_id=None):
     """The one line that replaces a cleared result. A function of `text` alone
-    (no counters, no clock) so the same result gets the same bytes every turn."""
+    (no counters, no clock) so the same result gets the same bytes every turn.
+
+    With `archived_id` -- the id the original was filed under in the hub's
+    conversation archive (mem_id) -- the stub also says how to get it back.
+    Without it the line is byte-for-byte the one every earlier hub wrote."""
     head = re.sub(r"\s+", " ", text[:OLD_RESULT_EXCERPT_CHARS * 4]).strip()
     head = head[:OLD_RESULT_EXCERPT_CHARS] or "(no text)"
+    if archived_id:
+        return ("%s (was ~%d chars): %s. Fetch it with the hub tool memory_get "
+                "id=%s if available, or re-run the command.]"
+                % (CLEARED_RESULT_PREFIX, len(text), head, archived_id))
     return ("%s (was ~%d chars): %s. Re-run the command if you need it.]"
             % (CLEARED_RESULT_PREFIX, len(text), head))
 
@@ -496,7 +511,7 @@ def _with_stubs(m, stubs):
 def clear_old_tool_results(messages, keep_recent=OLD_RESULT_KEEP_RECENT,
                            min_chars=OLD_RESULT_MIN_CHARS, *, est_tokens=None,
                            min_tokens=OLD_RESULT_CLEAR_FROM_TOKENS,
-                           keep_failing=OLD_RESULT_KEEP_FAILING):
+                           keep_failing=OLD_RESULT_KEEP_FAILING, stub_fn=None):
     """-> (messages, stats). Old tool results longer than `min_chars` are
     replaced by one `cleared_stub` line; everything else is returned as it was.
 
@@ -513,6 +528,16 @@ def clear_old_tool_results(messages, keep_recent=OLD_RESULT_KEEP_RECENT,
     `rough_tokens`; 0 disables the size gate), a result already cleared, and a
     result the stub would not make shorter.
 
+    `stub_fn(text, message, slot) -> str | None`, when given, is asked for the
+    stub of each result that WILL be cleared (never one that is kept): the hub
+    uses it to file the original in its conversation archive and return a stub
+    that names the archive id. None, "", an exception or a line that is not
+    shorter than the result all fall back to `cleared_stub(text)`. A hook that
+    has a `prepare(entries)` attribute is first handed EVERY (text, message,
+    slot) that will be cleared, once, so it can file them in one batch (one
+    transaction instead of one per result). Without a hook every byte is what it
+    always was.
+
     Monotonic in time: a result that is cleared at turn T is cleared, to the
     same bytes, at every later turn (the keep window only moves forward and a
     failing step can only fall out of the last `keep_failing`)."""
@@ -520,14 +545,14 @@ def clear_old_tool_results(messages, keep_recent=OLD_RESULT_KEEP_RECENT,
              "kept_failing": 0, "skipped": None}
     try:
         return _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens,
-                                       min_tokens, keep_failing, stats)
+                                       min_tokens, keep_failing, stats, stub_fn)
     except Exception:                                            # noqa: BLE001
         stats.update(cleared=0, chars_before=0, chars_after=0, skipped="error")
         return messages, stats
 
 
 def _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens, min_tokens,
-                            keep_failing, stats):
+                            keep_failing, stats, stub_fn=None):
     if not isinstance(messages, list) or not messages:
         stats["skipped"] = "empty"
         return messages, stats
@@ -568,8 +593,9 @@ def _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens, min_to
             pinned = k
             break
     replaced = {}
+    todo = []                      # (message index, slot, stub, chars, text) to clear
     for u in range(older):
-        pending = {}               # message index -> {slot: (stub, chars before)}
+        pending = {}               # message index -> {slot: (stub, chars before, text)}
         for k in range(*spans[u]):
             m = messages[k]
             if not isinstance(m, dict) or k == pinned or _has_image(m):
@@ -580,18 +606,38 @@ def _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens, min_to
                     continue
                 stub = cleared_stub(text)
                 if len(stub) < len(text):
-                    pending.setdefault(k, {})[slot] = (stub, len(text))
+                    pending.setdefault(k, {})[slot] = (stub, len(text), text)
         if not pending:
             continue
         if u in protected:
             stats["kept_failing"] += 1
             continue
         for k, slots in pending.items():
-            replaced[k] = _with_stubs(messages[k], {s: v[0] for s, v in slots.items()})
-            for stub, n in slots.values():
-                stats["cleared"] += 1
-                stats["chars_before"] += n
-                stats["chars_after"] += len(stub)
+            for slot, (stub, n, text) in slots.items():
+                todo.append((k, slot, stub, n, text))
+    if stub_fn is not None and todo:
+        prepare = getattr(stub_fn, "prepare", None)
+        if callable(prepare):
+            try:
+                prepare([(text, messages[k], slot) for k, slot, _s, _n, text in todo])
+            except Exception:                                    # noqa: BLE001
+                pass
+    final = OrderedDict()          # message index -> {slot: (stub, chars before)}
+    for k, slot, stub, n, text in todo:
+        if stub_fn is not None:
+            try:
+                alt = stub_fn(text, messages[k], slot)
+            except Exception:                                    # noqa: BLE001
+                alt = None
+            if isinstance(alt, str) and alt and len(alt) < len(text):
+                stub = alt
+        final.setdefault(k, {})[slot] = (stub, n)
+    for k, slots in final.items():
+        replaced[k] = _with_stubs(messages[k], {s: v[0] for s, v in slots.items()})
+        for stub, n in slots.values():
+            stats["cleared"] += 1
+            stats["chars_before"] += n
+            stats["chars_after"] += len(stub)
     if not replaced:
         stats["skipped"] = "nothing"
         return messages, stats
@@ -943,6 +989,48 @@ def _exact_facts(messages, max_chars):
     while rules and _size() > max_chars:
         rules.pop(0)
     return sorted(rules + others, key=order.get) + file_facts
+
+
+def standing_rules(messages):
+    """The standing rules, preferences, names and recorded decisions in
+    `messages` (OpenAI chat shape), oldest first, in the same line format as
+    exact_facts (`user said: "..."`, `Decision: ...`), WITHOUT exact_facts' cap
+    of EXACT_FACTS_MAX_RULES: the hub's conversation archive unions these over
+    every compaction so a rule is never lost to a window or a rewritten recap.
+    Only what the user said (and decisions either side wrote) is read -- never
+    a tool result. Pure, bounded, never raises, credentials dropped."""
+    try:
+        out = OrderedDict()
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = message_text(m)
+            if not text:
+                continue
+            for carried in _carried_facts(text):
+                if carried.startswith("user said:") or _DECISION_LINE_RE.match(carried):
+                    out.pop(carried.lower(), None)
+                    out[carried.lower()] = carried
+            bridge = bool(_SUMMARY_BRIDGE_RE.search(text[:2000]))
+            if role == "user" and not bridge \
+                    and not _COMPACTION_REQUEST_RE.search(text[-6000:]):
+                for sent in _sentences(instruction_text(text)):
+                    if 4 <= len(sent) <= _USER_FACT_MAX_SENTENCE and _USER_RULE_RE.search(sent):
+                        line = "user said: \"%s\"" % _fact_clip(sent, 200)
+                        out.pop(line.lower(), None)
+                        out[line.lower()] = line
+            if not bridge:
+                for dm in _DECISION_LINE_RE.finditer(text):
+                    line = text[dm.start():].split("\n", 1)[0].strip(" \t-*")
+                    line = _fact_clip(line, 200)
+                    out.pop(line.lower(), None)
+                    out[line.lower()] = line
+        return _drop_secrets(list(out.values()))
+    except Exception:                                            # noqa: BLE001
+        return []
 
 
 def format_exact_facts(facts):

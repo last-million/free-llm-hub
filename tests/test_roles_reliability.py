@@ -116,7 +116,7 @@ def test_rr_compute_sent_est_mirrors_clearing(monkeypatch):
     msgs = [{"role": "user", "content": "x"}]
     cleared = [{"role": "user", "content": "cleared"}]
     monkeypatch.setattr(A.ctxwin, "clear_old_tool_results",
-                        lambda m, est_tokens=None: (cleared, {"cleared": 4}))
+                        lambda m, est_tokens=None, **kw: (cleared, {"cleared": 4}))
     monkeypatch.setattr(A, "_est_tokens",
                         lambda m, tools=None: 65000 if m is cleared else 180000)
     # flag on, est over the threshold -> the post-clear (sent) size
@@ -148,7 +148,7 @@ def test_roles_walk_fits_a_model_on_the_cleared_size(roles_env, monkeypatch):
     small' on the original size."""
     cleared = [{"role": "user", "content": "cleared"}]
     monkeypatch.setattr(A.ctxwin, "clear_old_tool_results",
-                        lambda m, est_tokens=None: (cleared, {"cleared": 9}))
+                        lambda m, est_tokens=None, **kw: (cleared, {"cleared": 9}))
     # cleared list -> 65K, the full conversation -> 180K, the tools-only ([])
     # estimate -> tiny (so the tool-schema pre-filter never trips).
     monkeypatch.setattr(A, "_est_tokens",
@@ -189,7 +189,7 @@ def test_front_door_refuses_only_when_the_cleared_size_cannot_fit(monkeypatch):
     cleared = [{"role": "user", "content": "cleared"}]
     monkeypatch.setattr(A.ctxwin, "is_compaction_request", lambda m: False)
     monkeypatch.setattr(A.ctxwin, "clear_old_tool_results",
-                        lambda m, est_tokens=None: (cleared, {"cleared": 9}))
+                        lambda m, est_tokens=None, **kw: (cleared, {"cleared": 9}))
     monkeypatch.setattr(A, "_est_tokens",
                         lambda m, tools=None: 65000 if m is cleared else 180000)
     monkeypatch.setattr(A, "_front_door_bound", lambda tools, images: (100000, 3))
