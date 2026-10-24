@@ -1170,6 +1170,60 @@ def is_idle_greeting(text, prompt_text=None):
         return False
 
 
+# A model handed something it cannot do (an image it cannot see, a file type it
+# cannot open) and answers ONLY "I can't do that" is not an answer to the task:
+# the hub must switch to a model that can (2026-10-24, owner: "if a model can't
+# do a task the hub should understand it and switch to another model"). MEASURED:
+# a CLI turn carrying a screenshot was answered "I can't read image files -- this
+# model doesn't support image input ...". Narrow on purpose (same gate shape as
+# the idle greeting): a SHORT reply whose OPENING is the incapacity, so a long
+# answer that merely mentions image support in passing is never cut.
+_INCAPABLE_MAX_CHARS = 500
+_INCAPABLE_HEAD_CHARS = 240
+_INCAPABLE_OFFER_MAX_START = 60
+# Scoped to a MISSING VISION capability on purpose. It must NOT catch a real
+# task outcome like "I can't access files outside the project" (a sandbox/tool
+# refusal the model is correctly REPORTING, not a capability it lacks -- that is
+# a served answer, pinned by test_no_tools_claim). So: only image/vision/
+# screenshot nouns, and no bare "access"/"open"/"file" wording.
+_INCAPABLE_RE = re.compile(
+    r"\b(?:i(?:'m| am)?\s+(?:can(?:'|no)t|unable to|not able to)\s+"
+    r"(?:see|view|read|process|analy[sz]e|interpret|display|render)\b"
+    r".{0,40}?\b(?:image|images|picture|photo|screenshot|screen ?shot|visual)s?\b"
+    r"|(?:this|the|current)\s+model\s+(?:does(?:n'|\s+no)t|cannot|can'?t)\s+"
+    r"support\s+(?:image|images|vision|visual|multimodal)\b"
+    r"|(?:image|vision|visual|multimodal)\s+input\s+(?:is\s+)?not\s+supported\b"
+    r"|i\s+don'?t\s+have\s+the\s+(?:ability|capability)\s+to\s+(?:see|read|view|process)\b"
+    r".{0,30}?\b(?:image|images|picture|photo|screenshot|visual)s?\b)", re.I)
+
+
+def _cannot_do_capability(masked, prompt_text):
+    """0 when a short reply OPENS by refusing the task on a missing capability
+    (cannot see the image / no image-input support), else None. The caller gates
+    it to relay hops and tool turns, like the idle greeting."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head or len(head) > _INCAPABLE_MAX_CHARS:
+        return None
+    m = _INCAPABLE_RE.search(head[:_INCAPABLE_HEAD_CHARS])
+    if not m or m.start() > _INCAPABLE_OFFER_MAX_START:
+        return None
+    # The user asking ABOUT a model's image support is a real question, not a task
+    # the reply failed: "does this model support images?" -> a "no" IS the answer.
+    pt = (str(prompt_text or "")).lower()
+    if "support" in pt and ("image" in pt or "vision" in pt):
+        return None
+    return 0
+
+
+def is_cannot_do_capability(text, prompt_text=None):
+    """Public form of the capability-refusal check. Never raises."""
+    try:
+        return isinstance(text, str) and _cannot_do_capability(
+            _mask_code(text), prompt_text) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _meta_leak(masked, text, prompt_text, at_start=True):
     """Offset of leaked metadata/template junk in `text` (indices shared with
     `masked`), or None. `at_start`: `text` is the reply's head, so the
@@ -1497,6 +1551,12 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             # any relay hop): the model never took the conversation in -- fail the hop over.
             ("idle_greeting", lambda: (None if offset or not (relay or tools_offered)
                                        else _idle_greeting(masked, last_prompt))),
+            # A short reply that OPENS by refusing the task for a missing
+            # capability ("I can't see images", "this model doesn't support
+            # image input"): a failed hop, so the chain switches to a model that
+            # can. Same gate as the idle greeting (relay hops / tool turns).
+            ("cannot_do", lambda: (None if offset or not (relay or tools_offered)
+                                   else _cannot_do_capability(masked, last_prompt))),
         )
         for reason, fn in checks:
             cut = fn()

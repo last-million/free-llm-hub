@@ -106,16 +106,18 @@ def test_the_models_advertise_that_they_can_call_tools():
         assert spec.get("tool_call") is True, mid
 
 
-def test_the_vision_mode_accepts_attachments():
-    """Only the vision mode -- the bare "vision" id and its "vision-<effort>"
-    compounds -- routes to models that can take an image. Declaring attachment
-    on any other mode would invite opencode to send an image into a chain that
-    cannot take one."""
-    if "vision" in MODELS:
-        vision = [m for m in MODELS if m == "vision" or m.startswith("vision-")]
-        assert all(MODELS[m].get("attachment") is True for m in vision)
-        others = [m for m in MODELS if m not in vision]
-        assert all(MODELS[m].get("attachment") is False for m in others)
+def test_every_mode_accepts_attachments():
+    """EVERY mode accepts an image, not just the vision mode (2026-10-24, owner:
+    "the hub should know which models support images ... and switch if a model
+    can't"). The hub handles an image on any mode server-side -- an unpinned
+    image turn routes to a vision model, and a pipeline tier / non-vision mode
+    has the image DESCRIBED by a vision model first
+    (app._predescribe_pipeline_images) -- so opencode must SEND the screenshot
+    instead of stripping it client-side and printing "this model doesn't support
+    image input" itself."""
+    assert MODELS, "no modes generated"
+    for mid, spec in MODELS.items():
+        assert spec.get("attachment") is True, mid
 
 
 def test_the_labels_are_still_there():

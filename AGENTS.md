@@ -6751,3 +6751,58 @@ dir, like `tests/test_provider_out_reason.py`).
     `test_import_skip_also_drops_that_ids_api_key_so_it_never_misdirects`.
     Both reverted cleanly (`git diff` on `app.py` confirmed clean) before
     continuing.
+
+## Images work on every mode and every CLI (2026-10-24)
+
+Owner: "the hub should know which models support images -- which can see and
+which can't -- and if a model can't do a task the hub should switch to another
+one ... in all supported CLIs." Reported symptom (opencode `coding-swarm`): "I
+can't read image files -- this model doesn't support image input." That line was
+opencode's OWN, printed because the hub declared `attachment: false` on every
+opencode mode but `vision`, so a screenshot was stripped client-side and never
+reached the hub. Covered by `tests/test_images_on_every_mode.py` and the updated
+`tests/test_a_session_that_never_compacts.py::test_every_mode_accepts_attachments`.
+
+- **Every opencode mode now advertises image input** (`agentic_chat._opencode_hub_models`,
+  `spec(..., attachment=True)` for all modes, not just vision). Codex inherits
+  image capability from its own catalog template (`_codex_catalog_models` clones
+  the bundled entry's fields); Claude Code sends images natively -- so no per-CLI
+  flag was needed for those two. The actual handling is server-side and shared,
+  so it covers EVERY CLI.
+- **Server-side describe for a turn that bypasses the native vision route**
+  (`app._predescribe_pipeline_images`, gated by `_turn_bypasses_vision_route`):
+  a pipeline tier (swarm/multi/crews/compounds -- which dispatch before routing
+  and fan out to text models) or a non-vision category mode (coding/reasoning/
+  ...) has each image DESCRIBED by a vision model up front (reusing
+  `_vision_assist`/`_describe_image`), so the answering model gets words it can
+  read. Wired in ALL THREE /v1 handlers right after `est` is computed and before
+  the front door / pipeline dispatch (chat `body["messages"]`, responses
+  `messages`, messages `oai_messages`), so it reaches every CLI. auto / best /
+  empty / an explicit pin / the vision mode keep the native path -- an unpinned
+  image turn routes to a real vision model (`_route_for_vision`), a pinned one is
+  handled by the existing `_vision_assist` at the single-model site, so a model
+  that CAN see gets the real image. Fails open: a fleet with no vision model
+  leaves the turn untouched (the image rides through as before). Never raises.
+- **"I can't see images" is a non-answer -> the chain switches** (owner: "if a
+  model can't do a task the hub should switch"). `answer_check._cannot_do_capability`
+  (reason `cannot_do`, public `is_cannot_do_capability`): a SHORT reply (<= 500
+  chars) whose OPENING (first 240 chars, within 60) is a missing-VISION refusal
+  ("I can't see/read/view/process images", "this model doesn't support image/
+  vision/multimodal input", "image input is not supported", "I don't have the
+  ability to see images") is junk, so the hop fails over to a model that can.
+  Wired into `inspect` with the SAME gate as the idle greeting (relay hops / tool
+  turns, at the opening only). Scoped to VISION on purpose -- it must NOT catch a
+  real task outcome like "I can't access files outside the project" (a sandbox/
+  tool refusal the model is correctly REPORTING, pinned by `test_no_tools_claim`);
+  the regex dropped the generic "access/open/file" wording after that exact false
+  positive was caught in the full suite. A user question ABOUT image support gets
+  an honest "no" (not treated as a failed hop).
+- **Settings touched at the owner's request (runtime config, not code)**:
+  `cli_multi_approval` -> `chat` (a CLI can start real parallel agent sessions
+  when the user replies "go multi"/"yes", no dashboard click) and
+  `subscription_scope` -> `all` (subscriptions may act as sub-agents, NOT just
+  reviewer) -- but the `/subscriptions` master switch stays OFF, so nothing paid
+  runs until the owner enables it there. Reliable parallel-agents path for a weak
+  CLI model that will not call the `swarm_windows_start` MCP tool itself: select
+  the `multi` tier (`coding-multi`), which `_cm_multi_cli_intercept` starts as a
+  real `swarm_windows` run without needing a tool call.

@@ -3625,6 +3625,41 @@ def _vision_assist(messages, est=0):
     return (out, done) if done else (messages, 0)
 
 
+def _turn_bypasses_vision_route(model_id):
+    """True when this turn will NOT reach the native vision router
+    (_route_for_vision) -- a pipeline tier (swarm/multi/crews/compounds, which
+    dispatch before routing and fan out to text models) or a specific non-vision
+    category mode (coding / reasoning / ...). For auto / best / empty / an
+    explicit pin, or the vision mode itself, this is False: those paths already
+    put a real image in front of a model that can see it (routing picks a vision
+    model; a pin is handled by _vision_assist at the single-model site)."""
+    mid = (model_id or "").strip().lower()
+    try:
+        if _is_swarm_model(mid):
+            return True
+        m = _valid_mode(mid)
+        return bool(m and m != MODE_ALL and m != "vision")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _predescribe_pipeline_images(model_id, messages, est=0):
+    """For a turn that bypasses the native vision route (see
+    _turn_bypasses_vision_route), replace each image with a vision-model
+    DESCRIPTION up front, so every downstream model -- a swarm/multi helper, a
+    non-vision category mode -- gets words it can read instead of an image it
+    cannot. This is what makes a screenshot work on EVERY mode and in EVERY CLI
+    (the three /v1 handlers all call it): the answering model never has to say
+    "I can't see images". Returns (messages, n_described); fails open (a fleet
+    with no vision model leaves the turn untouched, exactly as before)."""
+    try:
+        if not _message_images(messages) or not _turn_bypasses_vision_route(model_id):
+            return messages, 0
+        return _vision_assist(messages, est)
+    except Exception:                                            # noqa: BLE001
+        return messages, 0
+
+
 def _is_vision_model(pid, model):
     """Can this model actually read an image?
 
@@ -46969,6 +47004,15 @@ def _chat_completions_uncached(body):
     _armed = _request_path_endswith("/v1/chat/completions")
     _est0 = _est_tokens(body.get("messages"), body.get("tools"))
     _rr_set_request_fit(body.get("messages"), body.get("tools"), _est0)   # fix #1
+    # IMAGES ON A PIPELINE TIER OR A NON-VISION MODE: describe them up front so
+    # the fan-out / category turn gets words (see _predescribe_pipeline_images).
+    if has_images:
+        _dmsgs, _dn = _predescribe_pipeline_images(body.get("model"),
+                                                   body.get("messages"), _est0)
+        if _dn:
+            body["messages"] = _dmsgs
+            has_images = bool(_message_images(_dmsgs))
+            _est0 = _est_tokens(body.get("messages"), body.get("tools"))
     # signal=False: this early call only sets up the original size and the
     # steering state; arming the overflow signal here would change how a
     # pipeline actor hop is served (the later _ctx_begin arms the single-model
@@ -48161,6 +48205,14 @@ def v1_responses(_retry_pass=False, _hedged=False):
     tools = _responses_tools_to_chat(body.get("tools"))
     est = _est_tokens(messages, tools)
     _rr_set_request_fit(messages, tools, est)   # fix #1: fit on the post-clear size
+    # IMAGES ON A PIPELINE TIER OR A NON-VISION MODE: describe up front (see
+    # _predescribe_pipeline_images), so codex's image reaches a model as words.
+    if has_images:
+        _dmsgs, _dn = _predescribe_pipeline_images(body.get("model"), messages, est)
+        if _dn:
+            messages = _dmsgs
+            has_images = bool(_message_images(messages))
+            est = _est_tokens(messages, tools)
 
     # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
@@ -49239,6 +49291,14 @@ def v1_messages():
     tools = _anthropic_tools_to_openai(body.get("tools"))
     est = _est_tokens(oai_messages, tools)
     _rr_set_request_fit(oai_messages, tools, est)   # fix #1: fit on the post-clear size
+    # IMAGES ON A PIPELINE TIER OR A NON-VISION MODE: describe up front (see
+    # _predescribe_pipeline_images), so Claude Code's image reaches a model as words.
+    if has_images:
+        _dmsgs, _dn = _predescribe_pipeline_images(body.get("model"), oai_messages, est)
+        if _dn:
+            oai_messages = _dmsgs
+            has_images = bool(_message_images(oai_messages))
+            est = _est_tokens(oai_messages, tools)
     has_tools = bool(tools)
     diff = None
     _orch_reply = _orch_command_response("messages", body, oai_messages, est)

@@ -1339,7 +1339,7 @@ def _opencode_hub_models():
     `limit.context` is PER ID (declared_window): the window the models behind
     that id actually hold, not one figure for every mode. The output reserve
     stays _HUB_MAX_OUTPUT, capped at a quarter of a small window."""
-    def spec(mid, name, attachment=False):
+    def spec(mid, name, attachment=True):
         # A FRESH limit dict per entry: one shared object means a later edit to
         # any single model silently rewrites all ten, and json.dump would not
         # show the aliasing.
@@ -1351,13 +1351,20 @@ def _opencode_hub_models():
                 "temperature": True,
                 "attachment": attachment}
 
+    # EVERY mode accepts an image (attachment=True), not just the vision mode
+    # (2026-10-24, owner: "the hub should know which models support images ...
+    # and if a model can't do a task the hub should switch"). The restriction
+    # to vision-only meant opencode STRIPPED a screenshot client-side on
+    # coding-swarm / auto / best and printed "this model doesn't support image
+    # input" ITSELF -- the image never reached the hub. The hub handles an image
+    # on any mode server-side: an unpinned image turn routes to a vision model
+    # (_route_for_vision), and a pipeline tier or a non-vision mode has the image
+    # DESCRIBED by a vision model first (_predescribe_pipeline_images), so the
+    # answering model always gets something it can read. A fleet with no vision
+    # model at all still fails open (the image rides through as before).
     out = {k: spec(k, v) for k, v in _OPENCODE_EFFORT.items()}
     for key, label, _help in model_categories.labels():
-        # Only the vision mode routes to models that can take an image. Saying
-        # so on every mode would invite the CLI to send one into a chain that
-        # cannot serve it.
-        out.setdefault(key, spec(key, "mode: %s -- %s only" % (key, label.lower()),
-                                 attachment=(key == "vision")))
+        out.setdefault(key, spec(key, "mode: %s -- %s only" % (key, label.lower())))
         # ...and the same category combined with each heavier effort, so the one
         # pick a flat-list CLI makes can carry BOTH axes ("coding + swarm").
         # Skip any label that is itself an effort id (model_categories lists
@@ -1370,7 +1377,7 @@ def _opencode_hub_models():
             if cid in out:
                 continue
             out[cid] = spec(cid, "%s + %s -- %s models, %s" % (
-                key, tier, label.lower(), tail), attachment=(key == "vision"))
+                key, tier, label.lower(), tail))
     return out
 
 
