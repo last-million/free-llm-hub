@@ -1072,6 +1072,61 @@ def is_tool_deadend(text, prompt_text=None):
         return False
 
 
+# MEASURED 2026-10-24 (opencode `coding-swarm`, session ses_e9602c99, 01:46 and 01:49):
+# the user had sent a concrete 372-character task ("start with whitebit and go exploit all
+# of ..."). The real models stalled, the chain fell to a relay's gpt-5, and that model -- which
+# had not taken the conversation in -- answered "Sure-how can I help today? Here are some common
+# things I can do: explain a concept or code snippet ..." / "What would you like me to help you
+# with today?". It is clean prose with no tool call, so the hub served it as the final answer,
+# the CLI's turn ended, and the user had to type the task again (twice).
+# A reply that is ONLY an offer to help is never an answer to a concrete task. Narrow on
+# purpose: tool turns and relay hops only, a SHORT reply, the offer in its opening, and a prompt
+# that is a real instruction (not a greeting, not a question about what the assistant can do).
+_IDLE_MAX_CHARS = 600
+_IDLE_HEAD_CHARS = 200
+# The offer must OPEN the reply ("Sure-how can I help today?", "Hello! How can I help you?"):
+# starting at char 0-40. An answer that delivers content and only then ends with "Next: what
+# would you like to do?" is a real answer (caught by the full suite: tests/test_double_answer).
+_IDLE_OFFER_MAX_START = 40
+_IDLE_MIN_PROMPT_WORDS = 5
+_IDLE_OFFER_RE = re.compile(
+    r"\bhow (?:can|may|could) i (?:help|assist)\b"
+    r"|\bwhat (?:would|do) you (?:like|want|need)(?: me)? to (?:help|do|work|talk|get)\b"
+    r"|\bwhat (?:can|should) i (?:help|do for)\b"
+    r"|\bwhat (?:are you|would you be) (?:looking|hoping) (?:for|to)\b"
+    r"|\bhere are some (?:common |popular |example )?(?:things|ways)(?: that)? i can\b"
+    r"|\bhow can i be of (?:help|assistance)\b"
+    r"|\bis there anything (?:specific |in particular )?(?:i can|you(?:'d| would) like)\b", re.I)
+_IDLE_PROMPT_ASKS_RE = re.compile(
+    r"\bwhat (?:can|do|are) you\b|\bwho are you\b|\byour (?:capabilit|abilit|feature)"
+    r"|\bwhat are you able\b|\bhow can you help\b|\bwhat can i (?:ask|do with)\b", re.I)
+
+
+def _idle_greeting(masked, prompt_text):
+    """0 when the whole reply is a bare offer to help ("What would you like me to help you
+    with today?") although the user's turn is a concrete instruction, else None."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head or len(head) > _IDLE_MAX_CHARS:
+        return None
+    m = _IDLE_OFFER_RE.search(head[:_IDLE_HEAD_CHARS])
+    if not m or m.start() > _IDLE_OFFER_MAX_START:
+        return None
+    pt = _instruction(str(prompt_text or "")) or ""
+    if len(pt.split()) < _IDLE_MIN_PROMPT_WORDS:
+        return None                          # "hi" / "hello there": an offer IS the answer
+    if _IDLE_PROMPT_ASKS_RE.search(pt) or _IDLE_OFFER_RE.search(pt):
+        return None                          # the user is asking what the assistant can do
+    return 0
+
+
+def is_idle_greeting(text, prompt_text=None):
+    """Public form of the idle-greeting check (see _idle_greeting). Never raises."""
+    try:
+        return isinstance(text, str) and _idle_greeting(_mask_code(text), prompt_text) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _meta_leak(masked, text, prompt_text, at_start=True):
     """Offset of leaked metadata/template junk in `text` (indices shared with
     `masked`), or None. `at_start`: `text` is the reply's head, so the
@@ -1321,6 +1376,8 @@ def reads_as_answer(text, *, last_prompt=None, relay=False):
             return False
         if relay and is_tool_deadend(text, last_prompt):
             return False
+        if is_idle_greeting(text, last_prompt):
+            return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
             return False
@@ -1393,6 +1450,10 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             # sentence is a failed hop, never the reply that ends the loop.
             ("tool_deadend", lambda: (None if offset or not (relay and tools_offered)
                                       else _tool_deadend(masked, last_prompt))),
+            # A bare "how can I help you today?" in answer to a concrete task (tool turns, or
+            # any relay hop): the model never took the conversation in -- fail the hop over.
+            ("idle_greeting", lambda: (None if offset or not (relay or tools_offered)
+                                       else _idle_greeting(masked, last_prompt))),
         )
         for reason, fn in checks:
             cut = fn()
