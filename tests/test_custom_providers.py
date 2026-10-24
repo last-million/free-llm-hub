@@ -142,10 +142,18 @@ def test_edit_base_url_overrides_a_stale_advanced_card_override():
         "https://new.example.com/v1"
 
 
-def test_edit_without_touching_base_url_leaves_any_override_alone():
-    """The override is cleared ONLY when the edit actually changes base_url
-    -- an edit of unrelated fields (e.g. notes) must not have this side
-    effect at all."""
+def test_edit_body_that_omits_base_url_entirely_leaves_any_override_alone():
+    """The override is cleared when the PUT body carries a `base_url` key AT
+    ALL (api_custom_provider_update checks `"base_url" in fields`, presence
+    in the submitted body -- NOT whether the new value differs from the one
+    already stored). This test exercises a body that omits the key
+    entirely (e.g. a direct API call sending only `{"notes": ...}`) -- the
+    dashboard's own Edit form always includes `base_url` (pre-filled with
+    the current value), so a notes-only edit made THROUGH THAT FORM still
+    clears a stale override; that is deliberate (Save-in-Edit is the escape
+    hatch for the exact stale-override mismatch
+    test_edit_base_url_overrides_a_stale_advanced_card_override proves),
+    not a bug, and is covered separately below."""
     _create(_basic_body())
     _client().post("/api/providers/my-test-provider",
                    json={"base_url": "https://override.example.com/v1"}, headers=_auth())
@@ -154,6 +162,27 @@ def test_edit_without_touching_base_url_leaves_any_override_alone():
     assert r.status_code == 200
     assert config.get_provider_config("my-test-provider")["base_url"] == \
         "https://override.example.com/v1"
+
+
+def test_dashboard_style_edit_body_always_includes_base_url_and_clears_the_override():
+    """The dashboard's submit handler always sends `base_url` (pre-filled on
+    Edit, see initCustomProviders), so even a dashboard edit that only
+    changes notes clears a stale override -- same request shape the real
+    UI sends, not a contrived one."""
+    _create(_basic_body(base_url="https://original.example.com/v1"))
+    _client().post("/api/providers/my-test-provider",
+                   json={"base_url": "https://override.example.com/v1"}, headers=_auth())
+    dashboard_style_body = {
+        "name": "My Test Provider", "base_url": "https://original.example.com/v1",
+        "models_url": "", "key_hint": "", "signup_url": "", "notes": "just a note",
+    }
+    r = _client().put("/api/custom-providers/my-test-provider",
+                      json=dashboard_style_body, headers=_auth())
+    assert r.status_code == 200
+    assert config.get_provider_config("my-test-provider")["base_url"] is None
+    assert app._resolve_base_url("my-test-provider",
+                                 config.get_provider_config("my-test-provider")) == \
+        "https://original.example.com/v1"
 
 
 def test_delete_needs_confirm():

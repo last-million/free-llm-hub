@@ -6452,9 +6452,16 @@ dir, like `tests/test_provider_out_reason.py`).
     DEFINITION (the Settings list would show the new value) while dispatch
     kept silently using the STALE override forever. `PUT
     /api/custom-providers/<id>` now clears that override (`base_url=""`,
-    config.py's own documented "clear" convention) whenever the edit
-    actually changes `base_url` -- and ONLY then, so an edit of unrelated
-    fields (notes, key_hint, ...) never touches it.
+    config.py's own documented "clear" convention) whenever the request
+    BODY carries a `base_url` key at all (`"base_url" in fields` -- presence
+    in the submitted body, not a check against the previously stored value;
+    an edit that omits the key entirely, e.g. a direct API call sending only
+    `{"notes": ...}`, leaves the override untouched). The dashboard's own
+    Edit form always sends `base_url` (pre-filled with the current value, so
+    even a notes-only edit through that form clears the override) --
+    deliberately: pressing Save in Edit is the escape hatch for a
+    stale-override mismatch, and comparing against the stored value first
+    would remove that escape hatch for the exact case this fix exists for.
   - **Every fix in this pass has its own test, and the two most load-
     bearing (the ranking discount, the import key-drop) were negative-
     controlled against the committed file**: reverting the discount's
