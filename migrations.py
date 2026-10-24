@@ -41,7 +41,7 @@ from typing import Optional
 _log = logging.getLogger("migrations")
 
 # The schema version this hub migrates UP TO. Bump when you add a step below.
-LATEST = 5
+LATEST = 6
 
 # Providers removed from the registry whose rows (and any keys) are carried
 # forward under ``retired_providers`` rather than left in the active map. Only
@@ -58,6 +58,8 @@ RETIRED_PROVIDERS_V4 = ("together",)
 # Retired by the v5 step (2026-10-24): CodeCraft and Radox AI. Their free tokens were never
 # activated (HTTP 402 "Billing verification failed"), so the owner had them removed.
 RETIRED_PROVIDERS_V5 = ("codecraft", "radoxai")
+# Release 2026-10-24: Morph bills every model from the first token (owner removed it).
+RETIRED_PROVIDERS_V6 = ("morph",)
 
 # Remembered for the status route; set by the last run_migrations() of the
 # process (boot). Never holds a key value — counts and a backup path only.
@@ -160,12 +162,19 @@ def _to_v5(raw: dict) -> dict:
     return _retire_removed_providers(raw, RETIRED_PROVIDERS_V5)
 
 
+def _to_v6(raw: dict) -> dict:
+    """Release 2026-10-24: morph left the registry; a saved row (and its keys) moves to
+    ``retired_providers`` verbatim, like v3, v4 and v5."""
+    return _retire_removed_providers(raw, RETIRED_PROVIDERS_V6)
+
+
 # Ordered (target_version, id, fn). A step runs when the config's effective
 # start version is below target_version.
 _STEPS = (
     (3, "v3:rename_cli_multi_approval+retire_providers", _to_v3),
     (4, "v4:retire_together", _to_v4),
     (5, "v5:retire_codecraft_radoxai", _to_v5),
+    (6, "v6:retire_morph", _to_v6),
 )
 
 

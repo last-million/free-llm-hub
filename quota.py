@@ -99,7 +99,6 @@ FREE_LIMITS = {
     # with Telegram verification; request and per-minute limits are not published, so the request
     # budget is UNKNOWN (like nvidia).
     "freemodel":     {"limit": None,  "window": "month", "unknown": True},
-    "morph":         {"limit": 0,     "window": "month"},   # medium: the official "200 req free every month" headline meters TOKENS (250K/mo = $2.50); a coding CLI's 20-50K-token turns make the real allowance ~5-12 req/month, so 200 reported quota long after Morph starts rejecting.
     "qwen":          {"limit": 0,     "window": "day"},     # medium: consumable 1M-tokens-PER-MODEL / 90-day trial, then AllocationQuota.FreeTierOnly on every call. (Documented rate is 600 RPM with no per-day cap.)
 
     # ── legacy rows, NOT researched, and both are DEAD KEYS ─────────────────

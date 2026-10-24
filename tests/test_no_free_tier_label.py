@@ -5,15 +5,20 @@ the card read
 
     key OK ... 4 keys saved ... Out of free quota - resets in 25d 21h
 
-Both halves were true and together they were nonsense. morph's registry entry is
+Both halves were true and together they were nonsense. morph's registry entry was
 {"limit": 0, "window": "month"}: a RESEARCHED zero meaning "no free tier at
-all", and its own card note says so ("No free models -- all 8 models bill per
-token"). Used was 0. Nothing was spent, and no reset will change anything.
+all", and its own card note said so ("No free models -- all 8 models bill per
+token"). Used was 0. Nothing was spent, and no reset would change anything.
 
 "Out of free quota, resets in 25d" tells the reader to wait a month for
 something that will never arrive, on a provider whose keys are working
 perfectly. The distinction the UI was missing: exhausted-because-spent versus
 never-free.
+
+2026-10-24: morph itself was removed from the registry (no free tier left at all,
+not even a metered one). huggingface is this file's new example of the exact same
+mechanism -- {"limit": 0, "window": "month"}, a researched zero -- since it is
+still registered and still exercises the real code path.
 """
 import quota
 
@@ -23,16 +28,16 @@ def _template():
         return f.read()
 
 
-def test_morph_really_is_a_researched_zero():
+def test_huggingface_really_is_a_researched_zero():
     """Not an accident or an unknown -- the registry states it."""
-    assert quota.FREE_LIMITS["morph"]["limit"] == 0
+    assert quota.FREE_LIMITS["huggingface"]["limit"] == 0
 
 
 def test_a_zero_limit_survives_the_key_scaling():
     """No free tier times four keys is still no free tier."""
     quota.set_key_counter(lambda pid: 4)
     try:
-        assert quota._limit_for("morph")["limit"] == 0
+        assert quota._limit_for("huggingface")["limit"] == 0
     finally:
         quota.set_key_counter(None)
 
@@ -40,7 +45,7 @@ def test_a_zero_limit_survives_the_key_scaling():
 def test_it_is_still_reported_as_exhausted_to_the_router():
     """Keeping it out of FREE routing is the whole point -- only the wording
     changes, never the behaviour."""
-    assert quota.status("morph")["exhausted"] is True
+    assert quota.status("huggingface")["exhausted"] is True
 
 
 def test_the_card_distinguishes_never_free_from_spent():

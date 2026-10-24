@@ -6105,3 +6105,30 @@ counts as a failed hop). Covered by `tests/test_blank_after_thinking.py`, includ
 negative control (monkeypatching the two helpers back to passthrough makes the wired
 tests fail) and a real roles-path run where the pure-think actor is tried and rejected
 before a tool-calling model serves the turn.
+
+## Morph removed (2026-10-24)
+
+Owner: "remove the provider morph cause he dont give monthly free tokens any more." Morph
+(api.morphllm.com) bills every model from the first token; its "200 req free every month"
+headline actually metered tokens ($2.50/250K), and the hub already carried it at quota
+limit 0 ("researched: no free tier") -- this removes the registry row itself, not just the
+quota flag. Migration **v6** (`migrations.LATEST` 6) moves a saved `morph` row to
+`retired_providers` with its keys verbatim, like v3/v4/v5. Removed from `providers.py`,
+`quota.FREE_LIMITS`, and the two per-provider tuning tables in app.py (window-size estimate,
+speed table). The morph-id canonicalization rules (`_CTX_ID_REWRITES`'s `morph-kimik...`
+etc. rows, `_canon_model_id`'s morph patterns) are left in place: they are now unreachable
+dead code (no live catalog will ever produce a `morph-*` id again) but harmless, and
+removing them would touch shared regex tables other relays' rewrites also live in.
+
+**Found along the way, NOT fixed (needs a live probe before touching it):** `quota.py`'s
+FREE_LIMITS rows for `scaleway` and `nebius` still say `{"limit": 0, ...}` with comments
+from an OLD finding ("card mandatory before the first call", "no $0 models"), but
+`providers.py`'s own notes for both now describe a real no-card free tier on a fixed model
+list ("Now offers a small no-card free tier..." / "a no-card free tier (Paris)..."). If that
+registry note is current, both providers are being reported `no_free_tier` -- and skipped by
+`_HEALTH_SKIP_REASONS` and anything else that reads that status -- when they should not be.
+Re-probe both with a real key before changing the quota row; this was found while picking a
+replacement example for tests that used to use morph's `{"limit": 0}` shape (ended up using
+huggingface, which is genuinely `"paid": True`, for the quota-level tests, and a synthetic
+provider for the one test (`_provider_out_status`'s unpaid-and-zero branch) that needed a
+real unpaid zero-limit provider and found none left that matches honestly).

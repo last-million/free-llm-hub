@@ -115,8 +115,10 @@ def test_context_ok_uses_the_alias_window():
     assert "relay-x" not in A._PROVIDER_TPM
     assert A._context_ok("relay-x", "morph-kimik3", 90000)
     assert not A._context_ok("relay-x", "morph-kimik3", 120000)
-    # ...still capped by a measured provider row (morph: 30000)
-    assert not A._context_ok("morph", "morph-kimik3", 40000)
+    # The pid-level cap this used to test (morph: 30000) went when morph left the
+    # registry 2026-10-24; _PROVIDER_TPM still caps a KNOWN pid the same way --
+    # groq's row (8000) proves it with the same id string.
+    assert not A._context_ok("groq", "morph-kimik3", 10000)
 
 
 # --------------------------------------------------------------------------- #

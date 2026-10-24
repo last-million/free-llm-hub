@@ -127,7 +127,7 @@ def test_apply_is_idempotent():
 
 def test_schema_version_is_bumped_to_latest():
     new, _ = migrations.apply(old_config())
-    assert new["schema_version"] == migrations.LATEST == 5
+    assert new["schema_version"] == migrations.LATEST == 6
 
 
 def test_a_newer_config_is_not_downgraded():
@@ -184,7 +184,7 @@ def test_run_writes_backs_up_first_and_keeps_keys(cfgfile):
     report = migrations.run_migrations()
 
     assert report["ok"] and report["changed"]
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     assert report["keys_count"] == 5
     # the pre-migration backup holds the ORIGINAL bytes -> it was taken first
     assert report["last_backup"] and os.path.isfile(report["last_backup"])
@@ -208,7 +208,7 @@ def test_run_is_idempotent_and_takes_no_second_backup(cfgfile):
     report2 = migrations.run_migrations()
 
     assert report2["ok"] and not report2["changed"]
-    assert report2["schema_version"] == 5
+    assert report2["schema_version"] == 6
     assert open(cfgfile, "rb").read() == bytes_after_first      # not rewritten
     backups_after_second = sorted(os.listdir(os.path.join(os.path.dirname(cfgfile),
                                                           "backups")))
@@ -232,7 +232,7 @@ def test_run_on_a_corrupt_file_leaves_it_untouched(cfgfile):
 
 
 def test_run_on_a_fresh_latest_config_does_nothing(cfgfile):
-    write_raw(cfgfile, {"schema_version": 5, "providers": {}, "cli_multi_approval": "off"})
+    write_raw(cfgfile, {"schema_version": 6, "providers": {}, "cli_multi_approval": "off"})
     before = open(cfgfile, "rb").read()
     report = migrations.run_migrations()
     assert report["ok"] and not report["changed"]
@@ -283,7 +283,7 @@ def test_config_reads_the_migrated_values(cfgfile):
     assert config.get_setting("cli_multi_approval") == "off"
     cfg = config.load_config()                                  # loads cleanly
     assert "groq" in cfg["providers"]
-    assert cfg["schema_version"] == 5
+    assert cfg["schema_version"] == 6
     assert set(cfg.get("retired_providers") or {}) == {"tokenrouter", "agentrouter"}
 
 
@@ -303,7 +303,7 @@ def test_status_has_the_four_fields(cfgfile):
     migrations.run_migrations()
     st = migrations.status()
     assert set(("schema_version", "applied", "last_backup", "keys_count")) <= set(st)
-    assert st["schema_version"] == 5
+    assert st["schema_version"] == 6
     assert st["keys_count"] == 5
 
 
@@ -421,10 +421,55 @@ def test_a_config_without_them_is_untouched_by_v5():
     assert applied == [] and "retired_providers" not in new
 
 
-def test_an_old_config_gets_v3_v4_and_v5_in_one_boot():
+def test_an_old_config_gets_v3_through_v6_in_one_boot():
     raw = old_config()
     raw["providers"]["together"] = {"api_keys": ["enc.v1:T"]}
     raw["providers"]["codecraft"] = {"api_keys": ["enc.v1:C"]}
+    raw["providers"]["morph"] = {"api_keys": ["enc.v1:M"]}
     new, _ = migrations.apply(raw)
-    assert set(new["retired_providers"]) == {"tokenrouter", "agentrouter", "together", "codecraft"}
+    assert set(new["retired_providers"]) == {"tokenrouter", "agentrouter", "together",
+                                             "codecraft", "morph"}
     assert "codecraft" not in new["providers"] and "together" not in new["providers"]
+    assert "morph" not in new["providers"]
+    assert new["schema_version"] == migrations.LATEST
+
+
+# --------------------------------------------------------------------------- #
+# v6 (2026-10-24): Morph left the registry, its key must not be lost          #
+# --------------------------------------------------------------------------- #
+def morph_config(version=5):
+    return {"schema_version": version,
+            "providers": {"groq": {"api_keys": ["enc.v1:GROQ1"]},
+                          "morph": {"api_keys": ["enc.v1:MORPH1", "enc.v1:MORPH2"],
+                                    "enabled": True}}}
+
+
+def test_v6_moves_morph_to_retired_with_every_key():
+    new, applied = migrations.apply(morph_config())
+    retired = new["retired_providers"]
+    assert set(retired) == {"morph"}
+    assert retired["morph"]["api_keys"] == ["enc.v1:MORPH1", "enc.v1:MORPH2"]
+    assert applied == ["v6:retire_morph"]
+    assert new["schema_version"] == migrations.LATEST
+
+
+def test_v6_leaves_other_providers_untouched():
+    new, _ = migrations.apply(morph_config())
+    assert new["providers"]["groq"] == {"api_keys": ["enc.v1:GROQ1"]}
+    assert "groq" not in new.get("retired_providers", {})
+    assert set(new["providers"]) == {"groq"}
+
+
+def test_v6_never_loses_a_key_and_is_idempotent():
+    cfg = morph_config()
+    before = migrations.key_fingerprint(cfg)
+    once, _ = migrations.apply(cfg)
+    twice, applied2 = migrations.apply(once)
+    assert twice == once and applied2 == []
+    assert migrations._keys_preserved(before, migrations.key_fingerprint(twice))
+
+
+def test_a_config_without_morph_is_untouched_by_v6():
+    new, applied = migrations.apply({"schema_version": 5,
+                                     "providers": {"groq": {"api_keys": ["enc.v1:G"]}}})
+    assert applied == [] and "retired_providers" not in new

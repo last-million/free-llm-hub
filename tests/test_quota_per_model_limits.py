@@ -113,7 +113,9 @@ def test_throttled_model_counts_as_exhausted(fresh_quota):
 
 
 def test_no_free_tier_is_exposed_not_hidden(fresh_quota):
-    st = quota.status("morph")
+    # morph was removed from the registry 2026-10-24; huggingface is another real
+    # {"limit": 0} provider, same mechanism.
+    st = quota.status("huggingface")
     assert st["exhausted"] is True             # kept exhausted by design
     assert st["no_free_tier"] is True
     assert quota.status("groq")["no_free_tier"] is False
@@ -122,7 +124,7 @@ def test_no_free_tier_is_exposed_not_hidden(fresh_quota):
 
 def test_no_free_tier_survives_key_scaling(fresh_quota):
     quota.set_key_counter(lambda pid: 4)
-    assert quota.status("morph")["no_free_tier"] is True
+    assert quota.status("huggingface")["no_free_tier"] is True
 
 
 def test_reset_kinds():

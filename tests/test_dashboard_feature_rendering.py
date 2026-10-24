@@ -179,13 +179,15 @@ def isolated(monkeypatch):
 
 
 def test_status_banner_skips_a_provider_with_no_free_tier(isolated, monkeypatch):
-    # precondition: the registry really documents morph's free limit as 0
-    st = quota.status("morph")
+    # morph (the original example here) was removed from the registry 2026-10-24;
+    # huggingface is another real {"limit": 0} provider, same mechanism.
+    # precondition: the registry really documents huggingface's free limit as 0
+    st = quota.status("huggingface")
     assert st.get("limit_known") and st.get("limit") == 0 and st.get("exhausted")
-    monkeypatch.setattr(app, "_enabled_keyed", lambda: ["morph", "groq"])
+    monkeypatch.setattr(app, "_enabled_keyed", lambda: ["huggingface", "groq"])
     headers = {"X-Free-LLM-Hub-Token": config.ensure_control_token(),
                "X-Free-LLM-Hub": "dashboard"}
     j = app.app.test_client().get("/api/status", headers=headers).get_json()
-    assert "morph" not in j["quota"]
+    assert "huggingface" not in j["quota"]
     assert "groq" in j["quota"]
     assert j["any_exhausted"] is False and j["all_exhausted"] is False

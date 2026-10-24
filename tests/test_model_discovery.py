@@ -35,12 +35,10 @@ def test_already_canonical_ids_are_untouched():
         assert app._canon_model_id(mid) == mid, mid
 
 
-def test_morph_kimi_k3_wins_the_top_slot():
-    """Kimi K3 is the user's top pick after gpt-5/claude. Before the fix morph's
-    spelling never matched the floor and it lost to lesser models."""
-    ms = prov.PROVIDERS["morph"]["default_free_models"]
-    best = max(ms, key=lambda m: app._benchmark_score("morph", m))
-    assert "kimik3" in best
+# test_morph_kimi_k3_wins_the_top_slot removed 2026-10-24: morph left the
+# registry (no free tier at all) and has no default_free_models list to
+# check any more. The scoring behaviour it probed (the kimi-k3 floor landing
+# on a morph-id-shaped string) is still covered by the tests below.
 
 
 def test_morph_glm52_gets_the_glm5_floor():

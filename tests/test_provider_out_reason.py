@@ -116,8 +116,21 @@ def test_throttled_shows_countdown_until():
     assert "429" in r["detail"]
 
 
-def test_morph_is_no_free_tier_not_an_outage():
-    r = _row("morph")
+def test_a_no_free_tier_provider_is_no_free_tier_not_an_outage(monkeypatch):
+    # morph (the original example here) was removed from the registry 2026-10-24.
+    # _provider_out_status only reports no_free_tier for an UNPAID provider
+    # (app.py: "if not p.get('paid'): q = quota.status(pid)") -- every registered
+    # provider that is genuinely limit==0 AND unpaid today (morph's exact shape) is
+    # gone or stale (scaleway/nebius's quota.py rows contradict their own registry
+    # notes, which now describe a real free tier -- a pre-existing mismatch, not
+    # touched here), so this uses a synthetic provider instead of depending on any
+    # specific real one's status, which changes over time.
+    fake = "no-free-tier-example"
+    monkeypatch.setitem(app.prov.PROVIDERS, fake,
+                        {"name": "No Free Tier Example",
+                         "base_url": "https://example.invalid/v1", "paid": False})
+    monkeypatch.setitem(quota.FREE_LIMITS, fake, {"limit": 0, "window": "month"})
+    r = _row(fake)
     assert r["status_reason"] == "no_free_tier"
     assert r["until"] is None
     assert "no free tier" in r["detail"]
