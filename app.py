@@ -94,6 +94,7 @@ import orchestrator
 import skills
 import ecc
 import perfstats
+import learnstate
 import providers as prov
 import quota
 import workspace
@@ -4028,6 +4029,7 @@ def _save_perf_stats(force=False):
             outcomes = {k: dict(v) for k, v in _outcomes.items()}
             latency = {k: dict(v) for k, v in _latencies.items()}
         perfstats.save(outcomes, latency, force=force)
+        _save_learned_state(force=force)       # slowness / rests / streaks (see LEARNED STATE)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -5271,6 +5273,7 @@ def _note_recent_hop_failure(pid, model, kind):
         # (see _note_pair_failure); a 429 / junk / invalid kind is not.
         _note_pair_failure(pid, model, "reasoning_stall" if kind == "reasoning_stall"
                            else "deadline")
+    _save_learned_state()
 
 
 def _clear_recent_hop_failure(pid, model):
@@ -10666,11 +10669,44 @@ def _never_chains(pid, model):
         return False
 
 
+# A PROVIDER THAT STALLS ON TWO DIFFERENT MODELS IS SLOW, NOT UNLUCKY (2026-10-24).
+# MEASURED (hub.log): 01:40 nvidia/z-ai/glm-5.3 "silent 30.0s -> backup", then 01:44
+# nvidia/z-ai/glm-5.3-flash "silent 30.0s -> backup" -- two roles turns that each burned
+# ~160 s -- because the stall mark is per (provider, model), so the sibling model on the
+# SAME host was tried first again four minutes later. Two DIFFERENT models of one direct
+# provider with a stall mark (deadline / timeout / reasoning_stall) inside _RECENT_FAIL_TTL
+# put the whole provider behind the others for tool turns until those marks expire.
+# Reorder only, never a drop (it joins the same "sick" group a resting pair does, so it is
+# still the last resort). Relays are excluded: their backends are separate servers with
+# their own server-level logic. Derived from _recent_hop_fail, so it is restored by the
+# learned-state file too. Flag `provider_stall_rest` (default on); off = per-pair only.
+_PROVIDER_STALL_MODELS = 2
+
+
+def _provider_stalling(pid):
+    """True while >= _PROVIDER_STALL_MODELS different models of `pid` carry a fresh
+    stall mark. Never raises."""
+    try:
+        if not pid:
+            return False
+        now = time.time()
+        with _recent_fail_lock:
+            seen = {m for (p, m), rec in _recent_hop_fail.items()
+                    if p == pid and rec[1] in _RECENT_STALL_KINDS
+                    and now - rec[0] <= _RECENT_FAIL_TTL}
+        if len(seen) < _PROVIDER_STALL_MODELS:
+            return False                       # the common case: no flag read, no relay check
+        return (not _is_relay_pid(pid)) and bool(config.get_flag("provider_stall_rest", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _tool_turn_sick(pid, model):
     """Measured on tool turns to mostly not deliver, or resting after failing
     the same way again and again (see _note_pair_failure), or never chaining a
-    tool call mid-loop (see _never_chains)."""
-    if _pair_resting(pid, model) or _never_chains(pid, model):
+    tool call mid-loop (see _never_chains), or on a provider that is stalling on
+    several of its models at once (see _provider_stalling)."""
+    if _pair_resting(pid, model) or _never_chains(pid, model) or _provider_stalling(pid):
         return True
     r = _tool_turn_reliability(pid, model)
     return r is not None and r < _TOOL_SICK_RATE
@@ -40923,6 +40959,7 @@ def _note_pair_failure(pid, model, cls):
             _pair_rest[(pid, model)] = {"until": now + ttl, "level": level, "cls": cls}
         _log.info("[streak] %s/%s failed the same way (%s) %d times: resting %d min for "
                   "tool turns (level %d)", pid, model, cls, same, int(ttl // 60), level)
+        _save_learned_state()
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -41247,6 +41284,236 @@ def _bandit_credit(messages):
     return n
 
 
+# LEARNED STATE SURVIVES A RESTART (2026-10-24).
+# Owner: "of course the hub should remember the slowness -- it should be done with code."
+# MEASURED the same day (turn-roles.jsonl + hub.log): a roles turn re-found that nvidia
+# GLM-5.3 is silent for 30 s by failing on it again, because what the hub learns about
+# slow first content (_tool_ttft), resting pairs (_pair_rest, _empty_200), recent stall /
+# 429 marks (_recent_hop_fail), text-only "never chains" pairs (_chain_seen), slow long
+# requests (_long_ctx_speed) and per-pair quirks (_SYSTEM_FIRST, _THINKING_LEARNED) lived
+# in plain dicts, and this hub restarts on every auto-update and every reboot.
+# perfstats.py already saves the two numeric ledgers; learnstate.py is its sibling for
+# these. Every one of them already SELF-EXPIRES on read (its own TTL / `until` / window),
+# so restoring a row verbatim is safe: a mark that went stale while the hub was off is
+# ignored by its consumer exactly as a live one would be. Anything older than its own TTL
+# is dropped on save AND on restore. Deliberately NOT persisted: _team_stats (re-seeded
+# from turn-roles.jsonl), _REASONING_REJECTED / _PARAM_REJECTED (no expiry; re-learned for
+# the price of one transparently retried 400), _PLANNER_FAILED (10 minutes). Flag
+# `persist_learned_state` (default on); off = nothing saved or restored, the old boot.
+_LS_TTFT_KEEP = 40
+_LS_TTFT_TTL = 7 * 86400.0
+_ls_ttft_sig = {}            # (pid, model) -> ((len, last sample), epoch that list last changed)
+
+
+def _ls_on():
+    try:
+        return bool(config.get_flag("persist_learned_state", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ls_pack(now=None):
+    """A JSON-native snapshot of the learned health state, expired rows left out.
+    Never raises (returns {} on a fault)."""
+    try:
+        now = float(time.time() if now is None else now)
+        out = {}
+        with _outcome_lock:
+            rows = []
+            for (p, m), samples in list(_tool_ttft.items()):
+                vals = [float(x) for x in (samples or ())][-_LS_TTFT_KEEP:]
+                if not vals:
+                    continue
+                sig = (len(vals), vals[-1])
+                prev = _ls_ttft_sig.get((p, m))
+                at = prev[1] if prev and prev[0] == sig else now
+                _ls_ttft_sig[(p, m)] = (sig, at)
+                if now - at <= _LS_TTFT_TTL:
+                    rows.append([p, m, vals, round(at, 3)])
+            out["tool_ttft"] = rows
+            out["long_ctx"] = [
+                [p, m, [[float(r[0]), float(r[1]), bool(r[2])] for r in rs
+                        if now - float(r[0]) <= LONG_CTX_SPEED_TTL]]
+                for (p, m), rs in list(_long_ctx_speed.items())
+                if any(now - float(r[0]) <= LONG_CTX_SPEED_TTL for r in rs)]
+            out["chain_seen"] = [
+                [p, m, {"text": int(rec.get("text") or 0), "last": float(rec.get("last") or 0)}]
+                for (p, m), rec in list(_chain_seen.items())
+                if now - float(rec.get("last") or 0) <= _NEVER_CHAIN_TTL]
+        with _recent_fail_lock:
+            out["recent_fail"] = [
+                [p, m, [float(rec[0]), str(rec[1])]]
+                for (p, m), rec in list(_recent_hop_fail.items())
+                if now - float(rec[0]) <= _RECENT_FAIL_TTL]
+        keep = max(_STREAK_WINDOW, _EMPTY_STREAK_TTL)
+        with _empty_200_lock:
+            ev = []
+            for (p, m), events in list(_empty_200.items()):
+                live = [[float(t), str(c)] for t, c in (_streak_event(e) for e in events)
+                        if now - float(t) <= keep]
+                if live:
+                    ev.append([p, m, live])
+            out["empty_200"] = ev
+            out["pair_rest"] = [
+                [p, m, {"until": float(r["until"]), "level": int(r["level"]),
+                        "cls": str(r["cls"])}]
+                for (p, m), r in list(_pair_rest.items())
+                if float(r["until"]) > now - _STREAK_REST_CAP]
+        with _thinking_lock:
+            out["thinking"] = [[p, m, float(t)] for (p, m), t in list(_THINKING_LEARNED.items())
+                               if now - float(t) <= _THINKING_LEARNED_TTL]
+        with _system_first_lock:
+            out["system_first"] = [[p, m, float(t)] for (p, m), t in list(_SYSTEM_FIRST.items())
+                                   if now - float(t) <= _SYSTEM_FIRST_TTL]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _ls_rows(blob, name):
+    """The well-formed [pid, model, value...] rows of one section."""
+    for row in (blob.get(name) or ()) if isinstance(blob, dict) else ():
+        if (isinstance(row, (list, tuple)) and len(row) >= 3
+                and isinstance(row[0], str) and isinstance(row[1], str) and row[0] and row[1]):
+            yield row
+
+
+def _ls_restore(blob, now=None):
+    """Put a saved snapshot back into the live dicts; rows past their own TTL are
+    skipped, a live entry is never overwritten. Returns how many rows were restored.
+    Never raises, and one bad row or section never costs the others."""
+    now = float(time.time() if now is None else now)
+    n = 0
+
+    def each(name, fn):
+        nonlocal n
+        try:
+            for row in _ls_rows(blob, name):
+                try:
+                    if fn((row[0], row[1]), row):
+                        n += 1
+                except Exception:                                # noqa: BLE001
+                    continue
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def ttft(key, row):
+        vals = [float(x) for x in row[2]][-_LS_TTFT_KEEP:]
+        at = float(row[3]) if len(row) > 3 else now
+        if not vals or now - at > _LS_TTFT_TTL:
+            return False
+        with _outcome_lock:
+            if key in _tool_ttft:
+                return False
+            _tool_ttft[key] = vals
+            _ls_ttft_sig[key] = ((len(vals), vals[-1]), at)
+        return True
+
+    def long_ctx(key, row):
+        rs = [(float(r[0]), float(r[1]), bool(r[2])) for r in row[2]
+              if now - float(r[0]) <= LONG_CTX_SPEED_TTL][-LONG_CTX_SPEED_SAMPLES:]
+        if not rs:
+            return False
+        with _outcome_lock:
+            if key in _long_ctx_speed:
+                return False
+            _long_ctx_speed[key] = rs
+        return True
+
+    def chain_seen(key, row):
+        rec = {"text": int(row[2]["text"]), "last": float(row[2]["last"])}
+        if now - rec["last"] > _NEVER_CHAIN_TTL or rec["text"] <= 0:
+            return False
+        with _outcome_lock:
+            if key in _chain_seen:
+                return False
+            _chain_seen[key] = rec
+        return True
+
+    def recent_fail(key, row):
+        t, kind = float(row[2][0]), str(row[2][1])
+        if now - t > _RECENT_FAIL_TTL:
+            return False
+        with _recent_fail_lock:
+            if key in _recent_hop_fail:
+                return False
+            _recent_hop_fail[key] = (t, kind)
+        return True
+
+    keep = max(_STREAK_WINDOW, _EMPTY_STREAK_TTL)
+
+    def empty_200(key, row):
+        ev = [(float(t), str(c)) for t, c in row[2]
+              if str(c) in _STREAK_CLASSES and now - float(t) <= keep][-12:]
+        if not ev:
+            return False
+        with _empty_200_lock:
+            if key in _empty_200:
+                return False
+            _empty_200[key] = ev
+        return True
+
+    def pair_rest(key, row):
+        r = {"until": float(row[2]["until"]), "level": int(row[2]["level"]),
+             "cls": str(row[2]["cls"])}
+        if r["cls"] not in _STREAK_CLASSES or r["until"] <= now - _STREAK_REST_CAP:
+            return False
+        with _empty_200_lock:
+            if key in _pair_rest:
+                return False
+            _pair_rest[key] = r
+        return True
+
+    def stamped(store, lock, ttl):
+        def put(key, row):
+            t = float(row[2])
+            if now - t > ttl:
+                return False
+            with lock:
+                if key in store:
+                    return False
+                store[key] = t
+            return True
+        return put
+
+    each("tool_ttft", ttft)
+    each("long_ctx", long_ctx)
+    each("chain_seen", chain_seen)
+    each("recent_fail", recent_fail)
+    each("empty_200", empty_200)
+    each("pair_rest", pair_rest)
+    each("thinking", stamped(_THINKING_LEARNED, _thinking_lock, _THINKING_LEARNED_TTL))
+    each("system_first", stamped(_SYSTEM_FIRST, _system_first_lock, _SYSTEM_FIRST_TTL))
+    return n
+
+
+def _save_learned_state(force=False):
+    """Persist the learned health state, throttled by learnstate.SAVE_INTERVAL (the
+    snapshot is not even built on a throttled call). Never raises."""
+    try:
+        if not force and not learnstate.due():
+            return False
+        if not _ls_on():
+            return False
+        return bool(learnstate.save(_ls_pack(), force=True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _load_learned_state():
+    """Boot: restore what the last run had learned. Returns the row count."""
+    try:
+        if not _ls_on():
+            return 0
+        n = _ls_restore(learnstate.load())
+        if n:
+            _log.info("[learned] restored %d slow / resting / failing record(s) from the "
+                      "last run", n)
+        return n
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
 def _bandit_boot():
     """bandit.configure(state_dir()/task-bandit.json) -- at hub BOOT only
     (never at import: a test importing app must not touch any state file)."""
@@ -41467,6 +41734,28 @@ def _v1_observe(messages, body=None):
         pass
 
 
+def _role_log_http_body(pid, model, resp):
+    """LOG ONLY: the provider's own explanation of a 4xx/5xx a roles hop got, so a bare
+    "HTTP 400" in the activity chip can be read as what it was. MEASURED 2026-10-24:
+    inception/mercury-3 answered HTTP 400 on two ~52K-token turns (it served 47-49K ones)
+    and the only record said "HTTP 400". 429s are skipped (noise); keys are masked by
+    _sanitize; the client never sees this. Never raises."""
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status < 400 or status == 429:
+            return
+        text = getattr(resp, "text", None)
+        if not isinstance(text, str) or not text:
+            try:
+                text = json.dumps(resp.json())
+            except Exception:                                    # noqa: BLE001
+                text = ""
+        _log.warning("[roles] %s/%s HTTP %d: %s", pid, model, status,
+                     " ".join(_sanitize(text, 300).split()) or "(empty body)")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _role_judge(pid, model, resp, exc, body, payload, est, kind):
     """One role call's result -> {"ok": True, "data", "msg", "gate"} or
     {"ok": False, "fail", "why"}. The fan-out's member checks, plus: a tool
@@ -41492,6 +41781,7 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
                 _record_outcome(pid, model, False)
                 _swarm_note_member_status(pid, model, resp.status_code)
                 _rr_remember_dead_model(pid, model, resp)   # fix #2: 404 -> not tried again
+                _role_log_http_body(pid, model, resp)
                 return fail("http", "HTTP %d" % resp.status_code)
             data = resp.json() or {}
         except (ValueError, AttributeError):
@@ -50248,6 +50538,7 @@ if __name__ == "__main__":
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _load_perf_stats()         # measured reliability/latency from previous runs
+    _load_learned_state()      # slow / resting / failing pairs the last run had learned
     try:
         # Swarm runs outlive the process that started them. The hub restarts
         # itself every five hours to git pull, and before this a swarm that

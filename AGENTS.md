@@ -5901,3 +5901,71 @@ Covered by `tests/test_inception_and_codecraft_providers.py`,
 - **OpenCode Zen is in the page's Paid group** (`PURE_PAID`), ZenMux keys must be made on
   `zenmux.ai/platform/pay-as-you-go`, and FreeModel's card says "Needs Telegram activation to enable
   the free 1M tokens per month".
+
+
+## The hub remembers what it learned about slow pairs (2026-10-24)
+
+Owner: "of course the hub should remember the slowness -- it should be done with code."
+Covered by `tests/test_learned_state_survives_restart.py`,
+`tests/test_provider_stall_rest.py` and `tests/test_idle_greeting_is_not_an_answer.py`.
+
+- **Why.** MEASURED (hub.log, 2026-10-24 01:40-01:49): nvidia GLM-5.3 was "silent 30 s ->
+  backup" on one roles turn and its sibling GLM-5.3-Flash on the next one four minutes later,
+  each turn burning ~160 s; the fallback then served a relay's gpt-5 that answered the task
+  with "What would you like me to help you with today?" -- the CLI's turn ended and the user
+  retyped the task twice. Slowness, rests, stall marks and "never chains" counters were plain
+  in-process dicts, and this hub restarts on every auto-update and every reboot.
+- **`learnstate.py`** (pure stdlib, never raises) is `perfstats.py`'s sibling: one
+  `learned-state.json` in `state_dir()`, temp file + `os.replace`, `SAVE_INTERVAL` 60 s,
+  `due()` so the hot path does not even build the snapshot on a throttled call, a whole-file
+  `MAX_AGE` of 7 days and a schema number. It stores a JSON-native blob and knows nothing
+  about what the keys mean; app.py owns `_ls_pack` / `_ls_restore` (section "LEARNED STATE
+  SURVIVES A RESTART").
+- **What is persisted** (each row dropped on save AND on restore once past ITS OWN ttl, a live
+  entry is never overwritten, one bad row never costs the others): `_tool_ttft` (first content
+  on tool turns; no timestamp of its own, so the file stamps "when the list last changed" and
+  forgets a list untouched for 7 days), `_long_ctx_speed`, `_chain_seen` (never-chains),
+  `_recent_hop_fail` (stall / 429 marks), `_empty_200` + `_pair_rest` (failure streaks and
+  rests -- an expired rest is kept up to `_STREAK_REST_CAP` so the next rest still doubles),
+  `_THINKING_LEARNED`, `_SYSTEM_FIRST`. NOT persisted on purpose: `_team_stats` (re-seeded from
+  turn-roles.jsonl), `_REASONING_REJECTED` / `_PARAM_REJECTED` (no expiry of their own; re-learned
+  for one transparently retried 400), `_PLANNER_FAILED` (10 minutes), `_relay_tool_fail`
+  (monotonic clock).
+- **When it writes**: from `_save_perf_stats` (every outcome, throttled; `force=True` in the
+  shutdown `finally`, which the auto-update re-exec goes through), and right after a stall /
+  429 mark and a new rest are written (outside their locks). Boot: `_load_learned_state()`
+  next to `_load_perf_stats()`. Flag `persist_learned_state` (default on); off = nothing saved
+  or restored, the old boot. Log: `[learned] restored N slow / resting / failing record(s)`.
+- **A provider that stalls on two different models rests as a whole**
+  (`_provider_stalling`, read by `_tool_turn_sick`; flag `provider_stall_rest`, default on):
+  two DIFFERENT models of one direct provider with a stall mark (deadline / timeout /
+  reasoning_stall) inside `_RECENT_FAIL_TTL` put every model of that provider in the same
+  "sick" group a resting pair is in -- behind the others, never dropped. Relays are excluded.
+  Derived from `_recent_hop_fail`, so it is restored by the file above.
+- **A bare offer to help is not an answer** (`answer_check` reason `idle_greeting`): a SHORT
+  reply (<= 600 chars) whose opening (first 200 chars) is "How can I help you today?" / "What
+  would you like me to help you with?" / "Here are some things I can do", in answer to a user
+  turn that is a real instruction (>= 5 words, not a greeting, not "what can you do"), on a
+  TOOL turn or a RELAY hop. Unlike `provider_notice` / `tool_deadend` it also applies to a
+  direct provider on a tool turn. The hop fails over like any junk reply; `reads_as_answer`
+  never releases it early. No flag (it rides in `inspect`'s checks array).
+- **HTTP 4xx explanations are logged** (`_role_log_http_body`): a roles hop that gets a 4xx/5xx
+  (not 429) now logs `[roles] pid/model HTTP N: <first 300 chars of the body>` (keys masked by
+  `_sanitize`; log only, the client never sees it). MEASURED the same day: inception/mercury-3
+  served tool turns of 47-49K tokens and answered a bare "HTTP 400" on two 52K ones; the cause
+  is NOT known yet -- the next failure will say.
+- **Context cap: researched, NOT changed (owner call open).** The owner asked whether the
+  ~400K `_REACH_WINDOW_CAP` is wrong. A read-only research pass (2026-10-24) found: the
+  "Google harness" of the week is most likely **Harness2** (github.com/google-research/harness2,
+  Apache-2.0, paper arXiv 2610.14224), which lets an agent edit its own harness components
+  (prompt, guardrails, memory, tools, subagents, skills) -- it carries nothing about context
+  windows to borrow. Evidence read (RULER, NoLiMa, Chroma "context rot", arXiv 2609.20804)
+  says quality falls with length and that clearing old tool output then summarising beats
+  just a bigger window, but nothing public tests 400K on free models, so the data cannot say
+  where the cap should sit. The 504K incident was compaction not firing, not the cap. Cheap
+  knobs if the owner wants earlier compaction without lowering the ceiling: codex compacts at
+  75% of the declared window (`declared_compact_limit`); the reach could be set per category.
+  Ideas worth a later pass (not built): keep standing user rules as a deterministic union block
+  so repeated recap rewrites cannot erode them (ACE, arXiv 2510.04618), and trigger old-result
+  clearing by share of the hop's window instead of a flat 60K. Not worth building per the
+  evidence: file offloading with re-read, embedding retrieval over history.
