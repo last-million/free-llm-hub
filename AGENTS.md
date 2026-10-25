@@ -6961,12 +6961,41 @@ pipeline-tier replays (`_swarm_as_responses`, `_cm_emit`) do not thread `ns_map`
 yet; codex reaches parallel agents on those tiers through
 `_cm_multi_cli_intercept` (Multi tier = real `swarm_windows`, text-only) and the
 swarm/crew tiers refuse tool-carrying turns, so a namespaced tool call is not
-emitted there in practice. Native `multi_agent_v1` is expanded by the same
-mechanism (strictly >= today: at worst it stays "unsupported" for native only,
-while MCP routing is verified); whether codex dispatches provider-returned
-native sub-agent calls against a custom provider was NOT live-tested. Separately,
-codex gates MCP tool calls behind approval (`approval_policy = "never"` auto-
-denies: "MCP tool call requires approval") -- a codex-config matter, not this
-hub bug; the Multi tier needs no MCP call. Only codex has this bug: namespaces
-exist only on the Responses API (opencode sends flat chat functions, Claude Code
-uses `/v1/messages`).
+emitted there in practice.
+
+**Verified live end-to-end 2026-10-25 (codex 0.163, this machine, read-only tool):**
+through the LIVE hub as both the model provider and the MCP server, under the
+owner's real approval settings, `model = inception/mercury-3` called the expanded
+child `publish_status` and codex EXECUTED it against the hub MCP server
+(`mcp: free-llm-hub/publish_status (completed)`) and summarised the result -- no
+approval prompt, no extra config key. This exercises the whole shipped path
+(hub expands the namespace tools -> real model calls one -> hub emits the call
+back with `name=<child>` + `namespace` -> codex runs it). `auto` as the model
+timed out before calling the tool (slow/reasoning routing, model behaviour, not
+the fix); pin a fast tool-caller to force it.
+
+**The earlier "MCP tool call requires approval, but approval policy is never" was
+the SANDBOX, not the approval policy** (measured matrix, isolated CODEX_HOME so no
+stale daemon, fake Responses provider returning the namespaced call, real hub MCP
+server): with `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`
+(the owner's setting) EXECUTES the hub's tools, while a restricted sandbox
+(`read-only` / `workspace-write`) DENIES them with that exact string. The hub
+advertises NO `readOnlyHint` on any tool, and a non-read-only tool runs under
+`danger-full-access` just the same, so the crew/swarm WRITE tools
+(`swarm_windows_start`, `crew_run`) run too. The per-server key
+`default_tools_approval_mode` (values `auto | prompt | writes | approve`; codex
+docs define only `writes` = "prompts for tools that aren't marked read-only") does
+NOT override the sandbox gate -- MEASURED: `default_tools_approval_mode = "auto"`
+under a read-only sandbox still DENIED. So it is not a workaround for a restricted
+sandbox; the only lever is `sandbox_mode`. Nothing to change in the owner's codex
+config (danger-full-access) and nothing added to `mcp_manager`.
+
+**Native `multi_agent_v1` works too.** MEASURED: a provider-returned `spawn_agent`
+call (namespace `multi_agent_v1`, `[features] multi_agent = true`,
+danger-full-access) DISPATCHES to codex's internal router
+(`codex_core::tools::router`; it only errored on empty args, "Provide one of:
+message or items") instead of "unsupported call". So the same expansion reaches
+codex's native sub-agents, not only the hub MCP tools.
+
+Only codex has this namespace bug: namespaces exist only on the Responses API
+(opencode sends flat chat functions, Claude Code uses `/v1/messages`).
