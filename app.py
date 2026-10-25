@@ -5620,14 +5620,28 @@ def _recent_hop_failure(pid, model):
     _RECENT_FAIL_TTL, else None. Fail-open: an error is None, so the ledger can
     only ever reorder a chain, never empty one."""
     try:
+        own = None
         with _recent_fail_lock:
             rec = _recent_hop_fail.get((pid, model))
-            if not rec:
-                return None
-            if time.time() - rec[0] > _RECENT_FAIL_TTL:
-                _recent_hop_fail.pop((pid, model), None)
-                return None
-            return rec[1]
+            if rec:
+                if time.time() - rec[0] > _RECENT_FAIL_TTL:
+                    _recent_hop_fail.pop((pid, model), None)
+                else:
+                    own = rec[1]
+        if own is not None:
+            return own
+        # A SIBLING behind the same slow gateway: when two different models of a
+        # direct provider carry a fresh stall mark, the others are just as likely
+        # to stall, so they read as recently stalled too -- on EVERY turn, not
+        # only tool turns (that was the gap: _provider_stalling fed only
+        # _tool_turn_sick). MEASURED 2026-10-25: tool-free codex turns 504'd on
+        # nvidia glm-5.3 -> glm-5.3-flash -> deepseek-v4.1-flash, each a fresh
+        # 120 s stall, while inception/mercury-3 answered in seconds once reached
+        # (activity rows: every success was 198-231 s of a 240 s clock).
+        # Reorder only (the tail keeps them), flag `provider_stall_any_turn`.
+        if _provider_stalling(pid) and config.get_flag("provider_stall_any_turn", True):
+            return "timeout"
+        return None
     except Exception:                                            # noqa: BLE001
         return None
 

@@ -7100,3 +7100,24 @@ this notice on opus, sonnet, fable, astra and sol in turn -- one wasted hop per 
   `_peek_check` now carries `pid`/`model` for this.
 - Not changed: other vendors' billing wording on a direct hop is still not judged (a
   direct provider reports it as an HTTP error); the rest is not persisted across a restart.
+
+## A stalling provider's siblings are not fresh, on any turn (2026-10-25)
+
+Covered by `tests/test_provider_stall_any_turn.py`. MEASURED (Activity rows + hub.log,
+codex `auto`, after the share-cap fixes): tool-free turns still 504'd on nvidia
+glm-5.3 -> glm-5.3-flash -> deepseek-v4.1-flash -- three sibling models behind one slow
+gateway, each a fresh ~120 s stall -- while `inception/mercury-3` answered in seconds
+once reached. Every success on those turns took 198-231 s of the 240 s clock: the working
+provider was only reached after the dead heads had spent it. `_provider_stalling` (two
+different models of a direct provider with a fresh stall mark, relays excluded) only fed
+`_tool_turn_sick`, so a tool-FREE chain and the router's primary pick still treated the
+unmarked siblings as fresh.
+
+`_recent_hop_failure` (the one ledger the router's pick, `_build_chain`'s primary guard and
+recent-failure tail, the hedge partner and the fan-out all read) now returns "timeout" for
+a pair with no record of its own whose provider is `_provider_stalling`; a pair's own record
+always wins, and the siblings' marks expire with the stalls (`_RECENT_FAIL_TTL`, 10 min).
+Reorder only: the tail keeps them, a chain where everything stalled is unchanged. Flag
+`provider_stall_any_turn` (default on), plus the existing `provider_stall_rest`. Not
+changed: relays (separate backends), and a provider whose first stall is not yet followed
+by a second model's stall (the first sibling still gets one try).
