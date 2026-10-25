@@ -7055,3 +7055,18 @@ inception (late, 198-243 s) and only avoided the 504 by luck.
   (3) When the WHOLE free fleet is degraded at once, no routing change conjures a
   working provider -- this fix only guarantees that whenever at least one works,
   the chain reaches it fast instead of dying on a staller.
+
+## One provider never holds the whole clock, on any turn (2026-10-25)
+
+Covered by `tests/test_provider_share_any_turn.py`. MEASURED (hub.log
+RESPONSES-DEADLINE, codex, after the stalled-walk fix): tool-free turns still
+504'd because ONE hop held almost the whole 240 s clock ("g4f:
+_HopBudgetExceeded no answer within 233s", "nvidia ... within 229s") while a
+working provider (inception/mercury-3) waited behind it. `_ChainClock._provider_cap`
+-- a provider may spend at most `_TOOL_PROVIDER_SHARE` (50%, 75% past
+STREAM_HUGE_REQUEST_TOKENS, min 60 s) of the deadline while ANOTHER provider
+still waits -- applied to tool turns only. Flag `provider_share_any_turn`
+(default on) applies it to every turn; the last provider left still gets
+whatever is left of the clock. Keyed on the provider id only, in the shared
+walk, so every provider and every CLI (chat / responses / messages) gets it.
+Off = the old tool-only cap.

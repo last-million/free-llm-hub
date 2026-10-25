@@ -36327,6 +36327,12 @@ class _ChainClock:
         # old trivial/tool-only gate. Lives in the shared walk, so codex
         # (responses), opencode (chat) and Claude Code (messages) all get it.
         self._demote_stalled_any = bool(config.get_flag("walk_demote_stalled_any", True))
+        # One provider may not spend more than its share of the deadline while
+        # another provider waits -- on EVERY turn, not only tool ones. MEASURED
+        # 2026-10-25: tool-free codex turns 504'd with one g4f hop holding
+        # 199-238 s of the 240 s clock while inception/mercury-3 (answering)
+        # waited behind it. Flag off = the old tool-only cap.
+        self._share_any = bool(config.get_flag("provider_share_any_turn", True))
         # TOOL turns (see _TOOL_PER_PROVIDER_HOPS): per-provider hops and
         # seconds spent in THIS walk, relay hops and failed relay servers.
         self._prov_hops = {}
@@ -36510,6 +36516,8 @@ class _ChainClock:
         # still_walks) still needs these: the walk gate reads both.
         if getattr(self, "_stalled", None) is None:
             self._stalled = set()
+        if getattr(self, "_share_any", None) is None:
+            self._share_any = bool(config.get_flag("provider_share_any_turn", True))
         if getattr(self, "_demote_stalled_any", None) is None:
             self._demote_stalled_any = bool(
                 config.get_flag("walk_demote_stalled_any", True))
@@ -36657,9 +36665,12 @@ class _ChainClock:
             pass
 
     def _provider_cap(self):
-        """Seconds one provider may spend on this TOOL turn while another
-        provider still waits, or None (no deadline / not a tool turn)."""
-        if not self.tools or not self.limit:
+        """Seconds one provider may spend on this turn while another provider
+        still waits, or None (no deadline; a tool-free turn with the flag
+        `provider_share_any_turn` off)."""
+        if not self.limit:
+            return None
+        if not self.tools and not getattr(self, "_share_any", False):
             return None
         share = (_TOOL_PROVIDER_SHARE_HUGE if self.est >= STREAM_HUGE_REQUEST_TOKENS
                  else _TOOL_PROVIDER_SHARE)
@@ -36694,9 +36705,9 @@ class _ChainClock:
                        if _is_slow_model(pid, model)
                        else _TRIVIAL_HOP_BUDGET)
             budget = _adaptive_hop_budget(pid, model, ceiling, stream)
-        # A TOOL turn: while another provider still waits, one provider may
-        # not spend more than its share of the deadline -- MEASURED, nvidia
-        # took all 240 s of a 16K tool turn over three hops.
+        # While another provider still waits, one provider may not spend more
+        # than its share of the deadline -- MEASURED, nvidia took all 240 s of
+        # a 16K tool turn over three hops (tool-free turns too, see __init__).
         cap = self._provider_cap()
         if cap is not None and not _is_sub(pid) and self._others_waiting(pid):
             room = max(_TOOL_PROVIDER_MIN_HOP, cap - self._prov_secs.get(pid, 0.0))
