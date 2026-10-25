@@ -47836,23 +47836,78 @@ def _chat_completions_uncached(body):
 # back UP into Responses objects/events. No new orchestration is introduced.
 
 
-def _responses_tools_to_chat(tools):
-    """Responses tools ({"type":"function","name","description","parameters"},
-    sometimes nested under a "function" key) -> OpenAI chat tools."""
-    out = []
+def _ns_qualify(ns, child):
+    """A presented name for a namespaced child when its bare name collides.
+    Survives a provider's name rule (^[A-Za-z0-9_-]{1,64}$)."""
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", "%s__%s" % (ns or "", child or ""))
+    return s[:64] or (child or "tool")
+
+
+def _responses_ns_entries(tools):
+    """Flatten Responses tools into [(presented, child, namespace, inner_def)].
+
+    MEASURED 2026-10-25: codex advertises its native sub-agents and the hub's
+    own MCP tools as `type: "namespace"` tools -- `multi_agent_v1`
+    (spawn_agent/wait_agent/...) and `mcp__free_llm_hub`
+    (swarm_windows_start/crew_run/...). The old converter read the namespace's
+    own `name` and dropped its `tools` children, so the free model saw ONE
+    empty, uncallable function per namespace; a call to it came back to codex
+    as "unsupported call: <namespace>" and the model never reached the hub's
+    real crew/swarm tools. This expands each namespace child into its own
+    callable function. `namespace` is None for a plain function. Presented name
+    = the bare child name (what codex routes on, VERIFIED live: a function_call
+    with name=<child> + a `namespace` field dispatches; name alone or a glued
+    `ns__child` name answer "unsupported call"), qualified `ns__child` only when
+    the bare name collides. Flag `responses_namespace_tools` (default on); off
+    = the old behaviour (a namespace becomes one function named after itself)."""
+    expand = config.get_flag("responses_namespace_tools", True)
+    plain, nsrc = [], []
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
-        inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        name = inner.get("name")
-        if not name:
+        if expand and tool.get("type") == "namespace":
+            ns = str(tool.get("name") or "").strip()
+            for child in tool.get("tools") or []:
+                if isinstance(child, dict) and str(child.get("name") or "").strip():
+                    nsrc.append((str(child["name"]).strip(), ns, child))
             continue
+        inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if str(inner.get("name") or "").strip():
+            plain.append((str(inner["name"]).strip(), inner))
+    counts = {}
+    for nm, _ in plain:
+        counts[nm] = counts.get(nm, 0) + 1
+    for child, _ns, _ in nsrc:
+        counts[child] = counts.get(child, 0) + 1
+    entries = [(nm, nm, None, inner) for nm, inner in plain]
+    for child, ns, inner in nsrc:
+        presented = child if counts.get(child, 0) == 1 else _ns_qualify(ns, child)
+        entries.append((presented, child, ns, inner))
+    return entries
+
+
+def _responses_tools_to_chat(tools):
+    """Responses tools ({"type":"function","name","description","parameters"},
+    sometimes nested under a "function" key, or a `type:"namespace"` group) ->
+    OpenAI chat tools. Namespace children are expanded (_responses_ns_entries)."""
+    out = []
+    for presented, _child, _ns, inner in _responses_ns_entries(tools):
         out.append({"type": "function", "function": {
-            "name": name,
+            "name": presented,
             "description": inner.get("description") or "",
             "parameters": inner.get("parameters") or {"type": "object", "properties": {}},
         }})
     return out
+
+
+def _responses_ns_backmap(tools):
+    """{presented_name: (child_name, namespace)} for every namespaced child, so
+    an emitter can turn the free model's call back into the {name: child,
+    namespace} shape codex routes on. Empty when nothing is namespaced or the
+    flag is off. Pure -- built from the request's own tools, never stashed on
+    `g` (streams / replays / hedge legs run outside the request context)."""
+    return {presented: (child, ns)
+            for presented, child, ns, _ in _responses_ns_entries(tools) if ns}
 
 
 # Responses/Codex roles -> roles every OpenAI-chat model template accepts. The
@@ -48027,10 +48082,12 @@ def _fix_nameless_tool_calls(chat_json, tool_defs):
     return chat_json
 
 
-def _chat_to_responses(chat_json, model_label, tool_defs=None):
+def _chat_to_responses(chat_json, model_label, tool_defs=None, ns_map=None):
     """Non-streaming OpenAI chat-completions JSON -> a Responses `response` object.
     A tool call without a name is repaired from its arguments when that is
-    unambiguous, else left out (_fix_nameless_tool_calls) -- never emitted."""
+    unambiguous, else left out (_fix_nameless_tool_calls) -- never emitted.
+    A call to a namespaced child (ns_map, _responses_ns_backmap) is emitted as
+    the bare child name plus a `namespace` field, the shape codex routes on."""
     _fix_nameless_tool_calls(chat_json, tool_defs)
     _dedupe_tool_calls_json(chat_json)
     choice = (chat_json.get("choices") or [{}])[0]
@@ -48049,15 +48106,20 @@ def _chat_to_responses(chat_json, model_label, tool_defs=None):
         })
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function") or {}
-        output.append({
+        nm = fn.get("name") or ""
+        child, ns = (ns_map or {}).get(nm, (nm, None))
+        item = {
             "type": "function_call",
             "id": "fc_" + uuid.uuid4().hex,
             "call_id": tc.get("id"),
-            "name": fn.get("name") or "",
+            "name": child,
             "arguments": _normalize_apply_patch_diff(
-                fn.get("name") or "", _repair_tool_arguments(fn.get("arguments") or "")),
+                child, _repair_tool_arguments(fn.get("arguments") or "")),
             "status": "completed",
-        })
+        }
+        if ns:
+            item["namespace"] = ns
+        output.append(item)
     usage = chat_json.get("usage") or {}
     pt = int(usage.get("prompt_tokens") or 0)
     ct = int(usage.get("completion_tokens") or 0)
@@ -48074,7 +48136,8 @@ def _chat_to_responses(chat_json, model_label, tool_defs=None):
 
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
                       hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
-                      last_prompt=None, answer_gate=None, tool_defs=None, served=None):
+                      last_prompt=None, answer_gate=None, tool_defs=None, served=None,
+                      ns_map=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -48137,14 +48200,22 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 return
         if not st["name"] or st["out_index"] is not None:
             return
+        # A namespaced child -> the bare child name + a `namespace` field, the
+        # shape codex routes on (VERIFIED live). Done once, before the item is
+        # first emitted, so the added/done/completed items all agree.
+        if "ns" not in st:
+            child, ns = (ns_map or {}).get(st["name"], (st["name"], None))
+            st["name"], st["ns"] = child, ns
         st["out_index"] = next_index
         next_index += 1
+        _added = {"type": "function_call", "id": st["item_id"],
+                  "call_id": st["call_id"], "name": st["name"],
+                  "arguments": "", "status": "in_progress"}
+        if st.get("ns"):
+            _added["namespace"] = st["ns"]
         yield _sse_event("response.output_item.added", {
             "type": "response.output_item.added",
-            "output_index": st["out_index"],
-            "item": {"type": "function_call", "id": st["item_id"],
-                     "call_id": st["call_id"], "name": st["name"],
-                     "arguments": "", "status": "in_progress"}})
+            "output_index": st["out_index"], "item": _added})
         if st["args"]:
             yield _sse_event("response.function_call_arguments.delta", {
                 "type": "response.function_call_arguments.delta",
@@ -48201,6 +48272,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                     "call_id": st["call_id"], "name": st["name"],
                     "arguments": full_args,
                     "status": "incomplete" if cut_short[0] else "completed"}
+            if st.get("ns"):
+                item["namespace"] = st["ns"]
             yield _sse_event("response.output_item.done", {
                 "type": "response.output_item.done",
                 "output_index": st["out_index"], "item": item})
@@ -48458,6 +48531,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # Tools + size estimate up front (Codex sends huge tool schemas — they must
     # count toward routing so a big request doesn't land on a small-TPM provider).
     tools = _responses_tools_to_chat(body.get("tools"))
+    ns_map = _responses_ns_backmap(body.get("tools"))
     est = _est_tokens(messages, tools)
     _rr_set_request_fit(messages, tools, est)   # fix #1: fit on the post-clear size
     # IMAGES ON A PIPELINE TIER OR A NON-VISION MODE: describe up front (see
@@ -48715,7 +48789,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est,
-                                      tool_defs=tools,
+                                      tool_defs=tools, ns_map=ns_map,
                                       served=_served_metadata(hop_pid, hop_model))),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
@@ -48771,7 +48845,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                       prompt_text=_prompt_text_for_check(payload),
                                       last_prompt=_last_user_text_for_check(payload),
                                       tools_offered=has_tools, answer_gate=gated,
-                                      tool_defs=tools,
+                                      tool_defs=tools, ns_map=ns_map,
                                       served=_served_metadata(hop_pid, hop_model))),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
@@ -48831,7 +48905,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                    max_tokens=body.get("max_output_tokens"))
             if _rv:
                 hop_pid, hop_model, data = _rv
-            out = _chat_to_responses(data, model_label, tool_defs=tools)
+            out = _chat_to_responses(data, model_label, tool_defs=tools, ns_map=ns_map)
             out["metadata"] = _served_metadata(hop_pid, hop_model)
             return (jsonify(out), 200,
                     _routing_headers(hop_pid, hop_model, len(_tried), last_error))

@@ -6903,3 +6903,70 @@ finished (a few seconds at most), not after its first words.
   last sentence decides: "Let me check it. Checked: the bug is on line 12."
   is a report.
 
+
+## codex namespaced tools: the hub's sub-agent/crew/swarm tools were invisible (2026-10-25)
+
+Covered by `tests/test_responses_namespace_tools.py`. Owner: sub-agents / swarm
+/ parallel agents never worked from codex through the hub ("No sub-agent tool is
+available"). MEASURED end-to-end against the installed codex (0.164), capturing
+the real `tools` array it sends on `/v1/responses` and replaying namespaced
+calls back to it:
+
+- codex advertises BOTH its native sub-agents and the hub's own MCP tools as
+  `type: "namespace"` tools: `multi_agent_v1` (children spawn_agent / wait_agent
+  / send_input / close_agent / resume_agent) and `mcp__free_llm_hub` (children
+  swarm_windows_start / crew_run / crew_start / crew_result / swarm_windows_*
+  / publish_* / memory_*).
+- `_responses_tools_to_chat` read the namespace's own `name` and DROPPED its
+  `tools` children, so the free model saw ONE empty, parameter-less, uncallable
+  function per namespace. A call to it came back to codex as "unsupported call:
+  <namespace>", and the model never reached the hub's crew/swarm tools. The real
+  session confirmed it: the model emitted `multi_agent_v1({"agents":[...]})` (the
+  namespace name with a guessed shape) -> codex "unsupported call" -> "continuing
+  the recon serially".
+- **codex's call convention, VERIFIED LIVE (A/B/C probe).** A function_call the
+  provider returns dispatches ONLY as the bare CHILD `name` plus a separate
+  `namespace` field: (A) `name=publish_status`, `namespace=mcp__free_llm_hub` ->
+  codex routed it to the hub MCP server (real result); (B) name alone and (C) a
+  glued `mcp__free_llm_hub__publish_status` both answered "unsupported call".
+  This matches a native-backend rollout where codex itself recorded
+  `{name: spawn_agent, namespace: collaboration}`.
+
+**The fix** (flag `responses_namespace_tools`, `config.get_flag`, default on;
+off = the old one-function-per-namespace behaviour byte for byte):
+- `_responses_ns_entries(tools)` (pure) flattens Responses tools into
+  `(presented, child, namespace, inner)`. A namespace child becomes its own
+  callable function; the presented name is the bare child, qualified
+  `<ns>__<child>` (`_ns_qualify`, survives `^[A-Za-z0-9_-]{1,64}$`) only on a
+  collision. `_responses_tools_to_chat` uses it, so `_infer_tool_name` /
+  `tool_rescue` / the peek validators (all fed the expanded chat tools) see the
+  children for free.
+- `_responses_ns_backmap(tools)` -> `{presented: (child, namespace)}`. PURE,
+  built from each request's own tools, never stashed on `g` (streams, the
+  `best`-fallback re-entry, hedge legs run outside the request context).
+- The `/v1/responses` handler builds `ns_map = _responses_ns_backmap(body["tools"])`
+  and threads it to `_chat_to_responses(..., ns_map=)` (non-stream) and
+  `_responses_stream(..., ns_map=)` (stream, mapped once in `_announce_tool`,
+  stashed on `st["ns"]`, emitted on the `output_item.added` and
+  `output_item.done` items). Both emit the bare child `name` + a `namespace`
+  field. A plain tool is unchanged (no namespace).
+- History needs no change in the common case: the presented name equals the
+  child name, which is what a replayed codex `function_call` item already
+  carries. Only a collision (qualified presented name) would need history
+  mapping -- not present in today's fleet.
+
+**Scope / not done.** The single-model `/v1/responses` path (auto / a category /
+best / Normal-Max) is fixed -- the reported case ran `model=auto`. The
+pipeline-tier replays (`_swarm_as_responses`, `_cm_emit`) do not thread `ns_map`
+yet; codex reaches parallel agents on those tiers through
+`_cm_multi_cli_intercept` (Multi tier = real `swarm_windows`, text-only) and the
+swarm/crew tiers refuse tool-carrying turns, so a namespaced tool call is not
+emitted there in practice. Native `multi_agent_v1` is expanded by the same
+mechanism (strictly >= today: at worst it stays "unsupported" for native only,
+while MCP routing is verified); whether codex dispatches provider-returned
+native sub-agent calls against a custom provider was NOT live-tested. Separately,
+codex gates MCP tool calls behind approval (`approval_policy = "never"` auto-
+denies: "MCP tool call requires approval") -- a codex-config matter, not this
+hub bug; the Multi tier needs no MCP call. Only codex has this bug: namespaces
+exist only on the Responses API (opencode sends flat chat functions, Claude Code
+uses `/v1/messages`).
