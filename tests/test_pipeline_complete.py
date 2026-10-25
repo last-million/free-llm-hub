@@ -675,14 +675,26 @@ def test_a_stalled_provider_goes_behind_the_others_on_a_trivial_turn(quiet, monk
     assert calls == ["nvidia/a", "llm7/x"], calls
 
 
-def test_a_real_turn_keeps_the_chain_order():
+def test_a_stalled_provider_is_stepped_over_on_every_turn(monkeypatch):
+    # walk_demote_stalled_any (2026-10-25): a stalled provider is demoted on
+    # EVERY turn now, not only trivial/tool ones -- so a tool-free "continue"
+    # reaches a working provider instead of re-picking the stalled one's
+    # siblings. (This USED to assert the chain order was kept for a non-trivial
+    # tool-free turn; that was the bug.)
     clock = A._ChainClock.__new__(A._ChainClock)
-    clock.trivial, clock._stalled = False, {"nv"}
+    clock.trivial, clock._stalled, clock._demote_stalled_any = False, {"nv"}, True
     assert list(clock.walk([("nv", "a"), ("nv", "b"), ("x", "c")])) == [
-        ("nv", "a"), ("nv", "b"), ("x", "c")]
+        ("x", "c"), ("nv", "a"), ("nv", "b")]
+    # trivial already demoted before this change -- still does.
     clock.trivial = True
     assert list(clock.walk([("nv", "a"), ("nv", "b"), ("x", "c")])) == [
         ("x", "c"), ("nv", "a"), ("nv", "b")]
+    # Flag OFF: the old behaviour -- a non-trivial tool-free turn keeps the
+    # chain order even with a stalled provider.
+    off = A._ChainClock.__new__(A._ChainClock)
+    off.trivial, off._stalled, off._demote_stalled_any = False, {"nv"}, False
+    assert list(off.walk([("nv", "a"), ("nv", "b"), ("x", "c")])) == [
+        ("nv", "a"), ("nv", "b"), ("x", "c")]
 
 
 def test_every_chain_loop_walks_through_the_clock():

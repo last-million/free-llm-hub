@@ -36316,6 +36316,17 @@ class _ChainClock:
         self._consumed = set()       # chain entries a hedge already ran
         self._served = None          # (pid, model, payload) a hedge served
         self._stalled = set()        # providers that stalled a hop in THIS walk
+        # When a provider STALLS a hop, step to another provider's model next --
+        # on EVERY turn, not only trivial/tool ones. MEASURED 2026-10-25: a
+        # tool-free codex "continue" (6853 est) walked nvidia -> nvidia (a
+        # sibling behind the same slow gateway), burned the whole 240s deadline
+        # on two ReadTimeouts and 504'd, never reaching inception/mercury-3
+        # which was answering. The demotion only REORDERS (the stalled pair's
+        # hops still run after the others) and fires only after a real stall, so
+        # before any stall the chain is byte-for-byte as built. Flag off = the
+        # old trivial/tool-only gate. Lives in the shared walk, so codex
+        # (responses), opencode (chat) and Claude Code (messages) all get it.
+        self._demote_stalled_any = bool(config.get_flag("walk_demote_stalled_any", True))
         # TOOL turns (see _TOOL_PER_PROVIDER_HOPS): per-provider hops and
         # seconds spent in THIS walk, relay hops and failed relay servers.
         self._prov_hops = {}
@@ -36391,7 +36402,8 @@ class _ChainClock:
                     # it opens the turn even when benched -- the picker below
                     # would silently serve a different model.
                     pass
-                elif (self.trivial or self.tools) and (self._stalled or self.tools):
+                elif (self._stalled and self._demote_stalled_any) or (
+                        (self.trivial or self.tools) and (self._stalled or self.tools)):
                     # A junk-benched pair is never what the demotion promotes: it
                     # stays the last hop the built chain made it (see _bench_last).
                     # MEASURED 2026-09-27: nvidia stalled one hop and the benched
@@ -36494,6 +36506,13 @@ class _ChainClock:
             pass
 
     def _ensure_ledgers(self):
+        # A clock built without __init__ (see test_a_clock_built_without_init_
+        # still_walks) still needs these: the walk gate reads both.
+        if getattr(self, "_stalled", None) is None:
+            self._stalled = set()
+        if getattr(self, "_demote_stalled_any", None) is None:
+            self._demote_stalled_any = bool(
+                config.get_flag("walk_demote_stalled_any", True))
         if self._prov_hops is None:
             self._prov_hops = {}
         if self._prov_secs is None:
@@ -36650,7 +36669,10 @@ class _ChainClock:
         return any(e[0] != pid for e in (self._rest or ()))
 
     def _note_stall(self, pid):
-        if (self.trivial or self.tools) and pid:
+        # `walk_demote_stalled_any` (see __init__): record the stall on EVERY
+        # turn, so a non-trivial tool-free walk also steps to another provider.
+        # Flag off = the old trivial/tool-only record, byte-for-byte.
+        if pid and (self.trivial or self.tools or self._demote_stalled_any):
             self._stalled.add(pid)
 
     def left(self):
