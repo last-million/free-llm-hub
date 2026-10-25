@@ -490,7 +490,10 @@ def test_the_stream_peek_commits_a_real_answer_without_reading_it_all(text):
     assert len(buf) < len(frames) - 2          # committed mid-stream, not at the end
 
 
-def test_the_stream_peek_does_not_read_on_when_not_watching():
+def test_the_stream_peek_does_not_read_on_when_not_watching(monkeypatch):
+    # Isolates the NO-TOOLS read-on: the announcement hold (a short tool-turn
+    # reply is read to its end, tests/test_peek_holds_short_replies.py) is off.
+    monkeypatch.setattr(A, "_ANNOUNCE_HOLD_S", 0.0)
     check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK, "used_tools": True}
     status, buf = A._peek_until_content(iter(_token_frames(LIVE)), 5, check=check)
     assert status == "content" and len(buf) <= 5
@@ -501,6 +504,7 @@ def test_the_stream_peek_does_not_read_on_when_not_watching():
 
 def test_the_read_on_is_bounded_in_time(monkeypatch):
     monkeypatch.setattr(A, "_NO_TOOLS_PEEK_EXTRA_S", 0.0)
+    monkeypatch.setattr(A, "_ANNOUNCE_HOLD_S", 0.0)    # the announcement hold is separate
     check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK}
     text = "Hello! I'm here to help. " + "Unfortunately, I don't have the tools to run it."
     status, buf = A._peek_until_content(iter(_token_frames(text)), 5, check=check)
@@ -566,3 +570,25 @@ def test_a_user_asking_about_tools_gets_the_first_answer(hub):
         "messages": [{"role": "user", "content": "Do you have any tools?"}]})
     assert "don't have tools" in r.get_json()["choices"][0]["message"]["content"]
     assert hub.state["calls"] == ["p1"]
+
+
+# --------------------------------------------------------------------------- #
+# An announcement streamed token by token (codex, 2026-10-25)
+# --------------------------------------------------------------------------- #
+
+ANNOUNCED = ("There's a local agent with session handling. Let me check "
+             "`hp_monitor.py` and the identity config.")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_skips_a_token_streamed_announcement(hub, ledger, stream):
+    """MEASURED on a real codex session: the model streamed this sentence token
+    by token, the peek committed it after ~6 frames, and codex ended its turn on
+    it. The first hop's announcement must walk on to the hop that calls a tool."""
+    hub.state.update(text=ANNOUNCED, per_token=True)
+    r = hub.post("/v1/responses", json={
+        "model": "auto", "stream": stream, "input": ASK,
+        "tools": [{"type": "function", "name": "bash",
+                   "parameters": TOOLS[0]["function"]["parameters"]}]})
+    body = r.get_data(as_text=True)
+    assert "Let me check" not in body and "function_call" in body

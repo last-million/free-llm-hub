@@ -37791,8 +37791,22 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         # by _read_on_end). MEASURED LIVE 2026-09-27: codex's
                         # turn ended on "I'll read the last line of big1.txt
                         # for you." -- committed after ~4 per-token frames.
+                        # ...and (2026-10-25) while the reply is still SHORT
+                        # enough to end as one (_announce_possible), even when
+                        # the text so far names no intent yet: a model that
+                        # streams token by token reached 600 frame bytes after
+                        # "There's a local agent" and was committed, then ended
+                        # its codex turn on "Let me check hp_monitor.py and the
+                        # identity config." -- never judged. Bounded by
+                        # _ANNOUNCE_HOLD_S and by what the peek may still wait.
+                        _first = _peeked_text("".join(seen_content))
                         box["ann"] = (verdict == "content" and tools_turn
-                                      and _announce_pending(_peeked_text("".join(seen_content))))
+                                      and (_announce_pending(_first)
+                                           or _announce_possible(_first)))
+                        _now = time.monotonic()
+                        box["ann_until"] = _now + max(0.0, min(
+                            _ANNOUNCE_HOLD_S,
+                            deadline_s + (content_grace or 0.0) - (_now - started) - 0.5))
                         if verdict != "content" or not (watch or box["ann"]):
                             box["status"] = verdict
                             return
@@ -37818,7 +37832,9 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                             return
                         if state == "clear" or time.monotonic() - read_on_at >= read_on_budget:
                             box["nt"] = False
-                    if box.get("ann") and not _announce_pending(text_now):
+                    if box.get("ann") and not _announce_pending(text_now) and (
+                            not _announce_possible(text_now)
+                            or time.monotonic() >= box.get("ann_until", 0.0)):
                         box["ann"] = False
                     if not (box.get("nt") or box.get("ann")):
                         box["status"] = "content"
@@ -38828,6 +38844,25 @@ def _ends_with_announcement(text):
         if _ANNOUNCE_ACTION_RE.search(last):
             return True
         return bool(_LAST_INTENT_RE.match(last) and _WORK_VERB_RE.search(last))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+_ANNOUNCE_HOLD_S = 10.0   # longest the peek holds a short reply to see if it ends as a bare announcement
+
+
+def _announce_possible(text):
+    """True while a PARTIAL reply on a tool turn is still short enough
+    (_ANNOUNCE_MAX_CHARS), question-free and code-free, i.e. it may yet END as
+    a bare announcement even though nothing in it names an intent so far
+    ("There's a local agent." ... "Let me check x.py."). Larger than
+    _announce_pending on purpose: the peek keeps reading instead of committing
+    a stream whose ending it has not seen. Never raises."""
+    try:
+        if not text or not isinstance(text, str):
+            return False
+        body = text.strip()
+        return bool(body) and len(body) <= _ANNOUNCE_MAX_CHARS             and "?" not in body and "```" not in body
     except Exception:                                            # noqa: BLE001
         return False
 

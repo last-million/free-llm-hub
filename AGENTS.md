@@ -6862,3 +6862,26 @@ carries `relay` (`_is_relay_pid`), all four chain peeks pass the hop's pid,
 and the peek's verdict is "junk" -> the walk goes on to the next hop. Hedge
 legs peek without a `check` and are unchanged.
 
+## A short reply that ends on "Let me check ..." is not committed (2026-10-25)
+
+Covered by `tests/test_peek_holds_short_replies.py` and the last test of
+`tests/test_no_tools_claim.py`. MEASURED (codex session 01:38, Activity ids
+18169-18174, nvidia/minimax-m3.1-flash, `/v1/responses`): the turn's last model
+message was "There's a local agent with session handling. Let me check
+`hp_monitor.py` and the identity config." and codex recorded `task_complete` --
+the model announced work, made no tool call, and the hub served it as the final
+answer. `_peek_until_content` judges the peeked text once 600 frame BYTES have
+arrived (~6 per-token frames, i.e. "There's a local") and kept reading only when
+that text already looked like an announcement (`_announce_pending`); nothing in
+it does, so the stream was committed and the sentence that ended the reply was
+never judged. The same text in bigger chunks WAS caught, which hid the bug.
+
+On a tool turn the peek now also keeps reading while the reply is still short
+enough to END as a bare announcement (`_announce_possible`: <= `_ANNOUNCE_MAX_CHARS`
+400, no "?", no code fence), up to `_ANNOUNCE_HOLD_S` (10 s) and never past the
+peek's own wait. A tool call still commits at once; past 400 chars the stream
+commits as before; the end of the stream is judged whole (`_read_on_end` ->
+`announced` -> the walk goes on, one retry per request: `_announce_skip_spent`).
+Cost: a short text-only reply on a tool turn starts reaching the CLI when it has
+finished (a few seconds at most), not after its first words.
+
