@@ -6999,3 +6999,59 @@ codex's native sub-agents, not only the hub MCP tools.
 
 Only codex has this namespace bug: namespaces exist only on the Responses API
 (opencode sends flat chat functions, Claude Code uses `/v1/messages`).
+
+## A stalled provider is stepped over on every turn (2026-10-25)
+
+Covered by `tests/test_walk_demotes_stalled_any_turn.py` and
+`tests/test_pipeline_complete.py`. Owner: "I say continue and he stops and I get
+error / empty / 200 in Activity -- when a model errors, go to the next one that
+WORKS, best available by benchmark, dynamically for any provider/model, in every
+supported CLI." MEASURED (hub.log + Activity, 2026-10-25): a tool-free codex
+"continue" (`/v1/responses`, est 6853, tools=False, non-trivial) walked
+`nvidia/glm-5.3 ! ReadTimeout` then `nvidia/deepseek-v4.1-flash !
+_HopBudgetExceeded` -- two SIBLING models behind the same slow gateway -- spent
+the whole 240 s deadline and 504'd, while `inception/mercury-3` was answering
+other turns in the same minutes. The 504 rows were always `nvidia -> nvidia`; a
+chain that happened to have a different provider as the next hop reached
+inception (late, 198-243 s) and only avoided the 504 by luck.
+
+- **Root cause**: `_ChainClock.walk`'s stall-demotion ("a provider that stalled a
+  hop this walk goes behind the others") AND the `_note_stall` that feeds
+  `self._stalled` were BOTH gated on `self.trivial or self.tools`. A non-trivial
+  tool-free turn therefore never recorded the stall and never reordered, so it
+  re-picked the staller's siblings until the chain ran out -> codex 504 ("it
+  stopped").
+- **Fix** (flag `walk_demote_stalled_any`, `config.get_flag`, default on): once
+  ANY provider stalls a hop this walk (hop budget / timeout / silent peek /
+  reasoning stall -> `_note_stall`, now recorded on every turn), the walk's
+  picker steps to the first entry of a DIFFERENT provider (`_demoted(pid)` is
+  True for a stalled pid regardless of `tools`). Fully dynamic: keyed on which
+  provider stalled, never on provider/model names. It only REORDERS (the stalled
+  pair still runs after the others, never dropped) and only after a real stall,
+  so before any stall the walk is byte-for-byte as built. `_ensure_ledgers`
+  defaults `_stalled` / `_demote_stalled_any` so a clock built without `__init__`
+  (the pure-logic tests) still walks. Flag off = the old trivial/tool-only gate,
+  byte for byte.
+- **All CLIs**: the change lives in the shared `_ChainClock` + `walk`, which all
+  three protocol loops use, so codex (`/v1/responses`), opencode
+  (`/v1/chat/completions`) and Claude Code (`/v1/messages`) all get it.
+- **Live-verified** 2026-10-25 on `67247c5` (fleet partly degraded: nvidia
+  timing out, dahl/freemodel 429): a tool-free non-trivial `/v1/responses`
+  "continue" replay completed in 37 s on `groq/qwen3.8-27b` after the first hop
+  (`g4f/.../grok-4.7`) stalled `_HopBudgetExceeded` -- the walk stepped to a
+  working provider instead of 504'ing. Full suite green under `.venv` (9429
+  passed / 3 skipped; the one `test_pipeline_complete` case that encoded the old
+  "keeps the chain order" contract was updated to the new one plus a flag-off
+  guard).
+- **Left open (separate, honest):** (1) the `empty . 200` that codex accepts as a
+  FINISHED turn and stops on -- a committed `/v1/responses` stream that delivers
+  no visible text ends as `response.completed` with empty output rather than a
+  retryable `response.failed`; the reliably-empty pair seen today was
+  `g4f/HuggingChat:zai-org/GLM-5.3`. This fix makes the chain reach other
+  providers first, so that pair is less often the last resort, but the
+  empty-as-finished shape itself is not changed here. (2) `uncloseai` returns
+  HTTP 401 "public beta closed" on every hop and is never parked (it is keyless,
+  so the dead-key path has nothing to mark); it wastes one fast hop per request.
+  (3) When the WHOLE free fleet is degraded at once, no routing change conjures a
+  working provider -- this fix only guarantees that whenever at least one works,
+  the chain reaches it fast instead of dying on a staller.
