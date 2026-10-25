@@ -36672,7 +36672,11 @@ class _ChainClock:
             return None
         if not self.tools and not getattr(self, "_share_any", False):
             return None
-        share = (_TOOL_PROVIDER_SHARE_HUGE if self.est >= STREAM_HUGE_REQUEST_TOKENS
+        # The larger share for a huge prompt is a TOOL-turn allowance; a
+        # tool-free turn keeps the plain share (MEASURED 2026-10-25: a 54K
+        # codex compaction lost 180 s of 240 to one silent nvidia hop).
+        share = (_TOOL_PROVIDER_SHARE_HUGE
+                 if self.tools and self.est >= STREAM_HUGE_REQUEST_TOKENS
                  else _TOOL_PROVIDER_SHARE)
         return max(_TOOL_PROVIDER_MIN_SECONDS, share * float(self.limit))
 

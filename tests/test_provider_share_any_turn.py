@@ -61,3 +61,14 @@ def test_tool_turns_keep_their_cap():
         cap = max(A._TOOL_PROVIDER_MIN_SECONDS,
                   A._TOOL_PROVIDER_SHARE * float(clock.limit))
         assert budget <= cap + 0.01
+
+
+def test_huge_tool_free_turn_keeps_the_plain_share():
+    # A 54K codex compaction (tool-free) must not hand one provider 75%.
+    chain = [("nvidia", "z-ai/glm-5.3"), ("inception", "mercury-3")]
+    with A.app.test_request_context("/v1/responses"):
+        clock = A._ChainClock(tools=False, est=53871, stream=True)
+        _, budget = _first_hop_budget(clock, chain)
+        cap = max(A._TOOL_PROVIDER_MIN_SECONDS,
+                  A._TOOL_PROVIDER_SHARE * float(clock.limit))
+        assert budget <= cap + 0.01
