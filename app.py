@@ -11143,6 +11143,40 @@ def _note_relay_tool_fail(pid, model):
         pass
 
 
+# A relay hop that answers with its backend's KEY-BUDGET notice ("The API key used
+# for this request has reached its budget ...") says every model behind that backend
+# is out, not just the one asked. MEASURED 2026-10-25: srv_mr9dda... failed the
+# canary notice-by-notice on opus, sonnet, fable, astra and sol, each costing a hop
+# on a different request. The server is skipped for _RELAY_NOTICE_TTL (fail-open:
+# never when it is all the chain has), then tried again. In memory on purpose: the
+# cost of rediscovering it after a restart is one rejected hop.
+_RELAY_NOTICE_TTL = 600.0
+_relay_notice_at = {}        # relay server id -> monotonic time of its last notice
+
+
+def _note_relay_notice(pid, model, reasons):
+    """Remember a relay backend that served a provider notice. Never raises."""
+    try:
+        if "provider_notice" not in (reasons or ()) or _client_gone():
+            return
+        if not config.get_flag("relay_notice_rest", True):
+            return
+        server = _relay_server_id(pid, model)
+        if not server:
+            return
+        if server not in _relay_notice_servers():
+            _log.warning("[relay] %s served a provider notice; skipping that backend "
+                         "for %d min", server, int(_RELAY_NOTICE_TTL // 60))
+        _relay_notice_at[server] = time.monotonic()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _relay_notice_servers():
+    now = time.monotonic()
+    return {s for s, t in list(_relay_notice_at.items()) if now - t <= _RELAY_NOTICE_TTL}
+
+
 def _relay_tool_sick(pid, model):
     """True for a relay server that failed a tool turn _RELAY_TOOL_FAIL_LIMIT
     times within _RELAY_TOOL_FAIL_TTL: skipped for tool requests."""
@@ -36115,7 +36149,7 @@ def _tag_nonanswer_kind(resp, kind):
         pass
 
 
-def _hedge_leg_verdict(item, payload):
+def _hedge_leg_verdict(item, payload, hop=None):
     """'ok' | 'salvaged' | a failure class, for one finished hedge leg. 'ok'
     is what may win the race: a real answer answer_check.inspect passes."""
     try:
@@ -36140,7 +36174,7 @@ def _hedge_leg_verdict(item, payload):
                 return "empty"
             if _starve_kind(data, payload) == "stub":
                 return "starved"   # a stub must not win the race
-            return _answer_gate(data, payload, False)
+            return _answer_gate(data, payload, False, hop=hop)
         if kind == "peek":
             status, buffered, _it = extra
             if status != "content":
@@ -36153,7 +36187,8 @@ def _hedge_leg_verdict(item, payload):
             text = _peeked_text(raw)
             if text and not answer_check.inspect(
                     text, prompt_text=_prompt_text_for_check(payload),
-                    last_prompt=_last_user_text_for_check(payload)).get("ok", True):
+                    last_prompt=_last_user_text_for_check(payload),
+                    relay=bool(hop) and _is_relay_pid(hop[0])).get("ok", True):
                 return "salvaged"
             return "ok"
     except Exception:                                            # noqa: BLE001
@@ -36377,6 +36412,14 @@ class _ChainClock:
         self._ensure_ledgers()
         original = list(chain or ())
         self._rest = rest = list(original)
+        try:
+            noticed = _relay_notice_servers()
+            # Fail-open: a backend is only skipped while something else is left.
+            if noticed and any(_relay_server_id(e[0], e[1]) not in noticed
+                               for e in original):
+                self._relay_bad |= noticed
+        except Exception:                                        # noqa: BLE001
+            pass
         if self.tools and self.est:
             rest[:] = self._roomy_first(rest)
         first = True
@@ -36898,7 +36941,8 @@ class _ChainClock:
                 # error handling (starved retry, soft 400, junk gate) applies.
                 self._settle(lock, abandoned, q, legs, keep=None, live=live)
                 return self._loop_result(item, legs)
-            verdict = verdicts[idx] = _hedge_leg_verdict(item, legs[idx][2])
+            verdict = verdicts[idx] = _hedge_leg_verdict(
+                item, legs[idx][2], hop=(legs[idx][0], legs[idx][1]))
             if verdict == "ok":
                 self._settle(lock, abandoned, q, legs, keep=idx, live=live)
                 if fallback is not None:
@@ -36974,7 +37018,8 @@ class _ChainClock:
                         _throttle_failed_hop(p, m)
                 else:
                     verdict = (verdicts or {}).get(idx) \
-                        or _hedge_leg_verdict(item, legs[idx][2])
+                        or _hedge_leg_verdict(item, legs[idx][2],
+                                              hop=(legs[idx][0], legs[idx][1]))
                     if verdict in ("junk", "salvaged"):
                         # As the loop files a junk answer (_JUNK_FAIL_WEIGHT +
                         # the junk bench): losing the race is no excuse.
@@ -37502,6 +37547,8 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
                     # relay=) cut it to an EMPTY 200 instead of the next hop.
                     relay=bool(check.get("relay")))
                 if not v.get("ok", True) and not v.get("salvage"):
+                    _note_relay_notice(check.get("pid"), check.get("model"),
+                                       v.get("reasons"))
                     return "junk"
     except Exception:                                            # noqa: BLE001
         pass
@@ -37581,7 +37628,7 @@ def _stream_starve_retry(clock, pid, model, payload, est, has_tools, tools, line
         it = tool_rescue.rescue_stream(it, tools, "lines" if lines else "frames")
     status, buffered = _peek_until_content(
         it, clock.peek_timeout(model, est, pid=pid), content_grace=clock.content_grace(),
-        check=_peek_check(retry, has_tools, pid=pid),
+        check=_peek_check(retry, has_tools, pid=pid, model=model),
         reasoning_budget=clock.reasoning_budget())        # after peek_timeout
     clock.note_peek(pid, model, status)
     if status == "starved":
@@ -39113,6 +39160,9 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     if kind in ("provider_quota", "provider_error", "no_tools_claim", "announced"):
         if kind == "provider_quota":
             _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
+            # A key-budget notice is the BACKEND's, not this model's: rest the
+            # whole relay server (see _note_relay_notice).
+            _note_relay_notice(pid, model, ["provider_notice"])
         return
     _mark_model_dead(pid, model, 404)         # 404 is in _DEAD_STATUSES
 
@@ -39216,6 +39266,8 @@ def _answer_gate(data, payload, has_tools, hop=None):
         _log.warning("[answer-gate] junk in answer (%s), salvage=%s",
                      ",".join(verdict.get("reasons") or ()),
                      "yes" if verdict.get("salvage") else "no")
+        if hop and len(hop) == 2:
+            _note_relay_notice(hop[0], hop[1], verdict.get("reasons"))
         if verdict.get("salvage"):
             msg["content"] = verdict["salvage"]
             if choice.get("finish_reason") == "length":
@@ -39583,6 +39635,7 @@ class _StreamAnswerGate:
                      "served the clean part" if piece.strip() or self._emitted
                      else "nothing salvageable")
         if self._pid and self._model_id:
+            _note_relay_notice(self._pid, self._model_id, self.reasons)
             try:
                 _record_outcome(self._pid, self._model_id, False, junk=True)
             except Exception:                                    # noqa: BLE001
@@ -39898,7 +39951,7 @@ def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
         return iterator
 
 
-def _peek_check(payload, has_tools, pid=None):
+def _peek_check(payload, has_tools, pid=None, model=None):
     """The answer_check context _peek_until_content judges a peeked answer
     with. None on error: the peek then runs only its older detectors.
     `pid` names the hop's provider: the relay-only checks (provider notices,
@@ -39907,6 +39960,7 @@ def _peek_check(payload, has_tools, pid=None):
     try:
         return {"prompt_text": _prompt_text_for_check(payload),
                 "relay": bool(pid) and _is_relay_pid(pid),
+                "pid": pid, "model": model,
                 "last_prompt": _last_user_text_for_check(payload),
                 "tools_offered": bool(has_tools),
                 # The offered tools themselves: a reply that is ONLY one of
@@ -47639,7 +47693,7 @@ def _chat_completions_uncached(body):
                 status, buffered = _peek_until_content(
                     it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools, pid=hop_pid),
+                    check=_peek_check(payload, has_tools, pid=hop_pid, model=hop_model),
                     reasoning_budget=_clock.reasoning_budget())
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
@@ -48844,7 +48898,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools, pid=hop_pid),
+                    check=_peek_check(payload, has_tools, pid=hop_pid, model=hop_model),
                     reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
@@ -49873,7 +49927,7 @@ def v1_messages():
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools, pid=hop_pid),
+                    check=_peek_check(payload, has_tools, pid=hop_pid, model=hop_model),
                     reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":

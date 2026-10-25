@@ -73,5 +73,5 @@ def test_a_real_relay_answer_still_commits():
 
 def test_every_chain_peek_names_its_provider():
     src = open("app.py", encoding="utf-8").read()
-    assert src.count("_peek_check(payload, has_tools, pid=hop_pid)") == 3
-    assert "_peek_check(retry, has_tools, pid=pid)" in src
+    assert src.count("_peek_check(payload, has_tools, pid=hop_pid, model=hop_model)") == 3
+    assert "_peek_check(retry, has_tools, pid=pid, model=model)" in src

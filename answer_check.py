@@ -1007,13 +1007,30 @@ _SIGNUP_NOTICE_RE = re.compile(
     re.I)
 
 
-def _provider_notice(masked, prompt_text):
+# MEASURED 2026-10-25 (a user's CLI showed the Pollinations key-budget notice as the
+# model's reply): the notice is only rejected on RELAY hops, so any hop the relay
+# list does not name (a hedge leg, a custom provider, the direct `pollinations`
+# row) served it as an answer. These fragments belong to that gateway's billing
+# notice and to nothing else, so they are rejected on EVERY hop (still short,
+# whole-reply, and skipped when the user's prompt is about budgets/keys).
+_GATEWAY_NOTICE_SIG_RE = re.compile(
+    r"enter\.pollinations\.ai/edit-key|ref=agent_key_budget|"
+    r"topping up the wallet does not raise this limit", re.I)
+
+
+def _provider_notice(masked, prompt_text, relay=True):
     """0 when the whole reply is an upstream quota/billing/rate-limit notice
     addressed to the API caller, or a short sign-up / log-in demand, else None.
     Judged on the code-masked text; the quota check is skipped when the user's
-    own prompt is about those topics."""
+    own prompt is about those topics. `relay=False` (a direct hop) keeps only
+    the unmistakable gateway signatures above."""
     head = (masked or "").strip()
     if not head or len(head) > _NOTICE_MAX_CHARS:
+        return None
+    if not relay:
+        if _GATEWAY_NOTICE_SIG_RE.search(head) and not (
+                prompt_text and _NOTICE_TOPIC_RE.search(_instruction(str(prompt_text)) or "")):
+            return 0
         return None
     if len(head) <= _SIGNUP_MAX_CHARS and _SIGNUP_NOTICE_RE.search(head):
         return 0
@@ -1024,10 +1041,11 @@ def _provider_notice(masked, prompt_text):
     return 0 if _NOTICE_CALLER_RE.search(head) else None
 
 
-def is_provider_notice(text, prompt_text=None):
+def is_provider_notice(text, prompt_text=None, relay=True):
     """Public form of the notice check (see _provider_notice). Never raises."""
     try:
-        return isinstance(text, str) and _provider_notice(_mask_code(text), prompt_text) == 0
+        return isinstance(text, str) and _provider_notice(
+            _mask_code(text), prompt_text, relay=relay) == 0
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -1469,7 +1487,7 @@ def reads_as_answer(text, *, last_prompt=None, relay=False):
                     return False
         if _EARLY_MARKER_RE.search(text):
             return False
-        if relay and is_provider_notice(text, last_prompt):
+        if is_provider_notice(text, last_prompt, relay=relay):
             return False
         if relay and is_tool_deadend(text, last_prompt):
             return False
@@ -1541,8 +1559,9 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             # RELAY hops only (`relay`): a direct provider reports its quota
             # as an HTTP error, and a real answer explaining the user's OWN
             # API quota must never be taken for a notice.
-            ("provider_notice", lambda: (None if offset or not relay else
-                                         _provider_notice(masked, last_prompt))),
+            ("provider_notice", lambda: (None if offset else
+                                         _provider_notice(masked, last_prompt,
+                                                          relay=relay))),
             # Same hops, TOOL turns only: the relay's own "invalid tool request"
             # sentence is a failed hop, never the reply that ends the loop.
             ("tool_deadend", lambda: (None if offset or not (relay and tools_offered)

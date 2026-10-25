@@ -34,9 +34,14 @@ def test_billing_and_quota_notices_from_a_relay_are_not_answers():
 
 
 def test_a_direct_provider_answer_is_never_judged_a_notice():
-    for text in (POLLINATIONS, OWN_QUOTA):
-        assert ac.inspect(text, prompt_text="why does my app fail?")["ok"]
+    # Generic quota wording on a DIRECT hop is still an answer (a direct provider
+    # reports quota as an HTTP error). SUPERSEDED 2026-10-25 for the Pollinations
+    # billing notice ONLY: its unmistakable URL / phrases are rejected on every hop
+    # (tests/test_notice_everywhere.py), because a hop the relay list did not name
+    # served it to a user's CLI.
+    assert ac.inspect(OWN_QUOTA, prompt_text="why does my app fail?")["ok"]
     assert ac.reads_as_answer(PLAIN_NOTICE, last_prompt="continue")
+    assert not ac.inspect(POLLINATIONS, prompt_text="why does my app fail?")["ok"]
 
 
 def test_a_streamed_notice_from_a_relay_is_never_released_early():
@@ -111,5 +116,10 @@ def test_the_hub_gate_judges_relay_hops_only():
     payload = {"messages": [{"role": "user", "content": "fix the zone numbers"}]}
     assert app._answer_gate(data(), payload, False,
                             hop=("g4f", "srv_mp5:community/kimi-k3-free")) == "junk"
-    assert app._answer_gate(data(), payload, False, hop=("groq", "qwen/qwen3.8-27b")) == "ok"
-    assert app._answer_gate(data(), payload, False) == "ok"
+    # a DIRECT hop keeps generic quota wording; the Pollinations signature is junk on
+    # every hop (2026-10-25, tests/test_notice_everywhere.py)
+    plain = {"choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": PLAIN_NOTICE}}]}
+    assert app._answer_gate(plain, payload, False, hop=("groq", "qwen/qwen3.8-27b")) == "ok"
+    assert app._answer_gate(data(), payload, False, hop=("groq", "qwen/qwen3.8-27b")) == "junk"
+    assert app._answer_gate(data(), payload, False) == "junk"

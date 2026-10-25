@@ -7070,3 +7070,33 @@ still waits -- applied to tool turns only. Flag `provider_share_any_turn`
 whatever is left of the clock. Keyed on the provider id only, in the shared
 walk, so every provider and every CLI (chat / responses / messages) gets it.
 Off = the old tool-only cap.
+
+## A gateway's key-budget notice is never an answer, on any hop (2026-10-25)
+
+Covered by `tests/test_notice_everywhere.py`. Report: a user's CLI showed Pollinations'
+"The API key used for this request has reached its budget ... raise the key budget
+(https://enter.pollinations.ai/edit-key?...)" as the model's reply. `answer_check`
+`provider_notice` ran on RELAY hops only (`_TOOL_RELAY_PIDS`), so a hop the list does not
+name served it, and the hedge race judged its streamed legs with no hop identity at all.
+MEASURED in hub.log the same day: one g4f backend (`srv_mr9dda...`) failed the canary with
+this notice on opus, sonnet, fable, astra and sol in turn -- one wasted hop per model.
+
+- **Signature on every hop**: `answer_check._GATEWAY_NOTICE_SIG_RE` (the
+  `enter.pollinations.ai/edit-key` URL, `ref=agent_key_budget`, "topping up the wallet does
+  not raise this limit") makes a short whole-reply notice junk whatever the hop is
+  (`_provider_notice(relay=False)`, also `reads_as_answer`). A prompt about budgets/keys is
+  still exempt, a long reply that merely quotes it is not cut, and generic quota wording
+  ("you exceeded your quota") on a DIRECT hop stays an answer, as before. This deliberately
+  supersedes the old pin in `test_provider_notice.py` that a direct hop never judges a
+  Pollinations notice.
+- **Hedge legs know their hop** (`_hedge_leg_verdict(item, payload, hop=)`): the streamed
+  leg is judged with `relay=`, the JSON leg with `_answer_gate(hop=)`.
+- **The backend rests, not one model** (flag `relay_notice_rest`, default on):
+  `_note_relay_notice` (called by `_answer_gate`, the stream gate's `_cut_at`, the chain
+  peek and `_note_nonanswer` kind `provider_quota`) remembers the relay SERVER
+  (`_relay_server_id`, pid-qualified) for `_RELAY_NOTICE_TTL` (10 min, in memory). The next
+  `_ChainClock.walk` seeds `_relay_bad` with those servers, so every model behind them is
+  skipped on any turn. Fail-open: never when nothing else is left in the chain.
+  `_peek_check` now carries `pid`/`model` for this.
+- Not changed: other vendors' billing wording on a direct hop is still not judged (a
+  direct provider reports it as an HTTP error); the rest is not persisted across a restart.
