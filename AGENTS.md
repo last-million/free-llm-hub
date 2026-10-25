@@ -6845,3 +6845,20 @@ daemon keeps the hub's modes in `/model` after a Disconnect.
   exists (both the fresh-write and the "file unchanged" paths), never replaces
   a key naming another file (the user's own catalog), and asks for a daemon
   refresh when it changed config.toml.
+
+## The stream peek runs the relay-only checks too (2026-10-25)
+
+Covered by `tests/test_peek_judges_relay_notices.py`. MEASURED (hub.log
+2026-10-25 01:16, opencode `coding-max`, Activity "1m 52s, empty . 200"): the
+Max pick (nvidia/z-ai/glm-5.3) was silent for 108 s, the best->auto fallback
+moved to g4f/srv_mrdypihj16e8b1776409:z-ai/glm-5.3-flash, and that relay
+streamed a quota notice. `_judge_peeked` ran `answer_check.inspect` WITHOUT
+`relay=`, so the relay-only checks (`provider_notice`, sign-up notices,
+`tool_deadend`, and the relay half of `idle_greeting` / `cannot_do`) never ran
+before the commit; the committed stream's `_StreamAnswerGate` (which passes
+`relay=`) then cut it to nothing, and the CLI got an empty 200 with the
+fallback's other picks unused. `_peek_check(payload, has_tools, pid=)` now
+carries `relay` (`_is_relay_pid`), all four chain peeks pass the hop's pid,
+and the peek's verdict is "junk" -> the walk goes on to the next hop. Hedge
+legs peek without a `check` and are unchanged.
+

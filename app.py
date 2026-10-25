@@ -37458,7 +37458,12 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
                     full, prompt_text=check.get("prompt_text"),
                     tools_offered=bool(check.get("tools_offered")),
                     finish_reason=fin,
-                    last_prompt=check.get("last_prompt"))
+                    last_prompt=check.get("last_prompt"),
+                    # MEASURED 2026-10-25 01:16 (opencode coding-max): a g4f
+                    # relay streamed a quota notice; without relay= the peek
+                    # passed it, committed the stream, and the gate (which has
+                    # relay=) cut it to an EMPTY 200 instead of the next hop.
+                    relay=bool(check.get("relay")))
                 if not v.get("ok", True) and not v.get("salvage"):
                     return "junk"
     except Exception:                                            # noqa: BLE001
@@ -37539,7 +37544,7 @@ def _stream_starve_retry(clock, pid, model, payload, est, has_tools, tools, line
         it = tool_rescue.rescue_stream(it, tools, "lines" if lines else "frames")
     status, buffered = _peek_until_content(
         it, clock.peek_timeout(model, est, pid=pid), content_grace=clock.content_grace(),
-        check=_peek_check(retry, has_tools),
+        check=_peek_check(retry, has_tools, pid=pid),
         reasoning_budget=clock.reasoning_budget())        # after peek_timeout
     clock.note_peek(pid, model, status)
     if status == "starved":
@@ -39780,11 +39785,15 @@ def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
         return iterator
 
 
-def _peek_check(payload, has_tools):
+def _peek_check(payload, has_tools, pid=None):
     """The answer_check context _peek_until_content judges a peeked answer
-    with. None on error: the peek then runs only its older detectors."""
+    with. None on error: the peek then runs only its older detectors.
+    `pid` names the hop's provider: the relay-only checks (provider notices,
+    "sign up and repeat", tool dead ends) need it, exactly as the committed
+    stream's _StreamAnswerGate has them -- see _judge_peeked."""
     try:
         return {"prompt_text": _prompt_text_for_check(payload),
+                "relay": bool(pid) and _is_relay_pid(pid),
                 "last_prompt": _last_user_text_for_check(payload),
                 "tools_offered": bool(has_tools),
                 # The offered tools themselves: a reply that is ONLY one of
@@ -47517,7 +47526,7 @@ def _chat_completions_uncached(body):
                 status, buffered = _peek_until_content(
                     it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools),
+                    check=_peek_check(payload, has_tools, pid=hop_pid),
                     reasoning_budget=_clock.reasoning_budget())
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
@@ -48648,7 +48657,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools),
+                    check=_peek_check(payload, has_tools, pid=hop_pid),
                     reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
@@ -49677,7 +49686,7 @@ def v1_messages():
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools),
+                    check=_peek_check(payload, has_tools, pid=hop_pid),
                     reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
