@@ -1384,7 +1384,11 @@ def _refresh_codex_catalog_locked(config_path=None):
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 if fh.read() == payload:
-                    return                # nothing changed; leave the mtime alone
+                    # nothing changed; leave the mtime alone -- but codex only
+                    # READS the file when config.toml names it.
+                    if _codex_ensure_catalog_key(config_path or _p_codex(), path):
+                        _codex_restart_daemon_soon(config_path)
+                    return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1406,6 +1410,9 @@ def _refresh_codex_catalog_locked(config_path=None):
             _backup_once(path)
         os.replace(tmp, path)
         _log.info("[codex] model catalog refreshed (%d entries)", len(entries))
+        if _codex_ensure_catalog_key(config_path or _p_codex(), path):
+            # the running daemon read config.toml without the key
+            _codex_restart_daemon_soon(config_path)
     except Exception as exc:                                     # noqa: BLE001
         _log.debug("codex catalog refresh skipped: %s", exc)
 
@@ -33158,6 +33165,41 @@ def _strip_codex_catalog_key(text, catalog_path):
             continue
         kept.append(ln)
     return (_codex_join(kept, rest), True) if removed else (text, False)
+
+
+def _codex_ensure_catalog_key(config_path, catalog_path):
+    """Point config.toml's top-level `model_catalog_json` at the hub's catalog.
+
+    MEASURED 2026-10-25 (codex 0.163 / 0.164): `codex debug models` lists the
+    hub's modes only with `model_catalog_json` set; without it the file next
+    to config.toml is ignored and /model shows the bundled gpt models. Connect
+    never wrote the key (Disconnect already strips it, _strip_codex_catalog_key),
+    so a Disconnect -> Connect left /model without the hub. Written only after
+    the catalog file exists (codex refuses a key naming a missing file). A key
+    naming ANOTHER file is the user's own catalog and is never replaced.
+    Returns True when the file was changed. Never raises."""
+    try:
+        if not (os.path.isfile(config_path) and os.path.isfile(catalog_path)):
+            return False
+        with open(config_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            text = f.read()
+        top, rest = _codex_split_top(text)
+        last_key = -1
+        for i, ln in enumerate(top):
+            m = None if ln.lstrip().startswith("#") else _CODEX_TOP_KEY_RE.match(ln)
+            if not m:
+                continue
+            if m.group(1) == "model_catalog_json":
+                return False         # ours already, or the user's own catalog
+            last_key = i
+        value = ("'%s'" % catalog_path if "'" not in catalog_path
+                 else json.dumps(catalog_path))
+        top.insert(last_key + 1, "model_catalog_json = %s" % value)
+        _cli_write_text(config_path, _codex_join(top, rest))
+        return True
+    except OSError as exc:
+        _log.debug("codex catalog key skipped: %s", exc)
+        return False
 
 
 def _codex_disconnect_catalog(config_path=None):

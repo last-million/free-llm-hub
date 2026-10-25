@@ -6835,3 +6835,13 @@ daemon keeps the hub's modes in `/model` after a Disconnect.
   a running codex is never cut off; the VS Code extension runs its own
   `codex ... app-server` and reads the config itself, so it neither blocks nor
   is stopped. Not run at hub start or on the declared-window resync.
+- **Connect also names the catalog** (`_codex_ensure_catalog_key`, same day).
+  MEASURED with the 0.164 binary: `codex debug models` lists the hub's modes
+  only when config.toml's top section has `model_catalog_json = '<catalog>'`;
+  without it codex ignores `~/.codex/model_catalog.json` and shows the bundled
+  gpt models. Disconnect already strips that key, but Connect never wrote it,
+  so Disconnect -> Connect left /model with gpt models only.
+  `_refresh_codex_catalog_locked` now writes the key once the catalog file
+  exists (both the fresh-write and the "file unchanged" paths), never replaces
+  a key naming another file (the user's own catalog), and asks for a daemon
+  refresh when it changed config.toml.

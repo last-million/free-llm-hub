@@ -143,3 +143,57 @@ def test_the_flag_on_starts_one_waiter(monkeypatch):
     _REAL_SOON(CFG)
     _REAL_SOON(CFG)                       # a second call while one waits adds none
     assert len(started) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Connect names the catalog in config.toml (codex ignores it otherwise)
+# --------------------------------------------------------------------------- #
+
+def _codex_home(tmp_path, body):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(body, encoding="utf-8")
+    cat = tmp_path / "model_catalog.json"
+    cat.write_text('{"models": [{"slug": "all", "display_name": "All (Calvoun hub)"}]}',
+                   encoding="utf-8")
+    return str(cfg), str(cat)
+
+
+def test_connect_writes_the_catalog_key(tmp_path):
+    cfg, cat = _codex_home(tmp_path, 'model_provider = "freehub"\nmodel = "auto"\n\n'
+                                     '[model_providers.freehub]\nname = "x"\n')
+    assert A._codex_ensure_catalog_key(cfg, cat) is True
+    import tomllib
+    data = tomllib.loads(open(cfg, encoding="utf-8").read())
+    assert data["model_catalog_json"] == cat               # a TOP-level key
+    assert data["model_providers"]["freehub"]["name"] == "x"
+    assert A._codex_ensure_catalog_key(cfg, cat) is False  # idempotent
+
+
+def test_a_users_own_catalog_key_is_kept(tmp_path):
+    cfg, cat = _codex_home(tmp_path, "model_catalog_json = 'D:\\mine.json'\nmodel = \"auto\"\n")
+    before = open(cfg, encoding="utf-8").read()
+    assert A._codex_ensure_catalog_key(cfg, cat) is False
+    assert open(cfg, encoding="utf-8").read() == before
+
+
+def test_no_key_when_the_catalog_is_missing(tmp_path):
+    cfg, cat = _codex_home(tmp_path, 'model = "auto"\n')
+    os.remove(cat)
+    assert A._codex_ensure_catalog_key(cfg, cat) is False
+    assert "model_catalog_json" not in open(cfg, encoding="utf-8").read()
+
+
+def test_disconnect_removes_the_key_connect_wrote(tmp_path):
+    cfg, cat = _codex_home(tmp_path, 'model_provider = "freehub"\nmodel = "auto"\n')
+    A._codex_ensure_catalog_key(cfg, cat)
+    os.remove(cat)                                         # Disconnect deleted the catalog
+    text, removed = A._strip_codex_catalog_key(open(cfg, encoding="utf-8").read(), cat)
+    assert removed and "model_catalog_json" not in text
+
+
+def test_the_catalog_refresh_writes_the_key():
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _refresh_codex_catalog_locked(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    # both the "file already up to date" path and the fresh-write path
+    assert body.count("_codex_ensure_catalog_key(") >= 2
