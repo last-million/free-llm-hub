@@ -102,3 +102,48 @@ def test_announce_possible_shape():
     assert A._announce_possible(None) is False
     assert A._announce_possible("Which one?") is False
     assert A._announce_possible("see ```code```") is False
+
+
+# --------------------------------------------------------------------------- #
+# Any verb: the second stopped codex turn (2026-10-25, 02:59)
+# --------------------------------------------------------------------------- #
+
+EXTRACT = ("That searched the whole repo. Let me extract just the scope arrays "
+           "from the saved HTML files.")
+
+
+def test_the_second_real_reply_is_an_announcement():
+    # "extract" is in neither the build-verb list nor the read-verb list; the
+    # shape (a future intent opening the last sentence) is what counts.
+    assert A._ends_with_announcement(EXTRACT) is True
+    assert A._announced_only(EXTRACT) is True               # the non-stream path too
+
+
+def test_it_is_caught_streamed_token_by_token():
+    for size in (1, 3, 5):
+        assert _peek(_cut(EXTRACT, size)) == ("nonanswer", "announced"), size
+
+
+def test_any_verb_after_a_future_intent():
+    for text in ("Let me parse the JSON.", "I'll trace the call chain now.",
+                 "Now I'll dig into the logs.", "Let me try to extract it.",
+                 "I will go ahead and fetch the page.",
+                 "Found the repo. I'm going to compare the two files."):
+        assert A._ends_with_announcement(text) is True, text
+
+
+def test_courtesy_waiting_and_asking_are_not_announcements():
+    for text in ("Done. All tests pass.", "Let me know if you want more.",
+                 "I'll be happy to help further.", "I'll wait for your reply.",
+                 "I will not be able to do that.", "I'll keep that in mind.",
+                 "I'll need your API key.",
+                 "Both tests pass now. I fixed the loop bound in parser.py.",
+                 "Found it. The bug is on line 12."):
+        assert A._ends_with_announcement(text) is False, text
+
+
+def test_an_intent_in_the_middle_is_not_the_end():
+    # only the LAST sentence decides: the model said what it would do and then
+    # reported having done it
+    assert A._ends_with_announcement(
+        "Let me check the file. Checked: the bug is on line 12, fixed.") is False

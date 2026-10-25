@@ -6884,4 +6884,22 @@ commits as before; the end of the stream is judged whole (`_read_on_end` ->
 `announced` -> the walk goes on, one retry per request: `_announce_skip_spent`).
 Cost: a short text-only reply on a tool turn starts reaching the CLI when it has
 finished (a few seconds at most), not after its first words.
+- **Any verb counts (same day, second stopped codex turn).** MEASURED 02:59 on
+  the restarted hub (f9b082e): the model's last message was "That searched the
+  whole repo. Let me extract just the scope arrays from the saved HTML files."
+  and codex recorded `task_complete`. The peek hold above was working; the
+  reply simply did not read as an announcement, because the two verb lists
+  (`_WORK_VERB_RE` = building, `_ANNOUNCE_ACTION_RE` = reading) had no
+  "extract". Whack-a-mole by verb cannot keep up, so `_ends_on_future_intent`
+  judges the SHAPE: the LAST sentence of a short, question-free, code-free reply
+  opens with a future intent (`I'll`, `I will`, `let me`, `I'm going to/about
+  to`, optionally after now/first/next/then and adverbs) and its verb is not in
+  `_NOT_AN_ACTION_RE` (be, help, assist, know, keep, stay, wait, stop, thank,
+  leave, hold, not, never, need, require...). Used by `_ends_with_announcement`
+  (streams, via the peek) and `_looks_like_announced_action` (non-stream, via
+  `_announced_only`). The older verb rules still run first and are unchanged,
+  so their old false positives remain (e.g. "I'll need your API key to
+  continue." -- costs one retry on another model, never a lost answer). Only the
+  last sentence decides: "Let me check it. Checked: the bug is on line 12."
+  is a report.
 

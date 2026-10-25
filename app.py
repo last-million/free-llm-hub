@@ -38797,6 +38797,45 @@ _ANNOUNCE_ACTION_RE = re.compile(
     r"|verif\w*|test\w*|use|call\w*|invok\w*)\b", re.I)
 
 
+# ANY verb after a future intent, MEASURED 2026-10-25 (codex, /v1/responses):
+# two turns in a row ended on "Let me check ... and the identity config." and
+# "That searched the whole repo. Let me extract just the scope arrays from the
+# saved HTML files." -- no tool call, codex recorded task_complete. The verb
+# lists above (_WORK_VERB_RE: building, _ANNOUNCE_ACTION_RE: reading) cannot
+# keep up with the verbs an agent uses ("extract", "parse", "trace", "dig"...),
+# and a reply that ENDS on "I'll / Let me <verb>" is a dead turn whatever the
+# verb is. So the last sentence is judged on its SHAPE: a future intent at its
+# start and a verb that is not courtesy or a request for input. A false
+# positive costs one retry on another model (_announce_skip_spent); a miss ends
+# the user's turn.
+_FUTURE_INTENT_RE = re.compile(
+    r"^\W*(?:(?:now|first|next|then|ok(?:ay)?|alright|so),?\s+)*"
+    r"(?:i\s*['’]?ll|i will|let me|i(?:\s*['’]?m| am) (?:now )?(?:going to|about to))\s+"
+    r"(?:(?:now|first|quickly|just|then|also|go ahead and|start by|begin by"
+    r"|try to|try and)\s+)*(?P<verb>[a-z][a-z-]*)", re.I)
+# Verbs after the intent that are not an action the agent could have taken:
+# courtesy ("I'll be happy to help", "let me know"), waiting, and asking the
+# user for what it needs ("I'll need your API key").
+_NOT_AN_ACTION_RE = re.compile(
+    r"^(?:be|help|assist|know|keep|stay|remain|wait|stop|thank|apologi[sz]e|leave"
+    r"|hold|refrain|let|not|never|need|require|happily|gladly)$", re.I)
+
+
+def _ends_on_future_intent(text):
+    """True when the LAST sentence of a short reply opens with a future intent
+    followed by an action verb (see _FUTURE_INTENT_RE). Never raises."""
+    try:
+        if not text or not isinstance(text, str):
+            return False
+        parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(text.strip()) if p.strip()]
+        if not parts:
+            return False
+        m = _FUTURE_INTENT_RE.match(parts[-1].strip())
+        return bool(m and not _NOT_AN_ACTION_RE.match(m.group("verb")))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _looks_like_announced_action(text):
     """True when `text` (a COMPLETE reply on a tool turn) is only an
     announcement of an action -- see the note above. Short, no question."""
@@ -38805,7 +38844,7 @@ def _looks_like_announced_action(text):
     body = text.strip()
     if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
         return False
-    return bool(_ANNOUNCE_ACTION_RE.search(body))
+    return bool(_ANNOUNCE_ACTION_RE.search(body)) or _ends_on_future_intent(body)
 
 
 def _announced_only(text):
@@ -38843,7 +38882,9 @@ def _ends_with_announcement(text):
         last = parts[-1].strip() if parts else body
         if _ANNOUNCE_ACTION_RE.search(last):
             return True
-        return bool(_LAST_INTENT_RE.match(last) and _WORK_VERB_RE.search(last))
+        if _LAST_INTENT_RE.match(last) and _WORK_VERB_RE.search(last):
+            return True
+        return _ends_on_future_intent(last)
     except Exception:                                            # noqa: BLE001
         return False
 
