@@ -254,6 +254,11 @@ def _stop_never_touches_real_clis(monkeypatch):
     # tests/test_declared_window_providers.py runs the real one on temp homes.
     monkeypatch.setattr(app, "_resync_declared_windows", lambda: [])
     monkeypatch.setattr(app, "_start_declared_window_resync", lambda: None)
+    # Connect/Disconnect of codex stops codex's background daemon -- a REAL
+    # process on the owner's machine. tests/test_codex_daemon_refresh.py runs
+    # the real logic on a fake process table.
+    monkeypatch.setattr(app, "_codex_restart_daemon_soon",
+                        lambda config_path=None: None)
     # Live window steering asks which UA-less CLIs (pi, openclaw, hermes,
     # kimi) are wired to the hub by READING the owner's real configs: a test's
     # reported usage must not depend on that machine state.

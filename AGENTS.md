@@ -6806,3 +6806,32 @@ reached the hub. Covered by `tests/test_images_on_every_mode.py` and the updated
   CLI model that will not call the `swarm_windows_start` MCP tool itself: select
   the `multi` tier (`coding-multi`), which `_cm_multi_cli_intercept` starts as a
   real `swarm_windows` run without needing a tool call.
+
+## codex's background daemon is refreshed on Connect / Disconnect (2026-10-25)
+
+Covered by `tests/test_codex_daemon_refresh.py` (fake psutil; conftest stubs
+`_codex_restart_daemon_soon` for every other test). MEASURED on the owner's
+machine: codex 0.163/0.164 keeps an "app-server daemon"
+(`<CODEX_HOME>/packages/app-server-daemon/releases/<ver>/bin/codex.exe
+app-server ...`, plus its `daemon pid-update-loop`) alive across codex
+windows, and the TUI's `/model` picker comes from it. It reads config.toml and
+model_catalog.json once, at its own start. One started at 23:51 kept showing
+"gpt models only" after Connect rewrote both files at 00:00-00:08, through
+several close/reopen cycles; `codex debug models` (no daemon) listed the hub
+modes all along. Stopping the daemon fixed `/model` at once. The same stale
+daemon keeps the hub's modes in `/model` after a Disconnect.
+
+- `_codex_restart_daemon_soon(config_path)` (flag `codex_daemon_refresh`,
+  default on; one waiter at a time) is called after a codex Connect
+  (`_refresh_codex_catalog_soon`, after the catalog is written), after
+  `_disconnect_codex` changed anything, and in `_bulk_hub_off`'s codex branch.
+  A daemon thread looks every second (`_CODEX_DAEMON_POLL`, gives up after 6 h)
+  and stops the daemon processes ONLY while no codex client runs; codex starts
+  a fresh daemon by itself on the next launch, which reads the new files.
+- Daemon = a `codex(.exe)` process whose command line contains THIS codex
+  home's `packages/app-server-daemon` folder (another CODEX_HOME's daemon is
+  never touched). Client = any other `codex(.exe)` process that is not an
+  `app-server` of its own: the TUI, `codex exec`, and the desktop app count, so
+  a running codex is never cut off; the VS Code extension runs its own
+  `codex ... app-server` and reads the config itself, so it neither blocks nor
+  is stopped. Not run at hub start or on the declared-window resync.

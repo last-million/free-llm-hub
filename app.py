@@ -1330,8 +1330,13 @@ def _refresh_codex_catalog_soon():
     try:
         # The config path is resolved NOW, on the caller's thread: the one the
         # connect just wrote is the one whose catalog this refreshes.
-        threading.Thread(target=_refresh_codex_catalog, args=(_p_codex(),),
-                         daemon=True, name="codex-catalog").start()
+        path = _p_codex()
+
+        def _go():
+            _refresh_codex_catalog(path)
+            # The background daemon still holds the PRE-connect list.
+            _codex_restart_daemon_soon(path)
+        threading.Thread(target=_go, daemon=True, name="codex-catalog").start()
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -1424,6 +1429,125 @@ def _codex_accepts_catalog(binary, path):
         return all(('"%s"' % mid) in out for mid in (MODE_ALL,) + tuple(_mode_keys()))
     except Exception:                                            # noqa: BLE001
         return False
+
+
+# ---- codex's background app-server daemon (2026-10-25) ----
+#
+# MEASURED on the owner's machine: codex 0.163/0.164 keeps a background
+# "app-server daemon" (<CODEX_HOME>/packages/app-server-daemon/.../codex.exe
+# app-server ...) alive across codex windows, and the TUI's /model picker comes
+# from IT. It reads config.toml and model_catalog.json once, when it starts. One
+# started at 23:51 kept serving "gpt models only" after Connect rewrote both
+# files at 00:00-00:08, through several close/reopen cycles; stopping it fixed
+# /model at once. The same stale daemon would keep the hub's modes in /model
+# after a Disconnect. So after codex is connected or disconnected, the hub stops
+# that daemon -- but ONLY while no codex window uses it (codex starts a fresh
+# daemon by itself on the next launch). A running codex is never cut off: the
+# hub waits until it closes.
+
+_CODEX_DAEMON_POLL = 1.0                 # seconds between looks while codex is open
+_CODEX_DAEMON_MAX_WAIT = 6 * 3600        # give up waiting after this long
+_codex_daemon_state = {"waiting": False}
+_codex_daemon_lock = threading.Lock()
+
+
+def _codex_daemon_dir(config_path=None):
+    home = os.path.dirname(config_path or _p_codex())
+    return os.path.normcase(os.path.abspath(os.path.join(home, "packages",
+                                                         "app-server-daemon")))
+
+
+def _codex_proc_rows(psutil):
+    """(pid, name, argv) of every process whose executable is called codex."""
+    rows = []
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = str(p.info.get("name") or "").lower()
+            if name not in ("codex", "codex.exe"):
+                continue
+            rows.append((p.info["pid"], name, list(p.info.get("cmdline") or ())))
+        except Exception:                                        # noqa: BLE001
+            continue
+    return rows
+
+
+def _codex_daemon_split(rows, daemon_dir):
+    """(daemon pids, client pids). A daemon process runs from this codex
+    home's packages/app-server-daemon folder. A client is any other codex
+    process that is not an app-server of its own (the VS Code extension runs
+    its own `codex app-server` and reads the config itself) -- the TUI,
+    `codex exec`, and the desktop app all count, so the hub waits for them."""
+    daemons, clients = [], []
+    for pid, _name, argv in rows:
+        joined = os.path.normcase(" ".join(str(a) for a in argv))
+        if daemon_dir and daemon_dir in joined:
+            daemons.append(pid)
+        elif "app-server" not in [str(a).lower() for a in argv[1:]]:
+            clients.append(pid)
+    return daemons, clients
+
+
+def _codex_restart_daemon_once(config_path=None, psutil_mod=None):
+    """One look. Returns "none" (no daemon running), "busy" (a codex window
+    is open), "stopped" (the daemon was stopped) or "error". Never raises."""
+    try:
+        psutil = psutil_mod
+        if psutil is None:
+            import psutil                                        # noqa: F811
+        daemons, clients = _codex_daemon_split(_codex_proc_rows(psutil),
+                                               _codex_daemon_dir(config_path))
+        if not daemons:
+            return "none"
+        if clients:
+            return "busy"
+        for pid in daemons:
+            try:
+                psutil.Process(pid).kill()
+            except Exception:                                    # noqa: BLE001
+                pass
+        return "stopped"
+    except Exception:                                            # noqa: BLE001
+        return "error"
+
+
+def _codex_restart_daemon_soon(config_path=None):
+    """Stop codex's background daemon as soon as no codex window is open, so
+    the next codex start reads the config/catalog the hub just wrote. One
+    waiter at a time; flag `codex_daemon_refresh` (default on). Never raises."""
+    try:
+        if not config.get_flag("codex_daemon_refresh", True):
+            return
+        cfg = config_path or _p_codex()
+        with _codex_daemon_lock:
+            if _codex_daemon_state["waiting"]:
+                return
+            _codex_daemon_state["waiting"] = True
+
+        def _go():
+            try:
+                end = time.time() + _CODEX_DAEMON_MAX_WAIT
+                said = False
+                while time.time() < end:
+                    got = _codex_restart_daemon_once(cfg)
+                    if got == "stopped":
+                        _log.info("[codex] stopped its background app-server so "
+                                  "the next codex start reads the new config")
+                        return
+                    if got != "busy":
+                        return
+                    if not said:
+                        _log.info("[codex] waiting for codex to close before "
+                                  "refreshing its background app-server")
+                        said = True
+                    time.sleep(_CODEX_DAEMON_POLL)
+            finally:
+                with _codex_daemon_lock:
+                    _codex_daemon_state["waiting"] = False
+
+        threading.Thread(target=_go, daemon=True, name="codex-daemon").start()
+    except Exception:                                            # noqa: BLE001
+        with _codex_daemon_lock:
+            _codex_daemon_state["waiting"] = False
 
 
 def _repair_opencode_config():
@@ -33574,6 +33698,9 @@ def _disconnect_codex(entry):
             out["catalog"] = cat["catalog"]
         if cat["catalog"] or cat["config_key_removed"]:
             out["changed"] = True
+    if out.get("changed") or out.get("restored_from_backup"):
+        # codex's background daemon still lists the hub's modes until it restarts.
+        _codex_restart_daemon_soon(path)
     return out
 
 
@@ -34218,6 +34345,7 @@ def _bulk_hub_off(expected_revision):
             if cid == "codex" and result.get("status") == "off" and \
                     not _codex_wired_to_hub(result.get("path") or None):
                 _codex_disconnect_catalog(result.get("path") or None)
+                _codex_restart_daemon_soon(result.get("path") or None)
             clients[cid] = result
             conflicts = conflicts or result.get("status") == "conflict"
     else:
