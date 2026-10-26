@@ -237,5 +237,7 @@ def test_the_saved_file_is_plain_json_with_no_secrets_by_construction(world):
     A._save_learned_state(force=True)
     data = json.loads(world.read_text())
     assert data["schema"] == 1 and isinstance(data["saved"], float)
+    # "trunc" (2026-10-26): per relay gateway, a label like "g4f|pa:fec3c477", a token count
+    # and a timestamp -- see tests/test_truncation_probe.py.
     assert set(data["dicts"]) == {"tool_ttft", "long_ctx", "chain_seen", "recent_fail",
-                                  "empty_200", "pair_rest", "thinking", "system_first"}
+                                  "empty_200", "pair_rest", "thinking", "system_first", "trunc"}

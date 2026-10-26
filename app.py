@@ -11186,6 +11186,33 @@ def _note_relay_notice(pid, model, reasons):
         pass
 
 
+def _note_lost_request(pid, model, reasons, est, tools=True):
+    """A hop that answered "your message contains only a tool setup" never received the
+    user's turn -- MEASURED 2026-10-26: a g4f relay copy answers a ~155-token request and
+    loses the END of a ~36K-token one, where the user's message sits. Say so on the
+    long-context ledger (a stalled sample at the slow mark), so for requests of
+    >= LONG_CTX_SPEED_TOKENS the pair goes behind the unmeasured ones
+    (_prefer_fast_long_context) until it answers a big one again or LONG_CTX_SPEED_TTL
+    passes -- it stays the first choice for small turns, where it works. Smaller requests
+    leave only the ordinary junk strike. Flag `lost_request_demote` (default on). Never
+    raises."""
+    try:
+        if "empty_message_claim" not in (reasons or ()) or _client_gone():
+            return
+        # Whatever the size: a relay that lost the user's turn has an input ceiling.
+        _trunc_note_claim(pid, model, est, tools)
+        if not (pid and model) or int(est or 0) < LONG_CTX_SPEED_TOKENS:
+            return
+        if not config.get_flag("lost_request_demote", True):
+            return
+        _record_long_ctx_speed(pid, model, est, LONG_CTX_SLOW_MS, stalled=True)
+        _log.warning("[lost-request] %s/%s answered as if the user's message was empty on a "
+                     "~%d-token request; big requests go behind it for %d h",
+                     pid, model, int(est), int(LONG_CTX_SPEED_TTL // 3600))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _relay_notice_servers():
     now = time.monotonic()
     return {s for s, t in list(_relay_notice_at.items()) if now - t <= _RELAY_NOTICE_TTL}
@@ -12400,7 +12427,13 @@ def _model_ctx_info(pid, model):
     lim, src = _model_ctx_info_uncapped(pid, model)
     cap = _PROVIDER_REQUEST_TOKEN_CAP.get(pid)
     if cap and isinstance(lim, int) and lim > cap:
-        return cap, src
+        lim = cap
+    # A relay gateway MEASURED to keep only the start of a request (see RELAYS THAT KEEP
+    # ONLY THE START OF A REQUEST): its ceiling is a hard per-request window, known
+    # ("learned") whatever the catalog says, so a bigger request never reaches it.
+    tc = _trunc_ceiling(pid, model)
+    if tc and (not isinstance(lim, int) or lim > tc):
+        return tc, "learned"
     return lim, src
 
 
@@ -15178,6 +15211,58 @@ def _apply_goal_note(messages):
         return messages
 
 
+_EMPTY_CLAIM_SCAN_MAX = 6000     # chars; the claim itself is <= 1200 (plus a leading <think> block)
+_EMPTY_CLAIM_TURN_NOTE = ("[Withheld by the hub: the model that wrote this reply had not "
+                          "received the user's message. Ignore it and answer the user's "
+                          "request above.]")
+
+
+def _scrub_empty_claims(msgs):
+    """`msgs` with every assistant turn that says "your message contains only a tool
+    setup / no request" (answer_check.is_empty_message_claim) replaced by a neutral
+    note -> a new list, or `msgs` itself when there is none. Never mutates its input.
+
+    MEASURED 2026-10-26 (Build session d9af0686): a relay that loses the end of a big
+    request answered three turns with that claim, and the CLI keeps every one of them
+    in the thread. A model copies what it finds in its history, so each later hop
+    would start from "the user sent nothing" -- and with the claim now failing the hop,
+    a copying chain would reject every model until the deadline. Per hop, like the
+    old-result clearing: the CLI's own history is untouched and the replacement is
+    deterministic, so the provider's prefix cache stays valid. Roles stay as they were
+    (the note is an assistant turn). Flag `scrub_empty_claim_turns` (default on); off
+    = byte-identical. Fails open."""
+    try:
+        if not isinstance(msgs, list) or not config.get_flag("scrub_empty_claim_turns", True):
+            return msgs
+        out, last_user, n = None, "", 0
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "user":
+                if ctxwin.is_real_instruction(m):
+                    last_user = ctxwin.message_text(m)
+            elif (role == "assistant" and not m.get("tool_calls")
+                  and isinstance(m.get("content"), str)
+                  # the claim is a short reply: skip long answers before any regex runs
+                  # (this loop runs on every hop over the whole thread)
+                  and len(m["content"]) <= _EMPTY_CLAIM_SCAN_MAX
+                  and answer_check.is_empty_message_claim(m["content"], last_user)):
+                if out is None:
+                    out = list(msgs)
+                out[i] = {**m, "content": _EMPTY_CLAIM_TURN_NOTE}
+                n += 1
+        if out is None:
+            return msgs
+        if not _ctx_g("_scrub_claims_logged"):
+            _ctx_set("_scrub_claims_logged", True)
+            _log.info("[scrub] replaced %d assistant turn(s) that claimed the user's "
+                      "message was empty", n)
+        return out
+    except Exception:                                            # noqa: BLE001
+        return msgs
+
+
 def _clear_old_results_for_hop(msgs, tools, no_craft=False):
     """This hop's messages with OLD tool results cleared to one line each
     (ctxwin.clear_old_tool_results) -> (messages, info).
@@ -16501,6 +16586,9 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # goal (opening-turn-only, never on compaction). Pipeline-internal
             # stage calls (_no_craft) are skipped with the brief.
             msgs = _apply_goal_note(msgs)
+        # An earlier hop's "your message contains only a tool setup" reply must not be
+        # what this model reads as the conversation so far (see _scrub_empty_claims).
+        msgs = _scrub_empty_claims(msgs)
         _nc = bool(payload.get("_no_craft"))
         if not _nc:
             # A CLI's own compaction request is the moment it forgets its whole
@@ -22082,6 +22170,282 @@ def _probe_pair(pid, model, timeout_s=25):
     -- the original contract; _probe_pair_verdict has the full verdict."""
     res = _probe_pair_verdict(pid, model, timeout_s=timeout_s)
     return res["ok"], res["detail"]
+
+
+# =========================================================================== #
+# A RELAY THAT DROPPED THE USER'S TURN IS KEPT AWAY FROM BIG REQUESTS (2026-10-26).
+# Every name here starts with `_trunc_`.
+#
+# MEASURED (Build session d9af0686, codex, `coding-max`, ~43K-token turns): the user's
+# message reached the hub every time, yet g4f/pa:fec3c477:claude-haiku-5-5-anthropic answered
+# three turns "your message contains only a tool setup" -- and when asked directly, with a code
+# at the very START of the prompt and one just before the question at the END, it often
+# returned only the first ("...the message ends mid-sentence", "the ACT section is cut off").
+# The gateway drops the END of a request, where the user's turn sits, so the model answers
+# blind. What decides it is NOT established, and it is NOT stable: tonight, with fresh random
+# content on every call --
+#     21:50  tools ON  cut at 1.5K-3.5K tokens (500-800 ok); tools OFF cut at 3K (2 of 2)
+#     22:02  tools OFF ok at 1.5K / 3K / 8K (6/6); tools ON cut at 1.5K / 3K / 8K (6/6);
+#            tools ON 500 ok, 900-1,200 mixed
+#     22:08  tools ON ok at 24K (2/2)
+# -- so it varies with time (g4f.space routes to community-donated servers) and perhaps with
+# tools; do not read any of it as a fixed cap. (Two earlier readings, "any prompt over ~8K
+# characters is cut" and "only requests with tools are cut", were each contradicted by the next
+# run.) Most blind answers are plausible prose or tool calls that no check can tell from a real
+# one -- perf-stats had the pair at 20 ok / 1 failed -- so only the ones that SAY the message was
+# empty are caught (answer_check.empty_message_claim fails that hop).
+#
+# What this section does with such a catch: the relay server (_relay_server_id: every model
+# behind `pa:fec3c477` shares one gateway) gets an input CEILING, filed as the pair's learned
+# window (_model_ctx_info), which routing, the chain walk, the quality fallback, the front door
+# and compaction already honour -- a request bigger than the ceiling no longer goes there, a
+# small one still does. Two steps:
+#   1. at once, a PROVISIONAL ceiling of half the size that failed (30 min), so the next turn
+#      is already protected;
+#   2. in the background, a probe (rungs top, top/3, top/9 ... of a request carrying one tool,
+#      a code at each end) looks for the largest rung that comes back whole; that becomes the
+#      ceiling for _TRUNC_TTL. A probe whose top rung comes back whole proves nothing about an
+#      intermittent gateway, so it files nothing and the provisional ceiling just runs out.
+# Short TTLs on purpose: the gateway changes, and a stale ceiling only costs one failed hop to
+# re-learn. Nothing is probed ahead of a failure (an earlier version probed the first big
+# request to every relay; it spent real relay budget -- g4f throttled the hub -- for a verdict
+# that does not hold on a flaky gateway). Direct providers are never involved (they report
+# limits as HTTP errors). Flag `truncation_probe` (default on); off = no entry, no probe,
+# `_model_ctx_info` unchanged. In memory + learned-state.json.
+# =========================================================================== #
+_TRUNC = {}                      # "pid|server" -> {"ceiling": int, "at": epoch, "src": "claim"|"probe"}
+_trunc_lock = threading.Lock()
+_trunc_busy = set()              # keys with a probe running
+_trunc_tried = {}                # key -> time.monotonic() of the last attempt
+_TRUNC_TTL = 3 * 3600.0          # a ceiling found by the probe
+_TRUNC_PROVISIONAL_TTL = 30 * 60.0   # a ceiling guessed from one rejected claim
+_TRUNC_RETRY = 20 * 60.0         # at least this long between two probes of one server
+_TRUNC_TOP = 16000               # the biggest rung (costs one call this size if the relay is whole)
+_TRUNC_FLOOR = 500               # below this a relay is no use for agent work
+_TRUNC_WORDS = ("alpha river stone lantern copper window harvest signal marble ember pocket "
+                "garden thunder velvet compass anchor orchard ribbon canyon saddle meadow "
+                "quartz falcon timber breeze cobalt prairie puzzle harbor summit glacier "
+                "whistle").split()
+_TRUNC_TOOL = [{"type": "function", "function": {
+    "name": "shell_command", "description": "Run a shell command and return its output.",
+    "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                   "required": ["command"]}}}]
+
+
+def _trunc_on():
+    try:
+        return bool(config.get_flag("truncation_probe", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _trunc_key(pid, model):
+    """The relay server a (pid, model) sits behind, or None (not a relay)."""
+    try:
+        return _relay_server_id(pid, model)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _trunc_ttl(src):
+    return _TRUNC_PROVISIONAL_TTL if src == "claim" else _TRUNC_TTL
+
+
+def _trunc_entry(key, now=None):
+    """The live record for a relay server (a copy), or None. A record past its own
+    TTL is dropped on read."""
+    if not key:
+        return None
+    now = time.time() if now is None else float(now)
+    with _trunc_lock:
+        e = _TRUNC.get(key)
+        if not e:
+            return None
+        if now - float(e.get("at") or 0) > _trunc_ttl(e.get("src")):
+            _TRUNC.pop(key, None)
+            return None
+        return dict(e)
+
+
+def _trunc_set(key, ceiling, src, now=None):
+    with _trunc_lock:
+        _TRUNC[key] = {"ceiling": int(ceiling), "at": float(time.time() if now is None else now),
+                       "src": str(src)}
+    _save_learned_state()          # throttled; a restart must not re-learn this by failing
+
+
+def _trunc_ceiling(pid, model):
+    """The most input tokens the relay server behind (pid, model) is believed to keep
+    whole, or None (not a relay / nothing known / flag off). Hot path (read by
+    _model_ctx_info for every candidate): an empty ledger returns before any config
+    read. Never raises."""
+    try:
+        if not _TRUNC:
+            return None
+        key = _trunc_key(pid, model)
+        e = _trunc_entry(key) if key else None
+        c = e.get("ceiling") if e else None
+        if not c or not _trunc_on():
+            return None
+        return int(c)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _trunc_payload(model, tokens, seed, tools=True):
+    """(payload, head_code, tail_code): a ~`tokens` request (hub estimate) with one
+    code at the very START of the system message and one right before the question
+    that ends the user message. Non-repeating filler, so a model cannot mistake it
+    for noise. `tools`: carry one tool like the request that failed; the size counts
+    it. `_no_craft` keeps the hub's own briefs out of what is being measured."""
+    rnd = random.Random(seed)
+    head, tail = "H%05d" % rnd.randrange(10 ** 5), "T%05d" % rnd.randrange(10 ** 5)
+    ask = ("CODE-AT-END: %s\nWithout calling any tool, reply with exactly this format and "
+           "nothing else:\nHEAD=<the CODE-AT-START value> TAIL=<the CODE-AT-END value>" % tail)
+    margin = 400 + (_est_tokens([], _TRUNC_TOOL, overhead=0) if tools else 0)
+    want = max(200, (int(tokens) - margin) * 4 - len(ask))   # _est_tokens adds a 400 margin
+    lines, n = [], 0
+    while n < want:
+        line = " ".join(rnd.choice(_TRUNC_WORDS) + str(rnd.randrange(1000)) for _ in range(12))
+        lines.append(line)
+        n += len(line) + 1
+    payload = {"model": model, "stream": False, "max_tokens": 60, "_no_craft": True,
+               "messages": [{"role": "system",
+                             "content": "CODE-AT-START: %s\n%s" % (head, "\n".join(lines))},
+                            {"role": "user", "content": ask}]}
+    if tools:
+        payload["tools"] = copy.deepcopy(_TRUNC_TOOL)
+    return payload, head, tail
+
+
+def _trunc_try(pid, model, tokens, seed, tools=True):
+    """One rung: "ok" (both codes came back), "cut" (an answer that lacks one) or
+    "error" (anything inconclusive: HTTP error, empty reply, exception). The codes are
+    compared by their DIGITS: MEASURED, a model that saw everything still answered
+    "HEAD=95031 TAIL=74272" with the letters dropped."""
+    payload, head, tail = _trunc_payload(model, tokens, seed, tools)
+    try:
+        r = _upstream_chat(pid, payload, False)
+    except Exception:                                            # noqa: BLE001
+        return "error"
+    try:
+        if getattr(r, "status_code", None) != 200:
+            return "error"
+        text = _canary_reply_text(r)
+    finally:
+        try:
+            r.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+    if not (text or "").strip():
+        return "error"
+    return "ok" if (head[1:] in text and tail[1:] in text) else "cut"
+
+
+def _trunc_probe(pid, model, est, tools=True):
+    """Look for the largest request the relay server behind (pid, model) returns whole:
+    rungs top, top/3, top/9 ... (top = min(est, _TRUNC_TOP), down to _TRUNC_FLOOR) until
+    one comes back whole, then ONE refinement between that pass and the cut above it.
+    Returns "ceiling" (filed for _TRUNC_TTL) | "clean" (the top rung came back whole: it
+    proves nothing about a flaky gateway, so nothing is filed) | "unusable" (even the
+    smallest rung failed: the model may just not follow the format, nothing filed) |
+    "error" (inconclusive). Never raises."""
+    try:
+        key = _trunc_key(pid, model)
+        if not key:
+            return "error"
+        top = max(_TRUNC_FLOOR * 2, min(int(est or 0) or _TRUNC_TOP, _TRUNC_TOP))
+        rungs, t = [], top
+        while t >= _TRUNC_FLOOR:
+            rungs.append(t)
+            t //= 3
+        seed = int(time.time()) % 100000
+        passed = failed = None
+        for i, t in enumerate(rungs):
+            res = _trunc_try(pid, model, t, seed + i, tools)
+            if res == "error":
+                return "error"
+            if res == "ok":
+                passed = t
+                break
+            failed = t
+        if passed is None:
+            return "unusable"
+        if failed is None:
+            _log.info("[truncation] %s returned a whole %d-token request just now; the "
+                      "provisional ceiling stands until it runs out", key, passed)
+            return "clean"
+        mid = int((passed * failed) ** 0.5)
+        if mid - passed > passed // 4:
+            res = _trunc_try(pid, model, mid, seed + 99, tools)
+            if res == "ok":
+                passed = mid
+            elif res == "cut":
+                failed = mid
+        _trunc_set(key, passed, "probe")
+        _log.warning("[truncation] %s returns only ~%d tokens of a request whole (cut at ~%d); "
+                     "bigger requests skip it for %d h", key, passed, failed,
+                     int(_TRUNC_TTL // 3600))
+        return "ceiling"
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[truncation] probe failed", exc_info=True)
+        return "error"
+
+
+def _trunc_start(fn):
+    """Run `fn` on a daemon thread (tests replace this to run inline)."""
+    threading.Thread(target=fn, name="trunc-probe", daemon=True).start()
+
+
+def _trunc_spawn(pid, model, est, tools=True):
+    """Start a background probe of the relay server behind (pid, model) unless one
+    is running or ran lately. True when one was started. Never raises."""
+    try:
+        key = _trunc_key(pid, model)
+        if not key:
+            return False
+        now = time.monotonic()
+        with _trunc_lock:
+            last = _trunc_tried.get(key)
+            if key in _trunc_busy or (last is not None and now - last < _TRUNC_RETRY):
+                return False
+            _trunc_busy.add(key)
+            _trunc_tried[key] = now
+
+        def run():
+            try:
+                with _usage_source_as("probe"):
+                    _trunc_probe(pid, model, est, tools)
+            except Exception:                                    # noqa: BLE001
+                pass
+            finally:
+                with _trunc_lock:
+                    _trunc_busy.discard(key)
+        _trunc_start(run)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _trunc_note_claim(pid, model, est, tools=True):
+    """A relay hop answered "your message is only a tool setup" to a request of `est`
+    tokens: it did not receive the user's turn. File a PROVISIONAL ceiling (half the
+    size that failed, 30 min) so the very next request is already protected, and
+    measure the real one in the background. Never raises."""
+    try:
+        key = _trunc_key(pid, model)
+        est = int(est or 0)
+        if not key or est <= 0 or not _trunc_on():
+            return
+        cur = _trunc_entry(key)
+        guess = max(_TRUNC_FLOOR, est // 2)
+        if not (cur and cur.get("ceiling") and cur["ceiling"] <= guess):
+            _trunc_set(key, guess, "claim")
+            _log.warning("[truncation] %s lost the user's turn on a ~%d-token request; "
+                         "requests above ~%d skip it while it is measured", key, est, guess)
+        _trunc_spawn(pid, model, est, tools)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -37563,6 +37927,9 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
                 if not v.get("ok", True) and not v.get("salvage"):
                     _note_relay_notice(check.get("pid"), check.get("model"),
                                        v.get("reasons"))
+                    _note_lost_request(check.get("pid"), check.get("model"),
+                                       v.get("reasons"), check.get("est"),
+                                       bool(check.get("tools_offered")))
                     return "junk"
     except Exception:                                            # noqa: BLE001
         pass
@@ -37777,12 +38144,28 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         prompt=prompt if prompt is not None else check.get("last_prompt"),
         used_tools=bool(check.get("used_tools"))))
     tools_turn = bool(check and check.get("tools_offered"))
+    # "Your message contains only a tool setup" (answer_check.empty_message_claim) applies
+    # where inspect() applies it: tool turns and relay hops. MEASURED 2026-10-26: streamed
+    # token by token, the peek's first verdict point (600 frame BYTES) lands ~11 characters
+    # in, long before the claim is readable, and the hold above released without judging
+    # the longer text -- the claim was committed and codex ended its turn on it.
+    claim_lp = (check or {}).get("last_prompt")
+    claim_watch = bool(check and (tools_turn or check.get("relay")))
 
     def _judge(seen, complete=True):
         verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt,
                                 complete=complete)
         box["kind"] = _take_nonanswer_kind()
         return verdict
+
+    def _claim_verdict(seen, complete):
+        """Fail the hop with the standard verdict once the stream read so far IS the
+        empty-message claim (both halves), else None. Never commits anything."""
+        if not claim_watch or not answer_check.is_empty_message_claim(
+                _peeked_text("".join(seen)), claim_lp):
+            return None
+        v = _judge(seen, complete=complete)
+        return v if v != "content" else "junk"
 
     def _read_on_end(seen):
         """Verdict for a stream that ENDED while the peek read on for a
@@ -37795,7 +38178,9 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         if tools_turn and _ends_with_announcement(text):
             box["kind"] = "announced"
             return "nonanswer"
-        return "content"
+        # The text grew after the first verdict: the empty-message claim is only
+        # readable now (it was judged on its first ~11 characters).
+        return _claim_verdict(seen, True) or "content"
 
     def _worker():
         buf = box["buf"]
@@ -37901,11 +38286,16 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         box["ann"] = (verdict == "content" and tools_turn
                                       and (_announce_pending(_first)
                                            or _announce_possible(_first)))
+                        # ...and while the text so far could still BECOME the
+                        # empty-message claim (same bounded hold as above).
+                        box["emc"] = bool(verdict == "content" and claim_watch
+                                          and answer_check.is_empty_claim_possible(
+                                              _first, claim_lp))
                         _now = time.monotonic()
                         box["ann_until"] = _now + max(0.0, min(
                             _ANNOUNCE_HOLD_S,
                             deadline_s + (content_grace or 0.0) - (_now - started) - 0.5))
-                        if verdict != "content" or not (watch or box["ann"]):
+                        if verdict != "content" or not (watch or box["ann"] or box["emc"]):
                             box["status"] = verdict
                             return
                         # MEASURED 2026-09-27: _PEEK_JUDGE_CHARS counts frame
@@ -37934,7 +38324,17 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                             not _announce_possible(text_now)
                             or time.monotonic() >= box.get("ann_until", 0.0)):
                         box["ann"] = False
-                    if not (box.get("nt") or box.get("ann")):
+                    if box.get("emc"):
+                        # Both halves in: this hop lost the user's turn -- fail it
+                        # now, before a byte is committed, so the chain walks on.
+                        v = _claim_verdict(seen_content, False)
+                        if v is not None:
+                            box["status"] = v
+                            return
+                        if (not answer_check.is_empty_claim_possible(text_now, claim_lp)
+                                or time.monotonic() >= box.get("ann_until", 0.0)):
+                            box["emc"] = False
+                    if not (box.get("nt") or box.get("ann") or box.get("emc")):
                         box["status"] = "content"
                         return
                     continue
@@ -37975,7 +38375,9 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
             if read_on_at is not None:
-                box["status"] = "content"     # judged already; no claim seen
+                # judged already; no claim seen (the empty-message claim, which only
+                # reads in full now, is the one thing left to look at)
+                box["status"] = _claim_verdict(seen_content, False) or "content"
             elif seen_content:
                 box["status"] = _judge(seen_content, complete=False)
             else:
@@ -39282,6 +39684,8 @@ def _answer_gate(data, payload, has_tools, hop=None):
                      "yes" if verdict.get("salvage") else "no")
         if hop and len(hop) == 2:
             _note_relay_notice(hop[0], hop[1], verdict.get("reasons"))
+            _note_lost_request(hop[0], hop[1], verdict.get("reasons"),
+                               _payload_est_tokens(payload), bool(has_tools))
         if verdict.get("salvage"):
             msg["content"] = verdict["salvage"]
             if choice.get("finish_reason") == "length":
@@ -39448,8 +39852,9 @@ class _StreamAnswerGate:
     def __init__(self, iterator, *, mode="bytes", hop_pid=None, hop_model=None,
                  prompt_text=None, last_prompt=None, tools_offered=False,
                  hold_chars=None, hold_seconds=None, visible_cap=None,
-                 early_chars="default"):
+                 early_chars="default", req_est=0):
         self._it = iterator
+        self._req_est = req_est       # the request's estimated tokens (_note_lost_request)
         # Chars of visible text past which the stream is ended at "length":
         # set only when the hub raised max_tokens for reasoning room, so the
         # caller still gets ~the visible length it asked for.
@@ -39650,6 +40055,8 @@ class _StreamAnswerGate:
                      else "nothing salvageable")
         if self._pid and self._model_id:
             _note_relay_notice(self._pid, self._model_id, self.reasons)
+            _note_lost_request(self._pid, self._model_id, self.reasons, self._req_est,
+                               self._tools)
             try:
                 _record_outcome(self._pid, self._model_id, False, junk=True)
             except Exception:                                    # noqa: BLE001
@@ -39960,7 +40367,8 @@ def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
             iterator, mode=mode, hop_pid=hop_pid, hop_model=hop_model,
             prompt_text=_prompt_text_for_check(payload),
             last_prompt=_last_user_text_for_check(payload),
-            tools_offered=bool(has_tools), visible_cap=cap)
+            tools_offered=bool(has_tools), visible_cap=cap,
+            req_est=_payload_est_tokens(payload))
     except Exception:                                            # noqa: BLE001
         return iterator
 
@@ -39975,6 +40383,7 @@ def _peek_check(payload, has_tools, pid=None, model=None):
         return {"prompt_text": _prompt_text_for_check(payload),
                 "relay": bool(pid) and _is_relay_pid(pid),
                 "pid": pid, "model": model,
+                "est": _payload_est_tokens(payload),     # _note_lost_request
                 "last_prompt": _last_user_text_for_check(payload),
                 "tools_offered": bool(has_tools),
                 # The offered tools themselves: a reply that is ONLY one of
@@ -42863,6 +43272,14 @@ def _ls_pack(now=None):
         with _system_first_lock:
             out["system_first"] = [[p, m, float(t)] for (p, m), t in list(_SYSTEM_FIRST.items())
                                    if now - float(t) <= _SYSTEM_FIRST_TTL]
+        # relay gateways that dropped the user's turn: ["trunc", "pid|server", {ceiling, at,
+        # src}] (the first two slots are what _ls_rows requires)
+        with _trunc_lock:
+            out["trunc"] = [
+                ["trunc", k, {"ceiling": int(e.get("ceiling") or 0),
+                              "at": float(e.get("at") or 0), "src": str(e.get("src") or "probe")}]
+                for k, e in list(_TRUNC.items())
+                if e.get("ceiling") and now - float(e.get("at") or 0) <= _trunc_ttl(e.get("src"))]
         return out
     except Exception:                                            # noqa: BLE001
         return {}
@@ -42982,6 +43399,20 @@ def _ls_restore(blob, now=None):
     each("pair_rest", pair_rest)
     each("thinking", stamped(_THINKING_LEARNED, _thinking_lock, _THINKING_LEARNED_TTL))
     each("system_first", stamped(_SYSTEM_FIRST, _system_first_lock, _SYSTEM_FIRST_TTL))
+
+    def trunc(key, row):
+        k, e = row[1], row[2]
+        src = str(e.get("src") or "probe")
+        at = float(e.get("at") or 0)
+        c = int(e.get("ceiling") or 0)
+        if c <= 0 or now - at > _trunc_ttl(src):
+            return False
+        with _trunc_lock:
+            if k in _TRUNC:
+                return False
+            _TRUNC[k] = {"ceiling": c, "at": at, "src": src}
+        return True
+    each("trunc", trunc)
     return n
 
 

@@ -440,6 +440,26 @@ def _conversation_memory_off_unless_tested(request, monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _truncation_probe_off_unless_tested(request, monkeypatch):
+    """RELAY INPUT CEILINGS (app `_trunc_*`, flag `truncation_probe`) are default ON
+    (2026-10-26): the first big request to an unmeasured relay server starts a
+    background probe that sends real requests through `_upstream_chat`. No other test
+    file may ever start one (a relay hop in a test would spawn a thread that calls the
+    network); the feature's own file turns it back on and fakes `_upstream_chat`. The
+    ledger is emptied around every test either way."""
+    import app
+    for store in (app._TRUNC, app._trunc_busy, app._trunc_tried):
+        store.clear()
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_truncation_probe":
+        monkeypatch.setattr(app, "_trunc_on", lambda: False)
+        monkeypatch.setattr(app, "_trunc_start", lambda fn: None)
+    yield
+    for store in (app._TRUNC, app._trunc_busy, app._trunc_tried):
+        store.clear()
+
+
+@pytest.fixture(autouse=True)
 def _weak_models_not_force_verified(request, monkeypatch):
     """Tests written with low fake scores (10-100) are about their own subject;
     the "weak actor is always verified" wiring has its own test file."""

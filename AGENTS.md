@@ -7121,3 +7121,151 @@ Reorder only: the tail keeps them, a chain where everything stalled is unchanged
 `provider_stall_any_turn` (default on), plus the existing `provider_stall_rest`. Not
 changed: relays (separate backends), and a provider whose first stall is not yet followed
 by a second model's stall (the first sibling still gets one try).
+
+## "Your message contains only a tool setup" is a failed hop (2026-10-26)
+
+Covered by `tests/test_empty_message_claim.py` (74 tests) and `tests/test_truncation_probe.py`
+(hermetic; see "A relay that dropped the user's turn ..." below). Report: "when I want to
+continue in a conversation or session I see: It looks like your message contains only a tool
+configuration block without a specific request." MEASURED on Build session d9af0686 (codex,
+`coding-max`, ~43K-token turns):
+
+- **The user's message reached the hub every time.** Codex's own rollout (`isolated-clis/codex/
+  config/sessions/.../rollout-*.jsonl`) holds it as a user message before each bad reply.
+- **One pair answered all three bad turns** (Activity rows, `GET /api/activity`, session
+  d9af0686): `g4f/pa:fec3c477:claude-haiku-5-5-anthropic`, the pair this file (2026-10-23) names
+  as the one working Claude-class relay copy. perf-stats.json records it at 20 ok / 1 failed:
+  the bogus replies were counted as delivered answers, so it kept ranking as healthy. Around
+  those turns nvidia was timing out and dahl returning 429 (hub.log). Whether `_relay_proven`
+  holds for it was NOT checked.
+- **REPRODUCED through the hub, but NOT a stable cap.** Asked directly (fresh random content on
+  every call, a code at the very START of the prompt and one just before the question at the END):
+  ~155 tokens -> the asked-for word; ~36K tokens with tools -> "your message is a long, repeated block
+  of system-style instructions ... it doesn't include an actual task". The same pair, same night:
+  21:50 cut at 1.5K-3.5K tokens with tools (500-800 ok) and at 3K tokens without (2 of 2); 22:02 tools
+  OFF ok at 1.5K / 3K / 8K (6/6), tools ON cut at 1.5K / 3K / 8K (6/6), 500 ok, 900-1,200 mixed; 22:08
+  tools ON ok at 24K (2/2). So the gateway (g4f.space routes to community-donated servers) drops the
+  END of a request -- where the user's turn sits -- on and off, and neither "any big prompt" nor "any
+  request with tools" held for the next run. Two earlier readings in this very section were each
+  contradicted by the next measurement and are gone. NOT established: why, or what decides it.
+- **Why the hub served it.** The reply is clean prose with no tool call. `idle_greeting` needs the
+  offer to help within the first 40 characters (pinned by `test_double_answer`); these replies
+  open with "It looks like your message contains only ..." and the offer comes ~80 characters in.
+  `inspect()` returned ok, codex recorded `task_complete`, and every "continue" went to the same
+  pair again.
+
+**The fix** (flag-free except where named; each part fails open):
+
+- **`answer_check` reason `empty_message_claim`** (`is_empty_message_claim`): needs BOTH halves,
+  so a real answer that merely mentions "your message" or "the tool setup" is never cut -- (a) the
+  reply OPENS (start <= 80 chars) by calling the user's message/input/prompt/request
+  tool / system / setup / configuration / definition / instructions material, and (b) it says there
+  is no request / question / task / "nothing for me to act on". Short replies only (<= 1200
+  chars). Same gate as `idle_greeting` / `cannot_do`: tool turns and relay hops. NO word-count gate
+  on the user's turn (the report was "continue"): the claim is false for ANY non-empty turn.
+  Skipped when the user's turn is empty after CLI wrapper blocks are removed (`_instruction`),
+  and when the user's own text is about a tool definition / tool config / function schema /
+  system prompt / JSON schema / MCP config / `"tools":` (it may really be one). That exclusion is
+  deliberately narrow: the Build page appends a long "Standing instruction" that says "native
+  planning/task tool" and "tool access", and a bare "tool" would have switched the rule off for
+  every Build message (pinned by a test).
+- **The stream peek reads on while a reply could still become the claim** (`_peek_until_content`;
+  `answer_check.is_empty_claim_possible`). The peek's first verdict point is 600 frame BYTES, ~11
+  characters when a model streams one token per frame, so a claim sent token by token was judged
+  on "It looks li" and committed (the claim fed in ONE frame was caught, which hid it). Now, on tool
+  turns and relay hops, the peek keeps reading (bounded by `_ANNOUNCE_HOLD_S` and the peek's own
+  deadline) while the text is a confirmed claim opening or could still become one (a short list of
+  openers, released after 200 chars or once the text diverges), fails the hop with the standard
+  `junk` verdict the moment both halves are in, and judges once more if the stream ends or runs out
+  of lines while held (`_claim_verdict`). `reads_as_answer` never releases a claim opening early
+  either (its ~80 characters are the claim's first half). A tool call still commits at once.
+  Measured 120/120 combinations (5 captured replies x frame sizes 1/3/10/400 x relay-tools /
+  direct-tools / relay-no-tools x two prompts incl. "continue") now fail the hop; before, every
+  token-streamed one committed. Negative control: with the `app.py` change taken out, 18 of the
+  stream tests fail.
+- **Bogus turns already in the thread are neutralised per hop** (`_scrub_empty_claims`, flag
+  `scrub_empty_claim_turns`, default on): an assistant turn that is the claim is replaced by one
+  fixed note (`_EMPTY_CLAIM_TURN_NOTE`) in what each hop SENDS, next to the old-result clearing.
+  The CLI keeps every reply in its own thread and a model copies what it finds there; without this
+  a copying chain would reject every hop until the deadline. Pure, deterministic (the provider's
+  prefix cache stays valid), roles keep alternating, user and tool turns untouched, an assistant
+  turn with tool calls never touched.
+- **The pair goes behind others for BIG requests only** (`_note_lost_request`, flag
+  `lost_request_demote`, default on): a rejected claim on a request >= `LONG_CTX_SPEED_TOKENS`
+  (60K estimated) writes a stalled sample at `LONG_CTX_SLOW_MS` on the long-context ledger, so
+  `_prefer_fast_long_context` queues the pair behind the unmeasured ones for big requests until
+  it answers one or `LONG_CTX_SPEED_TTL` (6 h) passes. It stays first choice for small turns,
+  where it works. Called from the peek (`check["est"]`), `_answer_gate` and the committed-stream
+  gate (`req_est`). The ordinary junk strike (`_record_outcome(..., junk=True)`) is filed as for
+  any junk hop.
+- **The relay server also gets an input ceiling, at any size** (`_trunc_note_claim`, called by
+  `_note_lost_request`; next section).
+
+Limits, said plainly:
+
+- Only openers in `_EMPTYCLAIM_OPENERS` plus a confirmed "your message ..." subject are held for
+  while streaming. A claim worded some other way ("There is no actual request here. I only see a
+  system prompt.") is not held by the peek; the committed-stream gate then cuts it to nothing (an
+  empty 200) rather than walking to the next hop. Extend the openers if the log shows one.
+- The long-context ledger above only acts at >= 60K; below that the relay-server ceiling (next
+  section) is what protects the next turn.
+- The rule cannot tell which model is wrong, only that a non-empty turn was called empty. A tool
+  definition pasted WITHOUT any of the excluded words would be rejected on a tool turn or relay
+  hop (the hop fails over; nothing is lost).
+- Takes effect when the hub restarts on this code; sessions already holding the bogus turns need
+  nothing (the scrub covers them). It was NOT live when this was first reported: the hub had been up
+  since before the edits and nothing was committed, so the owner saw the old behaviour again.
+
+## A relay that dropped the user's turn is kept away from big requests (2026-10-26)
+
+Covered by `tests/test_truncation_probe.py` (hermetic: a fake relay that keeps the first N characters;
+`_trunc_start` is captured so no thread runs). Flag `truncation_probe` (`config.get_flag`, default
+ON); off = no entry, no probe, `_model_ctx_info` unchanged. New app.py names are `_trunc_*` (section
+"A RELAY THAT DROPPED THE USER'S TURN IS KEPT AWAY FROM BIG REQUESTS", after `_probe_pair`).
+
+- **Why a per-reply check is not enough.** The gateway behind g4f/pa:fec3c477 drops the END of a
+  request on and off (see the measurements above), so the model answers blind. Most blind answers
+  are plausible prose or tool calls that no check can tell from a real one (the pair sat at 20 ok /
+  1 failed in perf-stats); only the ones that SAY the message was empty are caught
+  (`empty_message_claim`). Without more, the next "continue" picks the same pair again.
+- **What a caught claim now does to the relay SERVER** (`_relay_server_id`: every model behind
+  `pa:fec3c477` shares one gateway; direct providers are never involved): (1) at once, a PROVISIONAL
+  input ceiling of half the size that failed (`_TRUNC_PROVISIONAL_TTL`, 30 min), so the next turn is
+  already protected; (2) in the background, a probe (`_trunc_probe`, one at a time, at most one per
+  server per `_TRUNC_RETRY` = 20 min) sends rungs top, top/3, top/9 ... (top = min(the failed size,
+  `_TRUNC_TOP` 16K), floor `_TRUNC_FLOOR` 500) of a request carrying one tool, with a code at the very
+  start of the system message and one just before the question at the end, until one comes back with
+  both codes (compared by DIGITS: a model that saw everything answered "HEAD=95031" for "H95031"),
+  then one refinement between that pass and the cut above it. The result is the ceiling for
+  `_TRUNC_TTL` (3 h). A top rung that comes back whole proves nothing about a flaky gateway, so it
+  files nothing and the provisional ceiling just runs out; a model that ignores the format, an HTTP
+  error or an empty reply file nothing either. Cost: a gateway that is cutting costs a few small
+  calls (the cut ones are processed small); one that is whole costs a single <= 16K-token call, only
+  after it has already failed a turn.
+- **How the ceiling is used.** `_model_ctx_info` returns it as the pair's "learned" window (never
+  raising a smaller known one), so everything that already honours a learned window honours it: the
+  router's pin drop and fresh pick (`_roomy`), `_ChainClock._roomy_first`, the roles walk and
+  `_quality_fallback_pick` (`_window_fits`), the front door, `_ctx_hop_cannot_serve` and compaction.
+  A request bigger than the ceiling no longer goes to that gateway; a small one still does. The
+  ceiling is applied to every request, tool-carrying or not (the window function has no request
+  context), so a big tool-FREE request skips that gateway too while the entry lives.
+- **Persisted** in learned-state.json (`trunc` section, `["trunc", "pid|server", {ceiling, at, src}]`,
+  expired rows dropped on save and restore, a live entry never overwritten), so an auto-update or reboot
+  does not make the hub learn it again by failing. `tests/test_learned_state_survives_restart.py` pins
+  the section list and was updated for `trunc`.
+- **What was tried and removed.** The first version also probed the FIRST big tool request to every
+  unmeasured relay server, from `_dispatch_chat`, and trusted a passing top rung for 24 h. Testing it
+  against the live relay showed a pass at 24K minutes after cuts at 1.5K-8K, so "clean" meant nothing;
+  and the probing (many 24K-token calls tonight) got g4f to throttle the hub for ~25 minutes. Both
+  went. A guard test fails if the hook comes back (`_trunc_maybe_probe` must not exist).
+- **Limits, plainly.** (a) Nothing is measured ahead of a failure, so the first lost turn per gateway
+  per 3 h still costs one failed hop (the hop fails over; the user sees only latency). (b) A gateway
+  that drops the end WITHOUT producing a "no request" answer is not caught at all. (c) The provisional
+  figure (half the failed size) is a guess: a 25K request can still go to a gateway that failed at 43K
+  until the probe or the next claim narrows it. (d) The probe needs the relay to follow a two-line
+  format; a model that does not gets no ceiling (`unusable`). (e) The ceiling is per relay SERVER and
+  the real behaviour varies by model, time and perhaps tools, so it is a guard rail against repeats,
+  not a model of the gateway.
+- **Cost of testing it, said plainly.** Establishing the above took ~40 requests (several of 24K-36K
+  tokens) through the owner's g4f relay on 2026-10-26; g4f throttled the hub afterwards (`g4f`
+  `throttled_until` ~22:47), which is also why a last scan timed out. No further live probing was done.

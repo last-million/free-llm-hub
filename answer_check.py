@@ -1242,6 +1242,141 @@ def is_cannot_do_capability(text, prompt_text=None):
         return False
 
 
+# A model that never took the conversation in answers that the user's message holds no
+# request, only a tool/system setup. MEASURED 2026-10-26 (Build session d9af0686, codex
+# `coding-max`, ~43K-token turns): the user's message reached the hub intact every time, but
+# the g4f relay copy claude-haiku-5-5 answered three turns in a row "It looks like your
+# message contains only a tool specification and system configuration, with no actual
+# question or task attached." Reproduced through the hub: the same pair answers a 155-token
+# request correctly and a 36K-token one with this complaint -- the relay keeps the head of a
+# big request and loses its END, where the user's turn sits. Clean prose, no tool call, so it
+# was served as the final answer and codex recorded task_complete ("continue" just stopped).
+# idle_greeting cannot catch it: the offer to help comes ~80 chars in (its start limit is 40,
+# pinned by test_double_answer). This is the separate rule. It needs BOTH halves, so a real
+# answer that only mentions "your message" or "the tool setup" is never cut:
+#   (a) the reply's OPENING says the user's message/input/prompt is (only) tool / system /
+#       configuration material, and
+#   (b) the reply says there is no request / question / task / nothing to act on.
+# No word-count gate on the user's turn (unlike idle_greeting): the reported failure was
+# "continue", and the claim is false for ANY non-empty turn. It is skipped when the user's
+# turn is empty after CLI wrapper blocks are removed (the model is then right), and when the
+# user's own text is about a tool definition / system prompt / schema (it may really be one).
+_EMPTYCLAIM_MAX_CHARS = 1200
+_EMPTYCLAIM_HEAD_CHARS = 480
+_EMPTYCLAIM_MAX_START = 80
+_EMPTYCLAIM_SUBJECT_RE = re.compile(
+    r"\b(?:your|the|this)\s+(?:message|input|prompt|request|text|content)\s+"
+    r"(?:(?:only|just|merely)\s+)?"
+    r"(?:contains?|consists?\s+of|includes?|is|has|appears?\s+to\s+(?:be|contain|have)"
+    r"|seems?\s+to\s+(?:be|contain|have)|looks?\s+like)\b"
+    r"[^.!?\n]{0,90}?\b(?:tools?|system|set-?up|configuration|config|definitions?"
+    r"|specifications?|instructions|schema|boilerplate)\b", re.I)
+_EMPTYCLAIM_NOREQ_RE = re.compile(
+    r"\b(?:no|without|lacks?|missing"
+    r"|not\s+(?:include|contain|have)"
+    r"|(?:doesn'?t|does\s+not|don'?t|do\s+not)\s+(?:include|contain|have|carry))\s+"
+    r"(?:an?\s+|any\s+|the\s+)?"
+    r"(?:(?:actual|specific|real|clear|concrete|explicit|particular)\s+)?"
+    r"(?:(?:user\s+)?(?:request|question|task|instruction|ask)|prompt)\b"
+    r"|\bnothing\s+(?:for\s+me\s+)?to\s+(?:act\s+on|do|run|work\s+on|respond\s+to|answer)\b",
+    re.I)
+# Narrow on purpose: the Build page appends a long "Standing instruction ..." that says
+# "native planning/task tool" and "tool access" -- a bare "tool" would switch the rule off
+# for every Build message.
+_EMPTYCLAIM_PROMPT_RE = re.compile(
+    r"\btool\s*(?:definitions?|configs?|configuration|setup|specs?|specification|schema|"
+    r"list|block)\b|\bfunction\s+(?:schema|definitions?)\b|\bsystem\s+prompt\b|"
+    r"\bjson\s+schema\b|\bmcp\s+(?:config|server)\b|[\"']tools[\"']\s*:", re.I)
+
+
+def _empty_claim_opening(masked, prompt_text):
+    """The reply's head when it OPENS by calling the user's message tool/system material
+    and the user's turn is a real one, else None. The first half of the rule only: a
+    stream still arriving is held on this alone, before the "no request" half is read."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head:
+        return None
+    pt = (_instruction(str(prompt_text or "")) or "").strip()
+    if not pt or _EMPTYCLAIM_PROMPT_RE.search(pt):
+        return None
+    m = _EMPTYCLAIM_SUBJECT_RE.search(head[:_EMPTYCLAIM_HEAD_CHARS])
+    if not m or m.start() > _EMPTYCLAIM_MAX_START:
+        return None
+    return head
+
+
+def _empty_message_claim(masked, prompt_text):
+    """0 when a short reply OPENS by claiming the user's message is only a tool / system
+    setup with no request, although the user's turn is a real one, else None. The caller
+    gates it to relay hops and tool turns, like the idle greeting."""
+    head = _empty_claim_opening(masked, prompt_text)
+    if head is None or len(head) > _EMPTYCLAIM_MAX_CHARS:
+        return None
+    if not _EMPTYCLAIM_NOREQ_RE.search(head[:_EMPTYCLAIM_HEAD_CHARS]):
+        return None
+    return 0
+
+
+# How a reply that turns into the claim BEGINS (lowercase, whitespace-collapsed). Only used
+# to decide whether a partial stream is worth waiting for; the judgement is always the two
+# halves above. "it looks like the bug is in parser.py" shares an opener and is released
+# once the text diverges or passes _EMPTYCLAIM_OPENER_CHARS.
+_EMPTYCLAIM_OPENERS = (
+    "it looks like", "it seems", "it appears", "looks like", "seems like", "i notice",
+    "i see", "i can see", "i can only see", "i only see", "i received", "i got",
+    "your message", "your input", "your prompt", "your request", "the message",
+    "this message", "hmm", "sorry", "apologies", "unfortunately", "i'm sorry",
+    "i am sorry")
+_EMPTYCLAIM_OPENER_CHARS = 200
+
+
+def _empty_claim_possible(masked, prompt_text):
+    """True while a PARTIAL reply may still turn out to be the empty-message claim: its
+    opening is confirmed (the "no request" half may still be coming), or what has arrived
+    could be the beginning of one. The stream peek reads on while this holds -- a model that
+    streams token by token reaches the peek's first verdict point ~11 characters in."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head or len(head) > _EMPTYCLAIM_HEAD_CHARS:
+        return False
+    pt = (_instruction(str(prompt_text or "")) or "").strip()
+    if not pt or _EMPTYCLAIM_PROMPT_RE.search(pt):
+        return False
+    m = _EMPTYCLAIM_SUBJECT_RE.search(head)
+    if m and m.start() <= _EMPTYCLAIM_MAX_START:
+        return True
+    if len(head) > _EMPTYCLAIM_OPENER_CHARS:
+        return False
+    low = " ".join(head.lower().split())
+    return any(o.startswith(low) or low.startswith(o) for o in _EMPTYCLAIM_OPENERS)
+
+
+def is_empty_claim_possible(text, prompt_text=None):
+    """Public form of `_empty_claim_possible` (see there). Never raises."""
+    try:
+        return isinstance(text, str) and _empty_claim_possible(_mask_code(text), prompt_text)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def is_empty_message_claim(text, prompt_text=None):
+    """Public form of the empty-message-claim check. Never raises."""
+    try:
+        return isinstance(text, str) and _empty_message_claim(
+            _mask_code(text), prompt_text) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def is_empty_claim_opening(text, prompt_text=None):
+    """True when `text` (a reply, or the start of a streamed one) opens with the
+    empty-message claim. Never raises."""
+    try:
+        return isinstance(text, str) and _empty_claim_opening(
+            _mask_code(text), prompt_text) is not None
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _meta_leak(masked, text, prompt_text, at_start=True):
     """Offset of leaked metadata/template junk in `text` (indices shared with
     `masked`), or None. `at_start`: `text` is the reply's head, so the
@@ -1493,6 +1628,11 @@ def reads_as_answer(text, *, last_prompt=None, relay=False):
             return False
         if is_idle_greeting(text, last_prompt):
             return False
+        # "Your message contains only a tool setup ...": the opening alone holds the
+        # stream. Its "no request" half comes after the 80 chars that would otherwise
+        # release it, and inspect() judges the held text once it is whole.
+        if is_empty_claim_opening(text, last_prompt):
+            return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
             return False
@@ -1576,6 +1716,12 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             # can. Same gate as the idle greeting (relay hops / tool turns).
             ("cannot_do", lambda: (None if offset or not (relay or tools_offered)
                                    else _cannot_do_capability(masked, last_prompt))),
+            # A reply that OPENS by claiming the user's message is only a tool / system
+            # setup with no request, to a real non-empty turn: the hop lost the end of
+            # the request (a relay that truncates a big one). A failed hop, never the
+            # reply that ends the turn. Same gate as the two above.
+            ("empty_message_claim", lambda: (None if offset or not (relay or tools_offered)
+                                             else _empty_message_claim(masked, last_prompt))),
         )
         for reason, fn in checks:
             cut = fn()
