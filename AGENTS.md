@@ -7526,3 +7526,142 @@ New names: `app._agent_pin_key`, `ctxwin.pin_key`, `ctxwin.SHARED_ID_HEADERS`, `
     CLAUDE.md. Requests with their own unshared id pay nothing; Claude Code and no-id CLIs pay one extra
     hash per `_ctx_begin` (called up to twice per request).
   - Two sessions with the same prompt and NO id of any kind still share a key: there is nothing to tell them apart.
+
+## Rate-aware provider spreading (2026-10-27)
+
+Covered by `tests/test_rate_headroom_spread.py` (hermetic: fake clock, fake fleet,
+fake `requests.post`; no network, no live hub). Pure half: `ratehead.py` (stdlib,
+never raises). Glue: app.py section "RATE-AWARE SPREADING" (names `_rh_*`,
+`_RATE_WATCH`), between `_provider_load` and `_fair_spread_band`. Flag
+`rate_headroom_spread` (`config.get_flag`, default ON); OFF = every decision is
+byte-identical (the counter still runs and `/api/provider-load` still shows it).
+No new route (README route count unchanged).
+
+**Why.** Owner: "don't always use the same provider; if there are many requests for
+the same provider, don't block requests per second and per minute." Parallel
+agents pile onto one low-limit provider (llm7 20/min, g4f 5/min, a "1 req/s" host)
+and its 429s block everyone while equally good providers idle. This is the
+owner's report plus a reading of the code, NOT a live measurement: no sweep was run.
+
+**Premise check (done first): the gap is real, not already covered.** The fairness
+layer (`_fair_spread_band`, `_provider_load`) knows in-flight count (CONCURRENCY:
+a 200 ms provider never reaches the soft cap of 3 yet can be sent 5 requests a
+second), recent hop failures (arrive AFTER the 429) and the 15-min routing share
+(needs 6 picks to mean anything, a coarse proxy). `quota.py` counts a request only
+once its response HEADERS arrive, in calendar buckets (N hops started together all
+read "0 used") and hard-gates only at 100%. Nothing compared requests STARTED in the
+last 1 s / 60 s with a limit. The new signal is start RATE against a LIMIT; the
+in-flight logic is untouched and not duplicated.
+
+**The counter** (`ratehead.RateWatch`): per-provider timestamps of requests started
+(model kept for per-model limits), pruned to 60 s, bounded (4096 events x 256
+providers; overflow drops the OLDEST = undercounts = fail-open), one lock, injectable
+clock. `headroom` = fraction of the TIGHTEST known limit still free, None when no
+limit is known (then nothing changes); `is_pressed` = headroom <= 20% (a provider at
+>= 80% of a limit yields); `narrow` / `walk_index` are the two reorder-only decisions.
+
+**Limit source: POOLED, not per key** (`_rh_limits(pid)` -> `{per_min, per_sec,
+per_model, src}` or None). The counter sums starts over every key and model of a
+provider, so the limit it is compared with must be the pool's, the same figure
+`quota.status()` uses. `quota.FREE_LIMITS` states a limit per key; `quota._limit_for`
+scales it by `key_count` and `_rh_limits` uses that, so 4 keys x 5/min = 20/min (8
+starts read 40%, not 160%). Sources:
+1. the owner's declaration, config.json setting `provider_rate_limits`
+   `{pid: {per_min, per_sec, per_model}}` (already the pooled total; no UI) -- wins
+   outright;
+2. the provider's own headers, ONLY for a bucket that resets within a minute and not
+   under 2 s (`quota.rate_reading`: a day-sized `limit` is NOT a per-minute one --
+   `status()` keeps the static window label whatever the header said), scaled from
+   the keys HEARD to the whole pool (`_dynamic` now also returns `keys_heard`);
+3. a FREE_LIMITS row stated per MINUTE (g4f 5, llm7 20, navy 20, nararouter 10,
+   inception 1000). Hour/day/month budgets are not pacing limits; quota.py gates
+   them at 100%, so `_rs_per_day_requests`-style conversion is deliberately NOT used;
+4. `_RH_HINTS`: the request rates the providers' own notes state (glm and hyperbolic
+   ~1 req/s, sambanova 20 RPM, deepinfra 10, sealion 10, routeway 5), scaled by the
+   pool like source 3.
+The per-minute figure is the TIGHTEST of 2-4 that exist: `observe_headers` takes
+`retry-after` as a reset and can store a token-sized `limit` in the request slot, and
+such a reading must never loosen a researched figure just as the provider gets hot
+(a provider that really tightened is still followed).
+Unknown = headroom None = no effect (never read as full or empty). groq/cerebras
+headers are per MODEL (`PER_MODEL_HEADER_PROVIDERS`), so they are never learned from
+headers; only the owner's declaration (with `per_model: true`, which then counts only
+that model's starts) names them.
+
+**Count site: `_upstream_chat`, at the real `requests.post`** (`_rh_counted_post`),
+used for the first post of every key attempt AND each transparent retry
+(stream_options / reasoning_effort / refused-optional-param / system-first / context
+re-fit). So a real request counts exactly once; key rotation counts each attempt; a
+hedge leg or a `_stream_starve_retry` goes `_dispatch_chat` -> `_upstream_chat` and
+counts once; a hop that raises BEFORE sending (context overflow, a tool schema that
+cannot fit, no key) counts nothing; chain building, routing picks, the walk and
+hedge-partner planning never reach it. `_dispatch_chat` was rejected as the site: it
+sits above those pre-send exits (over-count) and above the retries (under-count).
+Counted too: the provider Test and the canary (direct `_upstream_chat` callers; they
+spend the same rate limit). Not counted: the Puter driver branch, sub-* CLI hops
+and the other `requests.post` callers (images, embeddings) -- undercounts only, so
+fail-open.
+
+**Use (reorder/narrow only, fail-open everywhere).**
+- `_fair_spread_band` step (0), before the small-request FAST rule: a pressed
+  provider's entries leave the band (already within `_AUTO_TOP_BAND` = "equally
+  good") when at least one other entry stays. Rides on `provider_fairness`.
+- `_pick_same_model_host` (a pinned session choosing among hosts of the SAME model):
+  pressed hosts drop out when another stays. No quality question.
+- `_ChainClock.walk` (so the chat, responses, messages loops AND the roles actor
+  walk): when the hop about to be popped is pressed, the first LATER hop that has
+  room, is not demoted/throttled/exhausted, has the same health signature (recent
+  failure, junk bench, low-quality family, below declared window, reliability band
+  2, fast/slow tier -- a trivial turn never gets a slow thinker promoted over the
+  fast tier; on tool turns also tool-sick, tool-slow, lead group, vision-specialised) and
+  scores within `_AUTO_TOP_BAND` on the key the chain was ordered by
+  (`_agentic_score` on a tool turn, `_learned_score` otherwise) goes first. The
+  pressed hop keeps its place, so nothing is dropped or added. The first hop of an
+  explicit `provider/model` request (`clock.pinned`) and of an orchestrator-led
+  chain never moves; later hops of those walks still spread.
+- An idle hub (no start in the last minute) skips all of it: the band, host and walk
+  helpers call `_RATE_WATCH.busy()` first, before any flag or limit lookup (the one
+  exception is the once-per-walk flag read in the `_ChainClock` constructor, like
+  its two sibling flags).
+
+**Visible.** `GET /api/provider-load` rows gain `starts_1s`, `starts_60s`,
+`rate_limit_per_min`, `rate_limit_per_sec`, `rate_limit_src`, `headroom` (None =
+unknown) and `pressed`; the response gains `rate_headroom_on` and `rate_yield_at`.
+One throttled (5 s per key) log line when a provider yields: `[rate] g4f (4/5 per
+min) at its request-rate limit; picking among nvidia instead` / `[rate] walk: ...`.
+`tests/conftest.py` clears `_RATE_WATCH` with the other ledgers.
+
+**Proof.** A simulated burst (ten picks, each dispatched): flag on, g4f 4 / nvidia 6
+and g4f is welcome again a minute later; flag off, g4f 10 / nvidia 0. The pure-module
+tests, a negative control that an unbounded band WOULD cross the quality band, and
+the existing fairness / walk / stall / share / relay-units / lead / wasted-hop files
+stay green (the nine files: 247 passed, 70 of them the new file); a 77-file subset of
+tests touching `_upstream_chat`, `_ChainClock`, quota headers and the fairness picks
+(plus the README route-count and migration files): 1922 passed, 1 skipped. The full
+suite was not run.
+
+**Limits, said plainly.**
+- No live measurement: the effect on real 429 counts is unverified. The 80% yield
+  point, the 2 s header floor and the 60 s rolling window (providers use calendar or
+  sliding windows) are judgement calls, not fitted numbers.
+- In-memory, per process: a restart forgets the last minute (fail-open).
+- Starts are counted when the request is SENT, never at pick time, so N picks made
+  truly simultaneously (before any of them is sent) still see the same headroom; the
+  spreading acts on the picks that follow. The burst proof above dispatches each
+  pick before the next, so it shows the steady-state effect, not a same-instant
+  burst. Closing that gap would need a pick-time reservation, which this does not do.
+- The pooled figure assumes each key is its own allowance (the same assumption
+  `quota._limit_for` documents). Keys sharing one allowance, or a per-IP limit, make
+  the figure too high: the hub yields later than ideal, exactly today's behaviour.
+- The hedge partner pick and the stall-backup actor are not rate-aware: an extra
+  request can still go to a pressed provider.
+- A conversation pinned to a model steps aside for a turn when its provider is
+  pressed and an equally good, equally healthy hop exists (the pin is not rewritten,
+  so it returns next turn). That is a model switch inside the 2.0 band, as any
+  fallback is; only an explicit `provider/model` and the orchestrator are immovable.
+- Hour/day/month budgets are not paced (quota.py gates them at 100%); groq/cerebras
+  are unprotected unless the owner declares a limit.
+- Header-learning treats a reset in (2 s, 60 s] as a per-minute window; an end-of-day
+  daily bucket landing in its last minute would be misread as a per-minute limit
+  (it can only TIGHTEN the figure, never loosen it, see the tightest-wins rule). The
+  real header shapes of each provider were not re-read here.

@@ -95,6 +95,7 @@ import skills
 import ecc
 import perfstats
 import learnstate
+import ratehead
 import providers as prov
 import quota
 import workspace
@@ -9141,6 +9142,12 @@ def _pick_same_model_host(pool, pinned):
         return None
     if len(hosts) == 1:
         return hosts[0]
+    # A host at its per-second / per-minute REQUEST-RATE limit yields to one of
+    # the SAME weights with room (see RATE-AWARE SPREADING): every host here
+    # serves this exact model, so there is no quality question at all.
+    hosts = _rh_narrow_hosts(hosts)
+    if len(hosts) == 1:
+        return hosts[0]
     best = max(_quota_headroom(p) for p, _m in hosts)
     tied = [h for h in hosts if _quota_headroom(h[0]) >= best - _SAME_HOST_EPS]
     # Headroom alone treats every host of a model as interchangeable, and
@@ -9880,6 +9887,318 @@ def _provider_load(pid):
         return 0.0
 
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# RATE-AWARE SPREADING (2026-10-27). Owner: "don't always use the same provider;
+# if there are many requests for the same provider, don't block requests per
+# second and per minute." Parallel agents pile onto one low-limit provider (llm7
+# 20/min, g4f 5/min, a "1 req/s" host) and its 429s then block everyone while
+# equally good providers idle.
+#
+# What the fairness layer above could NOT see (read from the code, not a sweep):
+#   * in-flight count is CONCURRENCY -- a 200 ms provider never reaches the soft
+#     cap of 3 yet can be sent 5 requests a second;
+#   * recent failures arrive AFTER the 429, and the 15-min share is a coarse
+#     proxy that needs 6 picks before it means anything;
+#   * quota.py counts a request only once its response HEADERS arrive, in calendar
+#     buckets, so N hops started together all read "0 used", and it hard-gates
+#     only at 100%.
+# This adds the missing signal: requests STARTED in the last 1 s / 60 s
+# (ratehead.RateWatch, fed at the one place a request is really sent -- see
+# _rh_counted_post) against the provider's known REQUEST-RATE limit. A provider at
+# >= 80% of it yields to an equally good one with room, in three places only: the
+# fresh pick (_fair_spread_band), a pinned session's choice among hosts of the
+# SAME model (_pick_same_model_host) and the fallback walk (_ChainClock.walk).
+#
+# Rules it keeps: never crosses the quality band (the callers hand it a band of
+# equally good models, or the walk checks _AUTO_TOP_BAND against the ordering
+# key), only REORDERS/NARROWS (nothing is dropped or added), fails open at every
+# step (everyone pressed, an unknown limit, any error = the input unchanged), an
+# explicit provider/model and the orchestrator's pick are never moved, and an
+# idle hub (nothing started in the last minute) behaves exactly as before.
+# Flag rate_headroom_spread (default ON, rides on provider_fairness for the pick
+# and the pinned-host choice); off = byte-identical. Visible at GET
+# /api/provider-load.
+_RATE_WATCH = ratehead.RateWatch()
+
+# A header bucket that resets in under this many seconds could be a per-SECOND
+# window, whose limit is not a per-minute one: it is not learned as one.
+_RH_HEADER_MIN_RESET = 2.0
+
+# Request rates the provider's own notes (providers.py) state and quota.FREE_LIMITS
+# cannot hold (it keeps ONE window per provider, and these budgets are per DAY or
+# unlisted). Each figure is per key/account, scaled by the pool size below like
+# quota._limit_for does. A provider with no documented request rate is absent:
+# an unknown limit must never be read as "full".
+_RH_HINTS = {
+    "glm":        {"per_sec": 1},    # "~1 req/s, 1 concurrent"
+    "hyperbolic": {"per_sec": 1},    # "Free Community models limited to ~1 req/s"
+    "sambanova":  {"per_min": 20},   # official Free Tier table: 20 RPM (and 20 RPD)
+    "deepinfra":  {"per_min": 10},   # "~10 req/min on the free OS models"
+    "sealion":    {"per_min": 10},   # "Free key via Google sign-in (no card), 10 RPM"
+    "routeway":   {"per_min": 5},    # "~5 RPM, ~200 req/day on ':free' ids"
+}
+
+
+def _rh_on():
+    try:
+        return bool(config.get_flag("rate_headroom_spread", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rh_pos(v):
+    return v if (isinstance(v, int) and not isinstance(v, bool) and v > 0) else None
+
+
+def _rh_declared(pid):
+    """The owner's own figure for `pid` (config.json setting provider_rate_limits:
+    {pid: {per_min, per_sec, per_model}}), already the POOLED total. A row with
+    no positive figure is ignored."""
+    try:
+        raw = config.get_setting("provider_rate_limits", None)
+    except Exception:                                            # noqa: BLE001
+        return None
+    row = raw.get(pid) if isinstance(raw, dict) else None
+    if not isinstance(row, dict):
+        return None
+    pm, ps = _rh_pos(row.get("per_min")), _rh_pos(row.get("per_sec"))
+    if not (pm or ps):
+        return None
+    return {"per_min": pm, "per_sec": ps, "per_model": bool(row.get("per_model")),
+            "src": "setting"}
+
+
+def _rh_limits(pid):
+    """`pid`'s known REQUEST-RATE limit as {"per_min", "per_sec", "per_model",
+    "src"}, or None when none is known (then nothing about the provider changes).
+
+    POOLED, like quota.status(): FREE_LIMITS states a limit per key, the pool's
+    key count scales it (quota._limit_for), and the counter it is compared with
+    (_RATE_WATCH) sums the starts over every key and model of the provider --
+    comparing that sum with ONE key's allowance would read a multi-key provider
+    as pressed when it is not. Sources:
+      1. the owner's declaration (setting provider_rate_limits) -- wins outright;
+      2. the provider's own headers, only for a bucket that resets within a
+         minute (a day-sized `limit` there is NOT a per-minute one: status()
+         keeps the static window label whatever the header said), scaled from
+         the keys heard to the whole pool;
+      3. a FREE_LIMITS row stated per MINUTE (hour/day/month budgets are not
+         pacing limits -- quota.py already gates them at 100%);
+      4. _RH_HINTS, from the providers' own notes.
+    The per-minute figure is the TIGHTEST of 2, 3 and 4 that exist: a header
+    can carry a retry-after reset next to a token- or day-sized limit, and such
+    a reading must never loosen a researched figure just as the provider gets
+    hot (a provider that really tightened is still followed). groq/cerebras
+    headers are per MODEL, so only 1 and 4 can name them. Never raises."""
+    try:
+        declared = _rh_declared(pid)
+        if declared:
+            return declared
+        n = max(1, int(quota.key_count(pid) or 1))
+        per_min = []                       # (figure, source) candidates, pooled
+        if pid not in quota.PER_MODEL_HEADER_PROVIDERS:
+            rr = quota.rate_reading(pid)
+            ri = (rr or {}).get("reset_in")
+            lim = _rh_pos((rr or {}).get("limit"))
+            if lim and ri is not None and _RH_HEADER_MIN_RESET < ri <= ratehead.WINDOW_SECONDS:
+                heard = max(1, int(rr.get("keys_heard") or 1))
+                per_min.append((int(round(float(lim) / heard * max(heard, n))), "headers"))
+        row = quota._limit_for(pid)
+        if row.get("window") == "minute" and _rh_pos(row.get("limit")):
+            per_min.append((row["limit"], "quota"))
+        hint = _RH_HINTS.get(pid) or {}
+        if hint.get("per_min"):
+            per_min.append((hint["per_min"] * n, "notes"))
+        out = {"per_min": None, "per_sec": None, "per_model": False, "src": None}
+        if per_min:
+            out["per_min"], out["src"] = min(per_min, key=lambda t: t[0])
+        if hint.get("per_sec"):
+            out["per_sec"] = hint["per_sec"] * n
+            out["src"] = out["src"] or "notes"
+        if out["per_min"] is None and out["per_sec"] is None:
+            return None
+        return out
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _rh_headroom(pid, model=None, lim=None):
+    """Fraction (0..1) of `pid`'s tightest known request-rate limit still free,
+    or None when no limit is known. A per-MODEL limit counts only `model`'s
+    starts (a sibling's do not press it); without a model, the busiest one."""
+    try:
+        lim = lim if lim is not None else _rh_limits(pid)
+        if not lim:
+            return None
+        if lim.get("per_model"):
+            if model:
+                counts = [_RATE_WATCH.counts(pid, model)]
+            else:
+                counts = list(_RATE_WATCH.per_model(pid).values()) or [(0, 0)]
+        else:
+            counts = [_RATE_WATCH.counts(pid)]
+        hs = [ratehead.headroom(n1, n60, lim.get("per_min"), lim.get("per_sec"))
+              for n1, n60 in counts]
+        hs = [h for h in hs if h is not None]
+        return min(hs) if hs else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _rh_pressed(pid, model=None, busy=None, memo=None):
+    """True when `pid` (for `model`, under a per-model limit) is at >= 80% of its
+    request-rate limit. `busy` (a _RATE_WATCH.busy() snapshot) lets a provider
+    with no start in the last minute skip the limit lookup; `memo` caches the
+    lookup across one decision. Never raises; unknown = not pressed."""
+    try:
+        if busy is not None and pid not in busy:
+            return False
+        if memo is not None:
+            if pid not in memo:
+                memo[pid] = _rh_limits(pid)
+            lim = memo[pid]
+        else:
+            lim = _rh_limits(pid)
+        return ratehead.is_pressed(_rh_headroom(pid, model, lim))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rh_describe(pid):
+    """'4/5 per min' -- the numbers behind a pressed provider, for the log."""
+    try:
+        lim = _rh_limits(pid) or {}
+        n1, n60 = _RATE_WATCH.counts(pid)
+        bits = []
+        if lim.get("per_min"):
+            bits.append("%d/%d per min" % (n60, lim["per_min"]))
+        if lim.get("per_sec"):
+            bits.append("%d/%d per s" % (n1, lim["per_sec"]))
+        return ", ".join(bits) or "unknown"
+    except Exception:                                            # noqa: BLE001
+        return "unknown"
+
+
+def _rh_narrow_band(band):
+    """`band` (equally good, within _AUTO_TOP_BAND) without the entries whose
+    provider is at its request-rate limit -- only when another entry stays."""
+    band = list(band or ())
+    try:
+        busy = _RATE_WATCH.busy()
+        if not busy or len(band) < 2 or not _rh_on():
+            return band                       # an idle hub: nothing to yield
+        memo = {}
+        kept, removed = ratehead.narrow(band, lambda c: _rh_pressed(c[1], c[2], busy, memo))
+        if removed:
+            gone = sorted({c[1] for c in removed})
+            if _RATE_WATCH.should_log("band:" + ",".join(gone)):
+                _log.info("[rate] %s at its request-rate limit; picking among %s instead",
+                          ", ".join("%s (%s)" % (p, _rh_describe(p)) for p in gone),
+                          ", ".join(sorted({c[1] for c in kept})))
+        return kept
+    except Exception:                                            # noqa: BLE001
+        return band
+
+
+def _rh_narrow_hosts(hosts):
+    """Hosts [(pid, model)] of ONE model, without those at their request-rate
+    limit (same weights, so no quality question) -- only when another stays."""
+    hosts = list(hosts or ())
+    try:
+        busy = _RATE_WATCH.busy()
+        if (not busy or len(hosts) < 2 or not _rh_on()
+                or not config.get_flag("provider_fairness", True)):
+            return hosts
+        memo = {}
+        kept, _removed = ratehead.narrow(hosts, lambda h: _rh_pressed(h[0], h[1], busy, memo))
+        return kept
+    except Exception:                                            # noqa: BLE001
+        return hosts
+
+
+def _rh_target_ok(pid, model):
+    """May a walk step move ONTO this pair: not throttled or out of budget right
+    now. Fail-closed (a doubt means no move)."""
+    try:
+        return (not quota.is_model_throttled(pid, model)
+                and not quota.status(pid).get("exhausted"))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rh_walk_pick(rest, i, tools=False, ok=None):
+    """Which index of the walk's remaining chain `rest` to pop next: `i` (what
+    the walk would pop), unless that hop's provider is at its request-rate limit
+    -- then the first LATER hop that has room, is as healthy (same group), is not
+    throttled or demoted (`ok`), and scores within _AUTO_TOP_BAND of it on the key
+    the chain was ordered by (_agentic_score on a tool turn, the learned score
+    otherwise). The pressed hop keeps its place in `rest`: reordered, never
+    dropped. Never raises; any doubt returns `i`."""
+    try:
+        if not 0 <= i < len(rest) - 1:
+            return i
+        busy = _RATE_WATCH.busy()
+        if not busy:
+            return i
+        memo = {}
+
+        def pressed(e):
+            return _rh_pressed(e[0], e[1], busy, memo)
+
+        if not pressed(rest[i]):
+            return i
+        lead = []
+
+        def lead_set():
+            if not lead:
+                trip = [(_benchmark_score(e[0], e[1]), e[0], e[1]) for e in rest]
+                lead.append({(c[1], c[2]) for c in _may_lead_pool(trip)})
+            return lead[0]
+
+        def sig(e):
+            pid, model = e[0], e[1]
+            # Same tier of the chain: the fast/slow split too (a trivial turn
+            # walks fast models first, and a slow thinker costs it a minute).
+            s = (bool(_recent_hop_failure(pid, model)), bool(_is_pair_benched(pid, model)),
+                 bool(_is_low_quality(model)), bool(_below_declared_window(pid, model)),
+                 _chain_reliability_band(pid, model) >= 2, bool(_is_fast(pid, model)))
+            if tools:
+                s += (bool(_tool_turn_sick(pid, model)), bool(_tool_turn_slow(pid, model)),
+                      bool(_is_vision_specialised(model)), (pid, model) in lead_set())
+            return s
+
+        def score(e):
+            trip = (_benchmark_score(e[0], e[1]), e[0], e[1])
+            return _agentic_score(trip) if tools else _learned_score(trip)
+
+        def acceptable(e):
+            return (ok is None or ok(e)) and _rh_target_ok(e[0], e[1])
+
+        k = ratehead.walk_index(rest, i, pressed, score, sig, _AUTO_TOP_BAND, acceptable)
+        if k != i and _RATE_WATCH.should_log("walk:" + str(rest[i][0])):
+            _log.info("[rate] walk: %s/%s is at %s; trying %s/%s first",
+                      rest[i][0], rest[i][1], _rh_describe(rest[i][0]),
+                      rest[k][0], rest[k][1])
+        return k
+    except Exception:                                            # noqa: BLE001
+        return i
+
+
+def _rh_counted_post(pid, model):
+    """`requests.post` that first counts one request STARTED for `pid`. The one
+    place a chat request is really sent: _upstream_chat uses it for the first
+    post of every key attempt AND for each transparent retry (stream_options,
+    reasoning_effort, refused optional params, system-first, the context re-fit),
+    so every real request counts exactly once and nothing is counted for a hop
+    that raises before it sends (context overflow, a tool schema that cannot fit,
+    no key). Chain building, routing picks and hedge-partner planning never reach
+    it. `requests.post` is looked up per call, so a test's fake is honoured."""
+    def _post(*args, **kwargs):
+        _RATE_WATCH.note_start(pid, model)
+        return requests.post(*args, **kwargs)
+    return _post
+
+
 def _fair_spread_band(band, est=0):
     """`band` (every member already within _AUTO_TOP_BAND of the best, i.e.
     'equally good') narrowed to the provider(s) carrying the LEAST current load.
@@ -9898,6 +10217,13 @@ def _fair_spread_band(band, est=0):
         if len({c[1] for c in band}) < 2:
             return band                     # one provider -> nothing to spread
         elig = band
+        # (0) REQUEST RATE: a provider at >= 80% of its known per-second /
+        #     per-minute request limit yields to an equally good one with room
+        #     (see RATE-AWARE SPREADING above). First, so the small-request FAST
+        #     rule below cannot narrow to a provider that is about to 429 and
+        #     leave nothing to yield to. An idle hub, an unknown limit or
+        #     everyone pressed leaves the band untouched.
+        elig = _rh_narrow_band(band)
         # (1) SMALL request -> let the FAST providers (groq/cerebras-class)
         #     compete inside the band. This is where groq SHOULD be used often.
         #     The band is already filtered to models whose window fits the
@@ -16852,6 +17178,9 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     start = _next_key_start(pid, n)
     last_exc = None
     refit_done = False        # one context re-fit per request, never a loop
+    # Every real request below goes out through this, which counts it as STARTED
+    # for the rate-aware spreader (see _rh_counted_post).
+    _rh_post = _rh_counted_post(pid, payload.get("model") if isinstance(payload, dict) else None)
     # The body goes up under the CONNECT timeout (see _send_timeout), and the
     # streaming header wait below also covers the upload: both grow with it.
     _nbytes = _body_bytes(payload)
@@ -16883,8 +17212,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # Only streaming: a non-streaming caller is waiting on a BODY, and a
             # one-shot generation legitimately takes minutes.
             resp = (_post_with_header_deadline(_hdr_wait,
-                                               requests.post, **_post_kw)
-                    if stream else requests.post(**_post_kw))
+                                               _rh_post, **_post_kw)
+                    if stream else _rh_post(**_post_kw))
             # A provider that rejects stream_options (the hub asks for usage on
             # every translated stream, see _STREAM_USAGE_OPTIONS) is retried
             # once without it and remembered, instead of losing the hop.
@@ -16897,8 +17226,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 payload.pop("stream_options", None)
                 _post_kw["json"] = payload
                 resp = (_post_with_header_deadline(_hdr_wait,
-                                                   requests.post, **_post_kw)
-                        if stream else requests.post(**_post_kw))
+                                                   _rh_post, **_post_kw)
+                        if stream else _rh_post(**_post_kw))
             # Same learn-and-drop for reasoning_effort: some provider/model
             # pairs reject it outright (groq's qwen3 takes only none/default,
             # plain chat models refuse the field). Retried once without it and
@@ -16915,8 +17244,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 payload.pop("reasoning_effort", None)
                 _post_kw["json"] = payload
                 resp = (_post_with_header_deadline(_hdr_wait,
-                                                   requests.post, **_post_kw)
-                        if stream else requests.post(**_post_kw))
+                                                   _rh_post, **_post_kw)
+                        if stream else _rh_post(**_post_kw))
             # ...and for any OTHER optional field a provider refuses BY NAME
             # (see _rejected_optional_params). MEASURED 2026-09-27: nvidia 400'd
             # every opencode/Codex-style request carrying `prompt_cache_key`.
@@ -16928,8 +17257,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     payload = {k: v for k, v in payload.items() if k not in _bad}
                     _post_kw["json"] = payload
                     resp = (_post_with_header_deadline(_hdr_wait,
-                                                       requests.post, **_post_kw)
-                            if stream else requests.post(**_post_kw))
+                                                       _rh_post, **_post_kw)
+                            if stream else _rh_post(**_post_kw))
             # ...and a template that wants ONE system message, first: merge them
             # and retry this hop at once (see _SYSTEM_ORDER_ERR_RE).
             if (resp.status_code in (400, 422) and isinstance(payload, dict)
@@ -16943,8 +17272,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     payload["messages"] = _merged
                     _post_kw["json"] = payload
                     resp = (_post_with_header_deadline(_hdr_wait,
-                                                       requests.post, **_post_kw)
-                            if stream else requests.post(**_post_kw))
+                                                       _rh_post, **_post_kw)
+                            if stream else _rh_post(**_post_kw))
         except requests.RequestException as exc:
             last_exc = exc
             if is_last:
@@ -17018,7 +17347,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     pass
                 resp.close()
                 try:
-                    resp = requests.post(
+                    resp = _rh_post(
                         url, json=refit,
                         headers=dict(({"Content-Type": "application/json"} if key is None else
                                       {"Authorization": "Bearer " + key,
@@ -21790,9 +22119,11 @@ def api_tracking():
 def api_provider_load():
     """LIVE per-provider load the fairness tie-break reads (see
     _fair_spread_band): upstream requests in flight right now, routing picks
-    over the last 15 min / 24 h and the 15-min share, and recent (last 2 min)
-    hop failures. Read-only; control-token gated by the global before_request
-    like every /api/* route; makes NO upstream calls."""
+    over the last 15 min / 24 h and the 15-min share, recent (last 2 min) hop
+    failures, and the REQUESTS STARTED in the last second / minute against the
+    provider's known request-rate limit (the rate-aware spreader's input).
+    Read-only; control-token gated by the global before_request like every
+    /api/* route; makes NO upstream calls."""
     inflight = _inflight_snapshot()
     c15 = _route_counts(900.0)
     c24 = _route_counts(86400.0)
@@ -21801,9 +22132,13 @@ def api_provider_load():
         keyed = set(_enabled_keyed())
     except Exception:                                            # noqa: BLE001
         keyed = set()
-    provs = sorted(set(inflight) | set(c15) | set(c24) | keyed)
+    busy = _RATE_WATCH.busy()
+    provs = sorted(set(inflight) | set(c15) | set(c24) | keyed | set(busy))
     rows = []
     for pid in provs:
+        n1, n60 = busy.get(pid, (0, 0))
+        rl = _rh_limits(pid) or {}
+        h = _rh_headroom(pid, lim=rl or None)
         rows.append({
             "provider": pid,
             "inflight": inflight.get(pid, 0),
@@ -21812,6 +22147,16 @@ def api_provider_load():
             "share_15m": round(c15.get(pid, 0) / tot15, 4) if tot15 else 0.0,
             "recent_failures": _provider_recent_fails(pid, 120.0),
             "load": round(_provider_load(pid), 3),
+            # REQUESTS STARTED in the last second / minute against the known
+            # request-rate limit (see RATE-AWARE SPREADING). headroom is the
+            # fraction of the tightest limit still free (None = no limit known).
+            "starts_1s": n1,
+            "starts_60s": n60,
+            "rate_limit_per_min": rl.get("per_min"),
+            "rate_limit_per_sec": rl.get("per_sec"),
+            "rate_limit_src": rl.get("src"),
+            "headroom": None if h is None else round(h, 3),
+            "pressed": ratehead.is_pressed(h),
         })
     rows.sort(key=lambda r: (-r["inflight"], -r["routed_15m"], r["provider"]))
     return jsonify({
@@ -21821,6 +22166,8 @@ def api_provider_load():
         "routed_24h": sum(c24.values()),
         "soft_cap": _provider_soft_cap(),
         "fairness_on": config.get_flag("provider_fairness", True),
+        "rate_headroom_on": _rh_on(),
+        "rate_yield_at": ratehead.YIELD_AT,
         "window_seconds": {"share": 900, "recent_failures": 120},
     })
 
@@ -37029,6 +37376,11 @@ class _ChainClock:
         # 199-238 s of the 240 s clock while inception/mercury-3 (answering)
         # waited behind it. Flag off = the old tool-only cap.
         self._share_any = bool(config.get_flag("provider_share_any_turn", True))
+        # A hop whose provider is at its per-second / per-minute request limit
+        # steps behind an equally good one with room (see RATE-AWARE SPREADING).
+        # Read once per walk, like the two flags above. Flag off = the walk as
+        # built.
+        self._rate_spread = _rh_on()
         # TOOL turns (see _TOOL_PER_PROVIDER_HOPS): per-provider hops and
         # seconds spent in THIS walk, relay hops and failed relay servers.
         self._prov_hops = {}
@@ -37124,6 +37476,16 @@ class _ChainClock:
                     if i is None:
                         i = next((k for k, e in enumerate(rest)
                                   if not _is_pair_benched(e[0], e[1])), 0)
+                if self._rate_spread and len(rest) > 1 and not (
+                        first and (self.pinned
+                                   or _is_orchestrator_lead(rest[0][0], rest[0][1]))):
+                    # The hop is at its provider's per-second / per-minute request
+                    # limit: an equally good, equally healthy hop with room goes
+                    # first. Only REORDERS (the pressed hop keeps its place in
+                    # `rest`); the user-named head and the orchestrator's pick
+                    # (the first hop) never move; an idle hub is a no-op.
+                    i = _rh_walk_pick(rest, i, tools=self.tools,
+                                      ok=lambda e: not self._demoted(e[0]))
                 first = False
                 yield rest.pop(i)
             self._close_hop()
@@ -37225,6 +37587,8 @@ class _ChainClock:
         if getattr(self, "_demote_stalled_any", None) is None:
             self._demote_stalled_any = bool(
                 config.get_flag("walk_demote_stalled_any", True))
+        if getattr(self, "_rate_spread", None) is None:
+            self._rate_spread = _rh_on()
         if self._prov_hops is None:
             self._prov_hops = {}
         if self._prov_secs is None:

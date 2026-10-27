@@ -943,7 +943,41 @@ def _dynamic(pid: str, now: float):
             "limit": sum(limits) if len(limits) == len(per) else None,
             # the SOONEST key back is when the provider is usable again
             "reset_at": min(resets) if resets else None,
-            "seen": max(d.get("seen", 0) for d in per)}
+            "seen": max(d.get("seen", 0) for d in per),
+            # How many keys that sum covers (rate_reading scales it to the pool).
+            "keys_heard": len(per)}
+
+
+def rate_reading(pid: str):
+    """The freshest REQUEST-bucket reading the provider's own rate-limit headers
+    gave (summed across its keys, the same figure status() trusts), as
+    {"limit", "remaining", "reset_in", "seen", "keys_heard"} -- or None when
+    none is fresh, or for the providers whose headers are per MODEL (groq,
+    cerebras: their readings live in _MODEL_DYNAMIC, never in _DYNAMIC).
+
+    `limit` covers only the `keys_heard` keys that have answered so far, not the
+    whole pool; the caller scales it.
+
+    Read-only, for the rate-aware spreader (app._rh_limits): it needs the
+    bucket's LIMIT together with how soon it resets, which status() does not
+    expose (status() keeps the static window label whatever the header said, so
+    a day-sized header limit would read as a per-minute one). `reset_in` is None
+    when the provider named no reset. Never raises."""
+    try:
+        now = time.time()
+        with _LOCK:
+            d = _dynamic(pid, now)
+        if not d:
+            return None
+        lim = d.get("limit")
+        ra = d.get("reset_at")
+        return {"limit": lim if isinstance(lim, int) and not isinstance(lim, bool) else None,
+                "remaining": d.get("remaining"),
+                "reset_in": (float(ra) - now) if ra else None,
+                "seen": d.get("seen"),
+                "keys_heard": max(1, int(d.get("keys_heard") or 1))}
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def mark_model_throttled(pid: str, model: str, seconds: float = 60,
