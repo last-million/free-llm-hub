@@ -589,7 +589,9 @@ def test_the_static_minute_row_is_the_limit_scaled_by_keys(real_limits):
 
 
 def test_a_day_window_row_is_not_a_per_minute_limit(real_limits):
-    assert app._rh_limits("openrouter") is None        # 50 per DAY
+    # openrouter: 50 per DAY in quota.FREE_LIMITS, which must NOT be read as 50/min; its docs
+    # (2026-10-27) state 20 requests/min for ':free' ids, and that is what pacing uses.
+    assert app._rh_limits("openrouter")["per_min"] == 20
     assert app._rh_limits("groq") is None              # no figure in the repo
     assert app._rh_limits("nvidia") is None            # unknown budget
     assert app._rh_limits("huggingface") is None       # limit 0 (no free tier)
@@ -646,9 +648,8 @@ def test_the_tightest_figure_wins_over_a_note_hint_too(real_limits):
 
 
 def test_explicit_per_second_hints_come_from_the_provider_notes(real_limits):
-    # providers.py notes: glm "~1 req/s", hyperbolic "~1 req/s"
+    # providers.py notes: glm "~1 req/s"
     assert app._rh_limits("glm")["per_sec"] == 1
-    assert app._rh_limits("hyperbolic")["per_sec"] == 1
     assert app._rh_limits("sambanova")["per_min"] == 20
 
 
@@ -712,7 +713,8 @@ def test_per_model_header_providers_are_never_learned_from_headers(real_limits):
     real_limits.setitem(quota._DYNAMIC, "groq",
                         {"remaining": 3, "limit": 6, "reset_at": now + 30, "seen": now})
     assert app._rh_limits("groq") is None
-    assert app._rh_limits("cerebras") is None
+    # cerebras: the header (limit 6) is NOT read; only its documented 5 RPM (notes) is known
+    assert app._rh_limits("cerebras")["per_min"] == 5 and app._rh_limits("cerebras")["src"] == "notes"
 
 
 def test_a_header_bucket_that_may_be_per_second_is_not_a_minute_limit(real_limits):

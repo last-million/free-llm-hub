@@ -1,6 +1,6 @@
 # Calvoun Free LLM Hub — one local endpoint for every free LLM provider
 
-**A self-hosted LLM gateway that turns 61 providers' free tiers into a single
+**A self-hosted LLM gateway that turns 57 providers' free tiers into a single
 endpoint speaking OpenAI, Anthropic, Ollama and Gemini — and wires Claude Code,
 Codex, opencode, aider and 9 more CLIs onto them in one click.**
 
@@ -22,7 +22,7 @@ http://127.0.0.1:8787
 - **One endpoint, four wire protocols.** OpenAI Chat Completions, Anthropic
   Messages, the Ollama API and Google's Gemini `v1beta` surface, all on the same
   port — plus an MCP server. A tool that speaks any of them just works.
-- **Free tiers, pooled and rotated.** 61 providers in the registry; 8 are marked
+- **Free tiers, pooled and rotated.** 57 providers in the registry; 8 are marked
   paid so orchestrated routing can never pick them. Several need no signup at
   all. A provider whose allowance is spent goes on cooldown rather than being
   retried into the same refusal.
@@ -271,7 +271,7 @@ your CLI ──► 127.0.0.1:8787 ──► classify difficulty ──► pick a
 
 ## Free providers, honestly
 
-The dashboard lists all 61 with signup links. A few need no account at all
+The dashboard lists all 57 with signup links. A few need no account at all
 (pollinations, aihorde, uncloseai, llm7, kilocode). The well-known ones —
 Groq, Cerebras, Google AI Studio, OpenRouter — all have real free tiers with
 no card.

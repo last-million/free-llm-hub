@@ -10,14 +10,14 @@ literal bearer "anonymous"), plus puter (user-pays gateway, BYOK).
 import providers as prov
 import quota
 
-NEW_PROVIDERS = ("github-models", "uncloseai", "llm7",
+NEW_PROVIDERS = ("uncloseai", "llm7",
                  "api-airforce", "navy", "routeway")
 
 NO_KEY_PROVIDERS = ("uncloseai", "llm7")
-KEYED_PROVIDERS = ("github-models", "api-airforce", "navy", "routeway")
+KEYED_PROVIDERS = ("api-airforce", "navy", "routeway")
 
 # Providers with a researched request budget in quota.FREE_LIMITS.
-KNOWN_LIMITS = ("github-models", "llm7", "navy", "routeway")
+KNOWN_LIMITS = ("llm7", "navy", "routeway")
 # Genuinely free but with NO published figure -> deliberately absent from
 # FREE_LIMITS so they track as UNKNOWN via DEFAULT_LIMIT (never a budget of 0
 # and never a fabricated number).
@@ -50,7 +50,7 @@ def test_all_filter_providers_accept_ordinary_ids():
     # 'all' is only honest on providers with no paid catalog to leak.
     # (llm7 was here until 2026-07-30, when its catalog gained a PAID 'pro'
     # tier — it is now family/exact-pinned; see the re-verification block.)
-    for pid in ("github-models", "uncloseai", "api-airforce", "navy"):
+    for pid in ("uncloseai", "api-airforce", "navy"):
         assert prov.get_provider(pid)["free_filter"] == "all", pid
         assert prov.is_free_model(pid, "openai/gpt-4.1"), pid
         assert prov.is_free_model(pid, "deepseek/DeepSeek-R1"), pid
@@ -97,15 +97,12 @@ def test_unknown_limit_providers_fall_back_to_default():
         assert row["limit"] is None and row.get("unknown") is True, pid
 
 
-def test_github_models_fixes_dangling_references():
-    # The bug this expansion fixes: quota.py and app.py referenced
-    # 'github-models' with no registry entry. The quota row predates the
-    # provider — both halves must now exist and agree it has a free budget.
-    assert prov.is_known_provider("github-models")
-    row = quota.FREE_LIMITS["github-models"]
-    assert row["limit"] > 0
-    assert prov.get_provider("github-models")["base_url"] == \
-        "https://models.github.ai/inference"
+def test_github_models_is_gone():
+    # GitHub retired GitHub Models on 2026-07-30 (its own docs + changelog; the endpoint answers
+    # 410). Owner 2026-10-27: a provider with no free quota any more leaves the list; a saved
+    # key moves to retired_providers (migration v7).
+    assert not prov.is_known_provider("github-models")
+    assert "github-models" not in quota.FREE_LIMITS
 
 
 # --------------------------------------------------------------------------- #

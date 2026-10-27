@@ -4228,7 +4228,7 @@ _PROVIDER_TPM = {
     # real 128k context on a 14,400/day budget (the sustainable large-agentic
     # workhorse) — 60000 wrongly dropped it once a growing conversation passed ~52k,
     # exactly when it was needed most.
-    "groq": 8000, "github-models": 60000, "huggingface": 30000, "mistral": 120000,
+    "groq": 8000, "huggingface": 30000, "mistral": 120000,
     "sambanova": 120000, "cerebras": 128000, "deepseek": 120000,
     "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
     "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
@@ -4365,6 +4365,58 @@ def _save_perf_stats(force=False):
         pass
 
 
+# A "this model is full right now" 429 (see quota._CAPACITY_CODES) is capacity, not a
+# failure of the model: the provider says to retry after Retry-After or switch model.
+# _upstream_chat leaves a short-lived MARK for the pair and _record_outcome consumes it
+# instead of filing the reliability strike -- the same mechanism a local DNS blip uses
+# (_local_net_failed), because ~30 call sites file that strike. MEASURED 2026-10-27:
+# dahl's two models sat at 6 ok / 32 fail and 0 / 27 on this alone, demoted for hours
+# while the provider said "retry in 10 s". Flag capacity_429_not_a_strike (default on).
+_CAPACITY_MARK_TTL = 8.0
+_capacity_marks = {}                     # (pid, model) -> [unconsumed count, expires (monotonic)]
+_capacity_lock = threading.Lock()
+
+
+def _capacity_flag_on():
+    try:
+        return bool(config.get_flag("capacity_429_not_a_strike", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _mark_capacity_429(pid, model):
+    """Note one capacity 429 for (pid, model); the next failure it explains files no strike."""
+    if not (pid and model) or not _capacity_flag_on():
+        return
+    now = time.monotonic()
+    with _capacity_lock:
+        if len(_capacity_marks) > 256:
+            for k in [k for k, v in _capacity_marks.items() if v[1] < now]:
+                _capacity_marks.pop(k, None)
+        row = _capacity_marks.get((pid, model))
+        n = row[0] if row and row[1] >= now else 0
+        _capacity_marks[(pid, model)] = [n + 1, now + _CAPACITY_MARK_TTL]
+
+
+def _take_capacity_mark(pid, model):
+    """True (and use up one mark) when a recent capacity 429 explains this failure."""
+    if not (pid and model) or not _capacity_flag_on():
+        return False
+    now = time.monotonic()
+    with _capacity_lock:
+        row = _capacity_marks.get((pid, model))
+        if not row:
+            return False
+        if row[1] < now:
+            _capacity_marks.pop((pid, model), None)
+            return False
+        if row[0] <= 1:
+            _capacity_marks.pop((pid, model), None)
+        else:
+            row[0] -= 1
+        return True
+
+
 def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
     """One real delivery result for this (pid, model). Never raises.
 
@@ -4383,6 +4435,8 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
         return          # the client left: not the provider's failure
     if not ok and _local_net_failed(pid, model):
         return          # this computer could not resolve the host: not the provider's failure
+    if not ok and not junk and _take_capacity_mark(pid, model):
+        return          # "this model is full, retry in N s": capacity, not a failure of the model
     try:
         now = time.time()
         weight = _JUNK_FAIL_WEIGHT if (junk and not ok) else 1
@@ -4871,7 +4925,7 @@ def _provider_capable(pid, est):
 _PROVIDER_SPEED = {
     "cerebras": 100, "groq": 92, "sambanova": 78, "deepseek": 66,
     "mistral": 66, "google": 62, "nvidia": 54, "openrouter": 52,
-    "huggingface": 46, "github-models": 44, "cohere": 60,
+    "huggingface": 46, "cohere": 60,
 }
 _DEFAULT_SPEED = 55
 # Reasoning / "thinking" model families — slow to first useful token.
@@ -9984,11 +10038,22 @@ _RH_HEADER_MIN_RESET = 2.0
 # an unknown limit must never be read as "full".
 _RH_HINTS = {
     "glm":        {"per_sec": 1},    # "~1 req/s, 1 concurrent"
-    "hyperbolic": {"per_sec": 1},    # "Free Community models limited to ~1 req/s"
     "sambanova":  {"per_min": 20},   # official Free Tier table: 20 RPM (and 20 RPD)
     "deepinfra":  {"per_min": 10},   # "~10 req/min on the free OS models"
     "sealion":    {"per_min": 10},   # "Free key via Google sign-in (no card), 10 RPM"
     "routeway":   {"per_min": 5},    # "~5 RPM, ~200 req/day on ':free' ids"
+    # Added 2026-10-27 from the providers' OWN documentation (research agents read the official docs; a
+    # figure is here only when a page states it, and the lower one wins when two pages disagree).
+    "cerebras":    {"per_min": 5},    # docs: free trial 5 RPM per organization (inference-docs.cerebras.ai rate limits)
+    "openrouter":  {"per_min": 20},   # docs: ':free' models 20 requests/min (openrouter.ai/docs limits)
+    "cohere":      {"per_min": 20},   # docs: trial 20 calls/min (its errors page shows 40: the lower wins)
+    "requesty":    {"per_min": 20},   # docs: free limit per organization, 20/min for new orgs
+    "api-airforce": {"per_min": 1},    # docs: free plan 1 request/min
+    "fireworks":   {"per_min": 10},   # docs: no payment method on file = 10 RPM per account
+    "aion":        {"per_min": 15},   # docs: 15 RPM free
+    "nararouter":  {"per_min": 15},   # docs: Free plan 15 RPM (the quota row says 10: the lower wins)
+    "llm7":        {"per_sec": 1},    # docs: free token 1 request/second
+    "uncloseai":   {"per_sec": 3},    # docs: public host 3 requests/second per IP
 }
 
 
@@ -17358,11 +17423,12 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # forever, so it is graded as the account-level fact it is.
             _mark_provider_authfail(pid, payload.get("model"), 402)
         elif resp.status_code == 429:
-            # THIS key is out, not the provider. Remember it so the next request
-            # starts on one that still has budget -- for as long as what ran out
-            # (a model's quota, a minute, a day) says, not a flat guess.
+            # THIS key is out, not the provider, for as long as what ran out says.
             info_429 = _classify_429(pid, resp, payload.get("model"))
-            quota.mark_key_exhausted(pid, key, _key_cooldown_for_429(info_429, resp))
+            if info_429.get("source") != "concurrency" or not _capacity_flag_on():
+                quota.mark_key_exhausted(pid, key, _key_cooldown_for_429(info_429, resp))
+            else:   # the MODEL is full (quota._CAPACITY_CODES), the key is fine: only the model parks
+                _mark_capacity_429(pid, payload.get("model"))
             if info_429.get("body_headers"):
                 # OpenRouter carries its x-ratelimit-* in the 429 BODY
                 # (error.metadata.headers): the real daily pool, for the dashboard.
@@ -19997,7 +20063,7 @@ _RECOMMENDED_QUALITY_THRESHOLD = 95
 # this is a snapshot list, same tradeoff the static 'recommended' flag
 # already makes. Update when a real new batch lands.
 _NEW_PROVIDER_IDS = frozenset((
-    "deepinfra", "hyperbolic", "nebius", "cohere",
+    "deepinfra", "nebius", "cohere",
     "scaleway", "stepfun", "aion", "sealion", "requesty",
     "dahl",
     "inception", "freemodel",       # added 2026-10-23/24

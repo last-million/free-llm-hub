@@ -41,7 +41,7 @@ from typing import Optional
 _log = logging.getLogger("migrations")
 
 # The schema version this hub migrates UP TO. Bump when you add a step below.
-LATEST = 6
+LATEST = 7
 
 # Providers removed from the registry whose rows (and any keys) are carried
 # forward under ``retired_providers`` rather than left in the active map. Only
@@ -60,6 +60,12 @@ RETIRED_PROVIDERS_V4 = ("together",)
 RETIRED_PROVIDERS_V5 = ("codecraft", "radoxai")
 # Release 2026-10-24: Morph bills every model from the first token (owner removed it).
 RETIRED_PROVIDERS_V6 = ("morph",)
+# Release 2026-10-27: providers whose OWN documentation says there is no free quota any more
+# (owner: "if a provider dont give free quota anymore remove it from our provider list").
+# github-models: fully retired by GitHub 2026-07-30 (docs + changelog; the endpoint answers 410).
+# hyperbolic: docs say a free account cannot send inference requests; a $5 deposit is required.
+# aimlapi: its official FAQ says "The Free Tier is currently paused"; plans are pay-as-you-go.
+RETIRED_PROVIDERS_V7 = ("github-models", "hyperbolic", "aimlapi")
 
 # Remembered for the status route; set by the last run_migrations() of the
 # process (boot). Never holds a key value — counts and a backup path only.
@@ -168,6 +174,13 @@ def _to_v6(raw: dict) -> dict:
     return _retire_removed_providers(raw, RETIRED_PROVIDERS_V6)
 
 
+def _to_v7(raw: dict) -> dict:
+    """Release 2026-10-27: github-models, hyperbolic and aimlapi left the registry (no free
+    quota in their own docs); a saved row (and its keys) moves to ``retired_providers``
+    verbatim, like v3 to v6."""
+    return _retire_removed_providers(raw, RETIRED_PROVIDERS_V7)
+
+
 # Ordered (target_version, id, fn). A step runs when the config's effective
 # start version is below target_version.
 _STEPS = (
@@ -175,6 +188,7 @@ _STEPS = (
     (4, "v4:retire_together", _to_v4),
     (5, "v5:retire_codecraft_radoxai", _to_v5),
     (6, "v6:retire_morph", _to_v6),
+    (7, "v7:retire_no_free_quota", _to_v7),
 )
 
 

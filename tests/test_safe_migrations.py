@@ -127,7 +127,7 @@ def test_apply_is_idempotent():
 
 def test_schema_version_is_bumped_to_latest():
     new, _ = migrations.apply(old_config())
-    assert new["schema_version"] == migrations.LATEST == 6
+    assert new["schema_version"] == migrations.LATEST == 7
 
 
 def test_a_newer_config_is_not_downgraded():
@@ -184,7 +184,7 @@ def test_run_writes_backs_up_first_and_keeps_keys(cfgfile):
     report = migrations.run_migrations()
 
     assert report["ok"] and report["changed"]
-    assert report["schema_version"] == 6
+    assert report["schema_version"] == 7
     assert report["keys_count"] == 5
     # the pre-migration backup holds the ORIGINAL bytes -> it was taken first
     assert report["last_backup"] and os.path.isfile(report["last_backup"])
@@ -208,7 +208,7 @@ def test_run_is_idempotent_and_takes_no_second_backup(cfgfile):
     report2 = migrations.run_migrations()
 
     assert report2["ok"] and not report2["changed"]
-    assert report2["schema_version"] == 6
+    assert report2["schema_version"] == 7
     assert open(cfgfile, "rb").read() == bytes_after_first      # not rewritten
     backups_after_second = sorted(os.listdir(os.path.join(os.path.dirname(cfgfile),
                                                           "backups")))
@@ -232,7 +232,7 @@ def test_run_on_a_corrupt_file_leaves_it_untouched(cfgfile):
 
 
 def test_run_on_a_fresh_latest_config_does_nothing(cfgfile):
-    write_raw(cfgfile, {"schema_version": 6, "providers": {}, "cli_multi_approval": "off"})
+    write_raw(cfgfile, {"schema_version": 7, "providers": {}, "cli_multi_approval": "off"})
     before = open(cfgfile, "rb").read()
     report = migrations.run_migrations()
     assert report["ok"] and not report["changed"]
@@ -283,7 +283,7 @@ def test_config_reads_the_migrated_values(cfgfile):
     assert config.get_setting("cli_multi_approval") == "off"
     cfg = config.load_config()                                  # loads cleanly
     assert "groq" in cfg["providers"]
-    assert cfg["schema_version"] == 6
+    assert cfg["schema_version"] == 7
     assert set(cfg.get("retired_providers") or {}) == {"tokenrouter", "agentrouter"}
 
 
@@ -303,7 +303,7 @@ def test_status_has_the_four_fields(cfgfile):
     migrations.run_migrations()
     st = migrations.status()
     assert set(("schema_version", "applied", "last_backup", "keys_count")) <= set(st)
-    assert st["schema_version"] == 6
+    assert st["schema_version"] == 7
     assert st["keys_count"] == 5
 
 
@@ -471,5 +471,46 @@ def test_v6_never_loses_a_key_and_is_idempotent():
 
 def test_a_config_without_morph_is_untouched_by_v6():
     new, applied = migrations.apply({"schema_version": 5,
+                                     "providers": {"groq": {"api_keys": ["enc.v1:G"]}}})
+    assert applied == [] and "retired_providers" not in new
+
+
+# --------------------------------------------------------------------------- #
+# v7 (2026-10-27): providers whose own docs say there is no free quota any more
+# --------------------------------------------------------------------------- #
+def v7_config(version=6):
+    return {"schema_version": version,
+            "providers": {"groq": {"api_keys": ["enc.v1:GROQ1"]},
+                          "hyperbolic": {"api_keys": ["enc.v1:HYP1", "enc.v1:HYP2"], "enabled": True},
+                          "github-models": {"api_keys": ["enc.v1:GH1"]},
+                          "aimlapi": {"api_keys": ["enc.v1:AIML1"]}}}
+
+
+def test_v7_moves_the_three_providers_to_retired_with_every_key():
+    new, applied = migrations.apply(v7_config())
+    retired = new["retired_providers"]
+    assert set(retired) == {"hyperbolic", "github-models", "aimlapi"}
+    assert retired["hyperbolic"]["api_keys"] == ["enc.v1:HYP1", "enc.v1:HYP2"]
+    assert retired["github-models"]["api_keys"] == ["enc.v1:GH1"]
+    assert applied == ["v7:retire_no_free_quota"]
+    assert new["schema_version"] == migrations.LATEST == 7
+
+
+def test_v7_leaves_other_providers_untouched():
+    new, _ = migrations.apply(v7_config())
+    assert new["providers"] == {"groq": {"api_keys": ["enc.v1:GROQ1"]}}
+
+
+def test_v7_never_loses_a_key_and_is_idempotent():
+    cfg = v7_config()
+    before = migrations.key_fingerprint(cfg)
+    once, _ = migrations.apply(cfg)
+    twice, applied2 = migrations.apply(once)
+    assert twice == once and applied2 == []
+    assert migrations._keys_preserved(before, migrations.key_fingerprint(twice))
+
+
+def test_a_config_without_those_providers_is_untouched_by_v7():
+    new, applied = migrations.apply({"schema_version": 6,
                                      "providers": {"groq": {"api_keys": ["enc.v1:G"]}}})
     assert applied == [] and "retired_providers" not in new

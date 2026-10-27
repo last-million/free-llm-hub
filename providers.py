@@ -938,16 +938,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["nova-2-pro-v1", "nova-2-lite-v1"],
         "notes": "Amazon Nova free developer tier (nova.amazon.com/dev). OpenAI-compatible.",
     },
-    "aimlapi": {
-        "name": "AI/ML API",
-        "base_url": "https://api.aimlapi.com/v1",
-        "models_url": "https://api.aimlapi.com/v1/models",
-        "signup_url": "https://aimlapi.com/app/keys",
-        "key_hint": "any",
-        "free_filter": "all",
-        "default_free_models": ["gpt-4o-mini", "deepseek-chat", "meta-llama/Llama-3.3-70B-Instruct-Turbo"],
-        "notes": "300+ models via one key; free allowance for new accounts. OpenAI-compatible.",
-    },
     "upstage": {
         "name": "Upstage (Solar)",
         "base_url": "https://api.upstage.ai/v1/solar",
@@ -1160,41 +1150,6 @@ PROVIDERS: Dict[str, dict] = {
         "free_families": [],
         "default_free_models": [],
         "notes": "Prepaid only — NO free tier and no signup credits (docs.aiand.com/billing/credits). NOTHING is callable at a zero balance as of 2026-07-31: the last free id (qwen/qwen3.6-27b, free when probed 2026-07-20) is now priced, and every catalog id returns 404 'no access' until credit is added at console.aiand.com/settings/billing ($1 minimum).",
-    },
-    "github-models": {
-        "name": "GitHub Models",
-        "base_url": "https://models.github.ai/inference",
-        "models_url": "https://models.github.ai/inference/models",
-        "signup_url": "https://github.com/marketplace/models",
-        "key_hint": "github_pat_... or ghp_... (needs the models:read scope)",
-        # 'all' is correct here: the WHOLE catalog has a free tier (per-model
-        # rate limits, not per-model billing) — GitHub Models is a free
-        # evaluation playground, there is no paid catalog to leak. The real
-        # metering is per-TIER request caps (see quota.py FREE_LIMITS), and
-        # real 429s sideline an exhausted id via the per-model throttle.
-        "free_filter": "all",
-        # Publisher-prefixed ids. Live /models discovery widens this; the pins
-        # below are well-known free-tier ids so the provider is usable even
-        # when discovery fails. NOTE: a token WITHOUT the models:read scope
-        # 403s on EVERY call (app.py's probe-before-default path exists
-        # precisely because llama-4-maverick ranked best while 403ing).
-        # RETIRED BY GITHUB 2026-07-30 — emptied 2026-07-31 so it contributes
-        # ZERO routing hops. Every endpoint (/inference/models, /catalog/models,
-        # completions on every id) answers:
-        #   HTTP 410 Gone
-        #   {"error":{"code":"github_models_retirement_brownout",
-        #             "message":"GitHub Models is temporarily unavailable as
-        #                        part of a scheduled retirement brownout."}}
-        # The "brownout" wording is stale tooling text: the brownouts were
-        # 2026-07-16 and 07-23, the hard shutdown was 07-30, and GitHub's docs
-        # now state the playground, catalog, inference API and BYOK are gone for
-        # every customer. Confirmed NOT a local problem: the same PAT still
-        # returns 200 on api.github.com/user, and the 410 is returned
-        # unauthenticated too. 410 is permanent, not 503.
-        # Entry KEPT (not deleted) so the quota row, tests and any saved key
-        # stay coherent, and so a future revival is a one-line restore.
-        "default_free_models": [],
-        "notes": "RETIRED — GitHub fully shut down GitHub Models on 2026-07-30; every endpoint now returns HTTP 410 'github_models_retirement_brownout' for all customers, authenticated or not. Nothing here is callable and the provider contributes no routing hops. Kept registered only so a revival would be a one-line change.",
     },
     "uncloseai": {
         "name": "UncloseAI (Hermes)",
@@ -1631,36 +1586,6 @@ PROVIDERS: Dict[str, dict] = {
     #   base_url    https://api.together.xyz/v1
     #   signup_url  https://api.together.xyz/settings/api-keys
     #   nature      prepaid ($5 minimum), no free tier
-    "hyperbolic": {
-        "name": "Hyperbolic",
-        "base_url": "https://api.hyperbolic.xyz/v1",
-        "models_url": "https://api.hyperbolic.xyz/v1/models",
-        "signup_url": "https://app.hyperbolic.xyz/keys",
-        "key_hint": "sk-...",
-        "free_filter": "family",
-        "free_exact": True,
-        "free_families": [
-            "Qwen/QwQ-32B",
-            "deepseek-ai/DeepSeek-R1",
-            "deepseek-ai/DeepSeek-V3",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "meta-llama/Llama-3.2-3B-Instruct",
-            "Qwen/Qwen2.5-72B-Instruct",
-            "Qwen/Qwen2.5-Coder-32B-Instruct",
-            "NousResearch/Hermes-3-Llama-3.1-70B",
-        ],
-        "default_free_models": [
-            "Qwen/QwQ-32B",
-            "deepseek-ai/DeepSeek-R1",
-            "deepseek-ai/DeepSeek-V3",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "meta-llama/Llama-3.2-3B-Instruct",
-            "Qwen/Qwen2.5-72B-Instruct",
-            "Qwen/Qwen2.5-Coder-32B-Instruct",
-            "NousResearch/Hermes-3-Llama-3.1-70B",
-        ],
-        "notes": "OpenAI-compatible. Free = the 'Community' model set; 'Premium' ids bill (and share id shapes with Community ones, so we pin exactly). Shares deepseek-r1/v3 + llama-3.3-70b with the rest of the fleet for cross-provider failover. Free Community models limited to ~1 req/s - real 429s sideline it.",
-    },
     "nebius": {
         "name": "Nebius AI",
         "base_url": "https://api.tokenfactory.nebius.com/v1",

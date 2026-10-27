@@ -7820,3 +7820,48 @@ course in intelligence available".
   <= 76 (`nemotron-3.5-super-vl` is a `-vl-` model, not routed for tool turns), and `stealth/space-bunny-alpha`
   is no longer in the live catalog. The hub offers only its `:free` models by design.
 - **AgentRouter** stays removed (see "AgentRouter: removed"); its row sits in `retired_providers` with the keys.
+
+## Provider documentation pass: limits from the docs, capacity 429s, providers with no free quota removed (2026-10-27)
+
+Covered by `tests/test_capacity_429.py` (15), `tests/test_documented_rate_hints.py` (25) and the v7 block of
+`tests/test_safe_migrations.py`. Owner: "all models and providers, he should adapt smartly and respect requests",
+"read the documentation before testing", "if a provider don't give free quota anymore, remove it from our list".
+
+- **How it was done.** Seven research agents read the OFFICIAL docs of all 59 named providers (no API calls, no
+  keys, every number recorded with its page; `null` + "not documented" where a page is silent). Raw output was in
+  the session scratchpad, not the repo. Findings worth knowing: groq's and nvidia's free-plan numbers are not printed
+  anywhere (groq's own 413 body is the authority: qwen/qwen3.8-27b `ITPM Limit 7000` on the free tier, verified
+  live); dahl documents NO numeric limits; google, mistral, zenmux, opencode-zen and g4f print none either;
+  freemodel.in refused connections; several Chinese providers' free quota is a ONE-OFF grant (qwen 1M tokens/90
+  days Singapore only, baidu 1M/3 months, tencent 1M/1 year), not a renewing allowance; Z.AI (glm) reports balance
+  AND rate errors all as HTTP 429 with business codes (1113 insufficient balance, 1302 rate, 1305 overload, 1313
+  fair-usage), never 402 -- the hub does not read those codes yet (open).
+- **Capacity 429 (dahl).** Documented: `429 model_concurrency` = "This model is at concurrency capacity ... Retry
+  after `Retry-After` or switch `model`" (inference.dahl.global/docs/api/). MEASURED live: the hub read it as scope
+  `account` (the message says "paid accounts ... create an account"), so `_apply_429` threw the WHOLE provider into
+  a throttle (siblings that the body itself lists as free included), the only key went into cooldown, and every
+  non-2xx hop filed `_record_outcome(False)`: dahl's two chat models sat at 6 ok / 32 fail and 0 / 27 and were demoted
+  for hours. Now `quota.classify_429` reads the DOCUMENTED CODE (`_CAPACITY_CODES`; never wording) as scope model,
+  window minute, reset from Retry-After; `_upstream_chat` leaves the key alone and leaves a short-lived MARK
+  (`_mark_capacity_429`, TTL 8 s) that `_record_outcome` consumes instead of filing the strike (same mechanism as a
+  local DNS blip). A junk answer is never excused; ordinary 429s are unchanged. Flag `capacity_429_not_a_strike`
+  (default on; off = key cooldown and strike as before -- the classifier's new reading stays, it only describes what the
+  429 says). Residual: the owner's dahl key may still be treated as an anonymous key ("signed-in and paid accounts are
+  admitted first" is in the live error text, not in the docs), so dahl may stay full more often than a linked key.
+- **Documented request rates -> `_RH_HINTS`** (reorder-only pacing, see "Rate-aware spreading"): cerebras 5/min,
+  openrouter 20/min (':free'), cohere 20/min, requesty 20/min, api-airforce 1/min, fireworks 10/min, aion 15/min,
+  nararouter 15/min, llm7 1/s, uncloseai 3/s. Left out on purpose because the hint table is provider-wide
+  per-minute: unorouter (1/min PER MODEL), ovhcloud (2/min per IP per model), kilocode (200/HOUR per IP), llm7's
+  250/hour, and every figure two pages of one provider disagreed on (llmgateway, cohere's 40/min). The tightest
+  figure still wins against FREE_LIMITS and headers.
+- **Removed (migration v7, `RETIRED_PROVIDERS_V7`; `migrations.LATEST` 7; keys move to `retired_providers`
+  verbatim, like v3-v6):** `github-models` (GitHub retired it 2026-07-30: docs + changelog, endpoint 410; it had
+  already been emptied 2026-07-31), `hyperbolic` (free accounts cannot send inference requests, a $5 deposit is
+  required; its endpoint is now api.hyperbolic.ai/inference/v1, not .xyz), `aimlapi` (official FAQ: "The Free Tier is
+  currently paused"). Registry 60 -> 57; their registry rows, the github-models quota row and two per-provider
+  tuning entries are gone. NOT removed: paid-zone providers the owner placed deliberately (huggingface, openai,
+  perplexity, opencode-zen, higgsfield, fireworks -- 10 RPM with no card, wandb, qwen's one-off grant) and
+  scaleway / nebius (docs gated or ambiguous; the earlier note about their quota rows stands).
+- **Evidence gaps, said plainly.** Several rows are medium or low confidence (modelscope, iflow, clarifai, llama,
+  upstage, novita, nova: pages did not load). The per-provider docs summaries are the agents' reports of those pages,
+  checked here only where a number drove a code change (github-models, hyperbolic, the dahl docs themselves).

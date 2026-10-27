@@ -48,7 +48,6 @@ FREE_LIMITS = {
     "groq":          {"limit": 1000,  "window": "day"},     # high: RPD floor across free chat models (llama-3.1-8b-instant is 14.4k/day)
     "cerebras":      {"limit": 14400, "window": "day"},     # high: 30 req/min, 900/hour, 14,400 req/day, 1M tok/day (per-model, gpt-oss-120b & Llama-3.1-8B). CORRECTED BACK from a wrong 5/minute: a research pass claimed no daily cap existed and that 14400 was "stale Groq cross-contamination" — it is not. Cerebras really is 14,400/day; Groq's llama-3.1-8b sharing that exact number is the coincidence that caused the mistake. Cross-checked against cheahjs/free-llm-api-resources (MIT). The 30/min burst limit is handled by the 429 -> 60s cooldown path, not by this daily budget.
     "openrouter":    {"limit": 50,    "window": "day"},     # high: 50/day TOTAL across all ':free' models (1000/day after a one-time $10 top-up)
-    "github-models": {"limit": 150,   "window": "day"},     # high: Copilot Free low-tier RPD (high-tier ids are 50/day, deepseek-r1 8/day — separate buckets)
     "sambanova":     {"limit": 20,    "window": "day"},     # medium: official Free Tier table = 20 RPM / 20 RPD / 200k TPD (was 300/day = 15x too high)
     "modelscope":    {"limit": 2000,  "window": "day"},     # high: 2,000 calls/day per account, sub-cap 500/model/day (was absent -> self-throttled at 10% of real capacity)
     "siliconflow":   {"limit": 100,   "window": "day"},     # medium: cap for accounts without Chinese real-name verification (实名认证), which most hub users cannot complete
@@ -1342,6 +1341,9 @@ import re as _re_429
 from email.utils import parsedate_to_datetime as _parsedate
 
 _MINUTE_429_CAP = 300.0     # a per-minute limit never benches anything longer
+# Provider error codes that mean "this model is full right now" (capacity), documented
+# by the provider. Only a documented code belongs here.
+_CAPACITY_CODES = frozenset({"model_concurrency"})   # dahl, /docs/api/ error table
 _HOUR_429_CAP = 3600.0
 _WIN_DAY_RE = _re_429.compile(
     r"per[ _-]?day|perday|daily|\bRPD\b|\bTPD\b|per 24 ?h(?:ours?)?|/day\b|"
@@ -1550,6 +1552,19 @@ def classify_429(pid: str, headers=None, body=None, model: str = None,
         if mh:
             out["body_headers"] = {str(k).lower(): v for k, v in mh.items()}
             explicit.append(_parse_reset(_hdr_ci(mh, "x-ratelimit-reset"), now))
+
+        # 3b) CAPACITY, not quota: the model is full for now and the key is fine.
+        # Dahl documents it (https://inference.dahl.global/docs/api/, error table:
+        # 429 `model_concurrency` -- "This model is at concurrency capacity ...
+        # Retry after `Retry-After` or switch `model`"). Its message mentions
+        # "accounts", which the account wording below would read as an
+        # account-wide quota and park the WHOLE provider -- siblings the body
+        # itself lists as free included. Matched on the documented error CODE
+        # only, never on wording.
+        code = err.get("code")
+        if isinstance(code, str) and code.strip().lower() in _CAPACITY_CODES:
+            out["source"] = "concurrency"
+            scope, window = "model", "minute"
 
         # 4) Generic wording and headers.
         text = " ".join(t for t in (msg, meta_raw) if t)
