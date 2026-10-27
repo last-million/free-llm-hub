@@ -7084,11 +7084,13 @@ this notice on opus, sonnet, fable, astra and sol in turn -- one wasted hop per 
 - **Signature on every hop**: `answer_check._GATEWAY_NOTICE_SIG_RE` (the
   `enter.pollinations.ai/edit-key` URL, `ref=agent_key_budget`, "topping up the wallet does
   not raise this limit") makes a short whole-reply notice junk whatever the hop is
-  (`_provider_notice(relay=False)`, also `reads_as_answer`). A prompt about budgets/keys is
-  still exempt, a long reply that merely quotes it is not cut, and generic quota wording
-  ("you exceeded your quota") on a DIRECT hop stays an answer, as before. This deliberately
-  supersedes the old pin in `test_provider_notice.py` that a direct hop never judges a
-  Pollinations notice.
+  (`_provider_notice(relay=False)`, also `reads_as_answer`). SUPERSEDED 2026-10-27 for the
+  exemption: it was "a prompt about budgets/keys is exempt" and it switched the whole check
+  off for any task brief that mentions "rate limit" / "api keys" -- see "A billing notice is
+  not an answer, even when the task mentions quotas" below. A long reply that merely quotes
+  it is not cut, and generic quota wording ("you exceeded your quota") on a DIRECT hop stays
+  an answer, as before. This deliberately supersedes the old pin in `test_provider_notice.py`
+  that a direct hop never judges a Pollinations notice.
 - **Hedge legs know their hop** (`_hedge_leg_verdict(item, payload, hop=)`): the streamed
   leg is judged with `relay=`, the JSON leg with `_answer_gate(hop=)`.
 - **The backend rests, not one model** (flag `relay_notice_rest`, default on):
@@ -7269,3 +7271,53 @@ ON); off = no entry, no probe, `_model_ctx_info` unchanged. New app.py names are
 - **Cost of testing it, said plainly.** Establishing the above took ~40 requests (several of 24K-36K
   tokens) through the owner's g4f relay on 2026-10-26; g4f throttled the hub afterwards (`g4f`
   `throttled_until` ~22:47), which is also why a last scan timed out. No further live probing was done.
+
+## A billing notice is not an answer, even when the task mentions quotas (2026-10-27)
+
+Covered by `tests/test_notice_survives_task_briefs.py` (50 tests, hermetic; briefs are synthetic).
+Report: an opencode turn (`coding-max`, 00:19) ended on Pollinations' "The API key used for this
+request has reached its budget ... raise the key budget (https://enter.pollinations.ai/edit-key?...)"
+-- the 2026-10-25 fix above was live and still let it through.
+
+- **Root cause (MEASURED).** `answer_check._provider_notice` skipped the check whenever the user's
+  last message mentioned budget / quota / billing / credits / rate limit / api key / wallet
+  (`_NOTICE_TOPIC_RE`) -- meant for a short QUESTION about quotas. On an agent turn the last user
+  message is the long original brief (or a hand-off), and any security or web task says "rate limit"
+  or "api keys" somewhere, so the check switched itself off for the whole task, on relay and direct
+  hops alike. Replayed from opencode's own database (read-only, only verdicts printed): 13 distinct
+  assistant replies that WERE the notice between 09-13 and 10-27 (the 55 stored parts also hold
+  forks' copies -- a fork copies a reply with its original creation time, so 12 "fork #1" sessions at
+  20:07:28 are one serve -- and user messages that quote the notice, which are not serves). The gate
+  as committed (HEAD d373210) accepts 7 of the 13, and every one of those 7 carries an exempting word
+  (`rate limit` / `api keys` / `credit`) in a 2.3K-46K char brief, tonight's 00:19:46 among them; it
+  already rejected the other 6 (served before the earlier fixes were live, or no prompt on record).
+  The fixed gate accepts none of the 13.
+- **The exemption now needs a short instruction** (`_NOTICE_TOPIC_MAX_PROMPT` 600 chars,
+  `_short_instruction`, after the CLI wrapper blocks are removed): a question, not a brief. The
+  generic quota / sign-up notice check on relay hops reads it the same way.
+- **The Pollinations signature is excused only by a short message that NAMES Pollinations and does
+  not contain the notice** (`_gateway_notice_excused`). A generic topic word never excuses it, and a
+  prompt that pasted the notice does not either (a reply that repeats it is not an explanation).
+  "Why does Pollinations say my budget is reached?" still gets its answer; "How do I raise my API key
+  budget?" followed by the notice does not.
+- **The gateway's opening sentence is a signature too** ("the api key used for this request has
+  reached its budget"): it arrives before the URL, so `reads_as_answer` holds a stream as soon as the
+  sentence is in.
+- **The stream peek waits for it** (`answer_check.is_provider_notice_possible`; the peek's
+  `_claim_possible` / `_claim_verdict`, which already did this for the empty-message claim). A model
+  streaming one token per frame reaches the peek's first verdict point (600 frame BYTES) ~10 characters
+  in -- "The API k" -- so the notice was committed, the committed `_StreamAnswerGate` then cut it to
+  nothing and the CLI got an EMPTY reply, which ends its turn just as the notice does. Now the peek reads
+  on, bounded like the claim hold (`_ANNOUNCE_HOLD_S`, 200 chars), and fails the hop so the chain walks
+  on. A gateway notice is waited for only while the text is a prefix of its opening sentence; a reply
+  that merely starts "The API key is read from .env" is released once it diverges.
+- **A notice already in the thread is replaced per hop** (`_scrub_empty_claims`, flag
+  `scrub_empty_claim_turns`, new `_NOTICE_TURN_NOTE`): the CLI keeps the served notice in its history and
+  a model copies what it finds there, so without this the next "continue" would start from it. Only the
+  unmistakable gateway signature is scrubbed, judged against the user message it answered; the CLI's own
+  list is never touched.
+- **What this cannot do.** The hub cannot make a CLI keep going once it receives a final text reply; it
+  can only refuse to serve non-answers, rest the relay backend (`_note_relay_notice`, 10 min) and let the
+  chain walk on. Other gateways' billing wording on a DIRECT hop is still not phrase-listed (only the
+  Pollinations signature is). NOT live until the hub restarts on this code: check `/api/version` against
+  HEAD.

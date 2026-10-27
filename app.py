@@ -15215,11 +15215,18 @@ _EMPTY_CLAIM_SCAN_MAX = 6000     # chars; the claim itself is <= 1200 (plus a le
 _EMPTY_CLAIM_TURN_NOTE = ("[Withheld by the hub: the model that wrote this reply had not "
                           "received the user's message. Ignore it and answer the user's "
                           "request above.]")
+# MEASURED 2026-10-27 00:19 (opencode `coding-max`): a billing notice from an upstream gateway was
+# served as the reply and stayed in the CLI's thread, so the next "continue" started from it.
+_NOTICE_TURN_NOTE = ("[Withheld by the hub: this reply was a billing / quota notice from an "
+                     "upstream service, not an answer. Ignore it and carry on with the user's "
+                     "request above.]")
 
 
 def _scrub_empty_claims(msgs):
     """`msgs` with every assistant turn that says "your message contains only a tool
-    setup / no request" (answer_check.is_empty_message_claim) replaced by a neutral
+    setup / no request" (answer_check.is_empty_message_claim), or that is a gateway's
+    billing / quota notice (answer_check.is_provider_notice, the unmistakable gateway
+    signatures only, judged against the user message it answered), replaced by a neutral
     note -> a new list, or `msgs` itself when there is none. Never mutates its input.
 
     MEASURED 2026-10-26 (Build session d9af0686): a relay that loses the end of a big
@@ -15246,18 +15253,23 @@ def _scrub_empty_claims(msgs):
                   and isinstance(m.get("content"), str)
                   # the claim is a short reply: skip long answers before any regex runs
                   # (this loop runs on every hop over the whole thread)
-                  and len(m["content"]) <= _EMPTY_CLAIM_SCAN_MAX
-                  and answer_check.is_empty_message_claim(m["content"], last_user)):
+                  and len(m["content"]) <= _EMPTY_CLAIM_SCAN_MAX):
+                if answer_check.is_empty_message_claim(m["content"], last_user):
+                    note = _EMPTY_CLAIM_TURN_NOTE
+                elif answer_check.is_provider_notice(m["content"], last_user, relay=False):
+                    note = _NOTICE_TURN_NOTE
+                else:
+                    continue
                 if out is None:
                     out = list(msgs)
-                out[i] = {**m, "content": _EMPTY_CLAIM_TURN_NOTE}
+                out[i] = {**m, "content": note}
                 n += 1
         if out is None:
             return msgs
         if not _ctx_g("_scrub_claims_logged"):
             _ctx_set("_scrub_claims_logged", True)
-            _log.info("[scrub] replaced %d assistant turn(s) that claimed the user's "
-                      "message was empty", n)
+            _log.info("[scrub] replaced %d assistant turn(s) that were not answers (an "
+                      "'empty message' claim or an upstream billing notice)", n)
         return out
     except Exception:                                            # noqa: BLE001
         return msgs
@@ -38151,6 +38163,19 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
     # the longer text -- the claim was committed and codex ended its turn on it.
     claim_lp = (check or {}).get("last_prompt")
     claim_watch = bool(check and (tools_turn or check.get("relay")))
+    # An upstream billing / quota notice served as the reply (answer_check.provider_notice):
+    # the gateway's own signature is a failed hop on EVERY hop, the looser quota / sign-up
+    # wording on relay hops. Same problem as the claim above, same remedy: a token-by-token
+    # stream is at ~10 characters when the first verdict lands. MEASURED 2026-10-27: it was
+    # committed, the committed gate cut it to nothing and the CLI ended its turn on the
+    # empty reply instead of the chain walking on.
+    notice_watch = bool(check)
+    notice_relay = bool(check and check.get("relay"))
+
+    def _claim_possible(text):
+        return bool((claim_watch and answer_check.is_empty_claim_possible(text, claim_lp))
+                    or (notice_watch and answer_check.is_provider_notice_possible(
+                        text, claim_lp, relay=notice_relay)))
 
     def _judge(seen, complete=True):
         verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt,
@@ -38160,9 +38185,12 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
 
     def _claim_verdict(seen, complete):
         """Fail the hop with the standard verdict once the stream read so far IS the
-        empty-message claim (both halves), else None. Never commits anything."""
-        if not claim_watch or not answer_check.is_empty_message_claim(
-                _peeked_text("".join(seen)), claim_lp):
+        empty-message claim (both halves) or an upstream billing notice, else None.
+        Never commits anything."""
+        text = _peeked_text("".join(seen))
+        if not ((claim_watch and answer_check.is_empty_message_claim(text, claim_lp))
+                or (notice_watch and answer_check.is_provider_notice(
+                    text, claim_lp, relay=notice_relay))):
             return None
         v = _judge(seen, complete=complete)
         return v if v != "content" else "junk"
@@ -38288,9 +38316,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                                            or _announce_possible(_first)))
                         # ...and while the text so far could still BECOME the
                         # empty-message claim (same bounded hold as above).
-                        box["emc"] = bool(verdict == "content" and claim_watch
-                                          and answer_check.is_empty_claim_possible(
-                                              _first, claim_lp))
+                        box["emc"] = bool(verdict == "content" and _claim_possible(_first))
                         _now = time.monotonic()
                         box["ann_until"] = _now + max(0.0, min(
                             _ANNOUNCE_HOLD_S,
@@ -38331,7 +38357,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         if v is not None:
                             box["status"] = v
                             return
-                        if (not answer_check.is_empty_claim_possible(text_now, claim_lp)
+                        if (not _claim_possible(text_now)
                                 or time.monotonic() >= box.get("ann_until", 0.0)):
                             box["emc"] = False
                     if not (box.get("nt") or box.get("ann") or box.get("emc")):

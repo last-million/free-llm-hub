@@ -1011,30 +1011,58 @@ _SIGNUP_NOTICE_RE = re.compile(
 # model's reply): the notice is only rejected on RELAY hops, so any hop the relay
 # list does not name (a hedge leg, a custom provider, the direct `pollinations`
 # row) served it as an answer. These fragments belong to that gateway's billing
-# notice and to nothing else, so they are rejected on EVERY hop (still short,
-# whole-reply, and skipped when the user's prompt is about budgets/keys).
+# notice and to nothing else, so they are rejected on EVERY hop (still short and
+# whole-reply; excused only by a short user message that names the gateway --
+# see _gateway_notice_excused).
 _GATEWAY_NOTICE_SIG_RE = re.compile(
     r"enter\.pollinations\.ai/edit-key|ref=agent_key_budget|"
-    r"topping up the wallet does not raise this limit", re.I)
+    r"topping up the wallet does not raise this limit|"
+    # the gateway's opening sentence: it comes BEFORE the URL, so a stream is held back
+    # (reads_as_answer) as soon as the sentence is in, not only once the URL arrives
+    r"the api key used for this request has reached its budget", re.I)
+_GATEWAY_NAME_RE = re.compile(r"pollinations", re.I)
+
+# MEASURED 2026-10-27 00:19 (opencode `coding-max`): the notice was served as the reply and the
+# agent's turn ended on it, because the TOPIC exemption above looked at the user's last message --
+# on an agent turn the long original brief, which says "rate limit" or "api keys" somewhere in any
+# security or web task. Replaying this gate on the 20 recorded serves of the notice: every one with
+# a known prompt that the gate would still have accepted carried an exempting word in a 2K-46K
+# char brief. The exemption exists for a QUESTION about quotas, so it needs a short instruction.
+_NOTICE_TOPIC_MAX_PROMPT = 600
+
+
+def _short_instruction(prompt_text):
+    """What the user typed, when it is short enough to be a question rather than a task brief
+    (else ""). The topic exemptions below read this, never the whole brief."""
+    inst = (_instruction(str(prompt_text)) if prompt_text else "") or ""
+    return inst if 0 < len(inst) <= _NOTICE_TOPIC_MAX_PROMPT else ""
+
+
+def _gateway_notice_excused(prompt_text):
+    """True when a reply carrying the gateway's own notice may be an answer: the user's SHORT
+    message names that gateway ("why does Pollinations say my budget is reached?") and does not
+    itself contain the notice. A generic quota word never excuses it, and neither does a prompt
+    that pasted the notice -- a reply that repeats it is not an explanation."""
+    q = _short_instruction(prompt_text)
+    return bool(q and _GATEWAY_NAME_RE.search(q) and not _GATEWAY_NOTICE_SIG_RE.search(q))
 
 
 def _provider_notice(masked, prompt_text, relay=True):
     """0 when the whole reply is an upstream quota/billing/rate-limit notice
     addressed to the API caller, or a short sign-up / log-in demand, else None.
-    Judged on the code-masked text; the quota check is skipped when the user's
-    own prompt is about those topics. `relay=False` (a direct hop) keeps only
-    the unmistakable gateway signatures above."""
+    Judged on the code-masked text; the quota check is skipped only when the
+    user's own SHORT message is about those topics. `relay=False` (a direct hop)
+    keeps only the unmistakable gateway signatures above."""
     head = (masked or "").strip()
     if not head or len(head) > _NOTICE_MAX_CHARS:
         return None
+    if _GATEWAY_NOTICE_SIG_RE.search(head):
+        return None if _gateway_notice_excused(prompt_text) else 0
     if not relay:
-        if _GATEWAY_NOTICE_SIG_RE.search(head) and not (
-                prompt_text and _NOTICE_TOPIC_RE.search(_instruction(str(prompt_text)) or "")):
-            return 0
         return None
     if len(head) <= _SIGNUP_MAX_CHARS and _SIGNUP_NOTICE_RE.search(head):
         return 0
-    if prompt_text and _NOTICE_TOPIC_RE.search(_instruction(str(prompt_text)) or ""):
+    if _NOTICE_TOPIC_RE.search(_short_instruction(prompt_text)):
         return None
     if not _NOTICE_RE.search(head[:400]):
         return None
@@ -1046,6 +1074,52 @@ def is_provider_notice(text, prompt_text=None, relay=True):
     try:
         return isinstance(text, str) and _provider_notice(
             _mask_code(text), prompt_text, relay=relay) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+# How a reply that turns into a billing / sign-up notice BEGINS (lowercase, whitespace-collapsed).
+# Only used to decide whether a PARTIAL stream is worth waiting for; the judgement is always
+# _provider_notice. MEASURED 2026-10-27: a model streaming token by token reaches the stream
+# peek's first verdict point (600 frame BYTES) ~10 characters in -- "The API k" -- long before the
+# notice is readable, so it was committed, the committed gate then cut it to nothing, and the CLI
+# got an EMPTY reply (it ends its turn on that, just as on the notice itself).
+_GATEWAY_NOTICE_OPENERS = (
+    "the api key used for this request has reached its budget",
+    "topping up the wallet does not raise this limit")
+_NOTICE_OPENERS = (
+    "you have exceeded your", "you exceeded your", "you've exceeded your",
+    "rate limit exceeded", "rate limited", "insufficient credit", "insufficient balance",
+    "insufficient funds", "not enough credit", "out of credit", "no more credit",
+    "sign up and", "sign in and", "please sign", "please log in", "log in to continue",
+    "login required", "an account is required", "account required",
+    "the api key", "your api key", "this api key")
+_NOTICE_POSSIBLE_CHARS = 200
+
+
+def _provider_notice_possible(masked, prompt_text, relay=True):
+    """True while a PARTIAL reply may still turn out to be a billing / quota / sign-up notice.
+    The stream peek reads on (bounded) while this holds. A gateway notice is waited for only
+    until the text stops being a prefix of its opening sentence; the looser relay openers hold
+    up to _NOTICE_POSSIBLE_CHARS. Never true where _provider_notice would excuse the reply."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head or len(head) > _NOTICE_POSSIBLE_CHARS:
+        return False
+    low = " ".join(head.lower().split())
+    if any(o.startswith(low) for o in _GATEWAY_NOTICE_OPENERS):
+        return not _gateway_notice_excused(prompt_text)
+    if not relay:
+        return False
+    if _NOTICE_TOPIC_RE.search(_short_instruction(prompt_text)):
+        return False
+    return any(o.startswith(low) or low.startswith(o) for o in _NOTICE_OPENERS)
+
+
+def is_provider_notice_possible(text, prompt_text=None, relay=True):
+    """Public form of `_provider_notice_possible` (see there). Never raises."""
+    try:
+        return isinstance(text, str) and _provider_notice_possible(
+            _mask_code(text), prompt_text, relay=relay)
     except Exception:                                            # noqa: BLE001
         return False
 
