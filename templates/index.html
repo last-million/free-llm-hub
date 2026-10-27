@@ -3197,6 +3197,31 @@
     .gh-inline .btn, .gh-manage .btn{ flex:1 1 auto; }
   }
   /* github-css:end */
+  /* add-prov-css:start */
+  /* "Add provider" on the Providers page. The dialog reuses the .publish-dialog
+     layout (head / scrolling body / footer, the bottom sheet on phones) and the
+     .publish-field / .gh-details classes; this block is only what those lack.
+     THEME TOKENS ONLY -- no raw colours. */
+  .pa-open{ margin-left:0; border-color:var(--accent-border); background:var(--accent-soft); color:var(--ok-text); }
+  .pa-open:hover{ background:var(--accent-soft); border-color:var(--accent); color:var(--ok-text); }
+  .pa-open:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .pa-form{ display:flex; flex-direction:column; gap:16px; }
+  .add-prov-dialog .pa-input{ width:100%; min-width:0; max-width:100%; min-height:var(--pub-tap);
+    padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--bg-inset); color:var(--text); font:inherit; font-size:14px; box-sizing:border-box; }
+  .add-prov-dialog textarea.pa-input{ min-height:calc(var(--pub-tap) * 1.8); resize:vertical; line-height:1.5; }
+  .add-prov-dialog .pa-input:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .add-prov-dialog .pa-input[aria-invalid="true"]{ border-color:var(--danger-border); }
+  .add-prov-dialog .pa-input[readonly]{ opacity:.7; cursor:default; }
+  .pa-opt{ font-weight:400; color:var(--text-dim); }
+  .pa-hint{ margin:0; font-size:12.5px; color:var(--text-dim); }
+  @media (pointer:coarse), (max-width:640px){
+    .pa-open{ min-height:calc(44px / var(--ui-scale, .8)); padding-left:14px; padding-right:14px; }
+  }
+  @media (max-width:640px){
+    .add-prov-dialog .pa-input{ font-size:calc(16px / var(--ui-scale, .8)); }
+  }
+  /* add-prov-css:end */
   /* What is currently open, and what it costs. */
   .runpanel{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
     background:var(--scrim, rgba(0,0,0,.55)); }
@@ -4657,6 +4682,12 @@
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
         Test all
       </button>
+      <!-- Add a provider by hand (opens #add-provider-dialog). Hidden when the
+           custom_providers_manual flag is off, exactly like the Settings form. -->
+      <button type="button" class="btn-test-all pa-open" id="pa-open" aria-haspopup="dialog" aria-controls="add-provider-dialog" title="Add your own OpenAI-compatible provider: a name, its base URL and your key">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        Add provider
+      </button>
     </div>
     <!-- Guided key setup. Deliberately an ordered list of LINKS you click
          through yourself: it opens each provider's own signup page and gives
@@ -5688,6 +5719,68 @@
 </button>
 
 <div id="toasts" aria-live="polite"></div>
+
+<!-- ADD A PROVIDER (Providers page -> "Add provider"): a native modal <dialog>,
+     a direct child of <body> (showModal() under a hidden ancestor would leave
+     the page inert behind an invisible dialog). It reuses the .publish-dialog
+     layout; the logic is the add-prov-js block below. The same definition can
+     be edited or removed under Settings -> Custom providers. -->
+<dialog class="publish-dialog add-prov-dialog" id="add-provider-dialog" aria-labelledby="pa-title" aria-describedby="pa-sub">
+  <div class="pub-dlg-head">
+    <h2 class="publish-title" id="pa-title" tabindex="-1">Add a provider</h2>
+    <button class="btn ghost publish-x" id="pa-close" type="button" aria-label="Close" title="Close">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div class="pub-dlg-body">
+    <p class="publish-p" id="pa-sub">Any service that speaks the OpenAI API: your company's gateway, a local server, or a provider the hub does not list. It becomes a normal provider card and stays after updates.</p>
+    <form class="pa-form" id="pa-form" novalidate autocomplete="off">
+      <div class="publish-field">
+        <label for="pa-name">Provider name <span class="pa-opt">(required)</span></label>
+        <input class="pa-input" type="text" id="pa-name" maxlength="120" placeholder="My Company LLM" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="publish-field">
+        <label for="pa-base-url">Base URL <span class="pa-opt">(required)</span></label>
+        <input class="pa-input" type="text" id="pa-base-url" inputmode="url" placeholder="https://api.example.com/v1" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="pa-base-url-help">
+        <p class="pa-hint" id="pa-base-url-help">The OpenAI-compatible address, usually ending in /v1. Use https:// unless the server runs on this machine.</p>
+      </div>
+      <div class="publish-field">
+        <label for="pa-key">API key <span class="pa-opt">(optional)</span></label>
+        <input class="pa-input" type="password" id="pa-key" placeholder="Paste the key" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="pa-key-help">
+        <p class="pa-hint" id="pa-key-help">Kept on this machine like every provider key, and tested as soon as it is saved. You can also paste it later on the provider's card.</p>
+      </div>
+      <details class="gh-details" id="pa-more">
+        <summary>Optional details</summary>
+        <div class="gh-details-body">
+          <div class="publish-field">
+            <label for="pa-models-url">Models URL</label>
+            <input class="pa-input" type="text" id="pa-models-url" inputmode="url" placeholder="Defaults to the base URL plus /models" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="publish-field">
+            <label for="pa-signup-url">Where to get a key</label>
+            <input class="pa-input" type="text" id="pa-signup-url" maxlength="2000" placeholder="A web address or a short note" autocomplete="off" spellcheck="false" aria-describedby="pa-signup-help">
+            <p class="pa-hint" id="pa-signup-help">Shown on the provider's card. A web address becomes a link; anything else stays a note.</p>
+          </div>
+          <div class="publish-field">
+            <label for="pa-key-hint">Key format hint</label>
+            <input class="pa-input" type="text" id="pa-key-hint" maxlength="80" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="publish-field">
+            <label for="pa-notes">Notes</label>
+            <textarea class="pa-input" id="pa-notes" maxlength="1000" rows="3" placeholder="Anything worth remembering about this provider" autocomplete="off"></textarea>
+          </div>
+        </div>
+      </details>
+    </form>
+  </div>
+  <div class="pub-dlg-foot">
+    <p class="publish-err" id="pa-err" role="alert" hidden></p>
+    <div class="publish-row">
+      <button class="btn" type="button" id="pa-cancel">Cancel</button>
+      <button class="btn primary" type="submit" form="pa-form" id="pa-submit">Add provider</button>
+    </div>
+  </div>
+</dialog>
 
 <script nonce="{{ csp_nonce }}">
 (function(){
@@ -15203,8 +15296,21 @@
     }).join('') : '<p class="sd-help">None yet. Add a name and base URL below.</p>';
   }
   function loadCustomProviders(silent){
-    return api('/api/custom-providers').then(renderCustomProviders)
+    return api('/api/custom-providers').then(function(r){ renderCustomProviders(r); paSetEnabled(r); })
       .catch(function(e){ if (!silent) toast('Custom providers: ' + e.message, true); });
+  }
+  /* The six definition fields of POST/PUT /api/custom-providers, trimmed, with
+     the two required ones checked. Shared by this Settings form and the Providers
+     page's "Add provider" dialog (add-prov-js below), so they cannot drift.
+     -> {body} or {error, field} where field is the API's own name for the input. */
+  function cpBuildBody(v){
+    v = v || {};
+    function clean(x){ return String(x == null ? '' : x).trim(); }
+    var name = clean(v.name), base = clean(v.base_url);
+    if (!name) return { error: 'Give the provider a name, for example "My Company LLM".', field: 'name' };
+    if (!base) return { error: 'Enter the base URL, for example https://api.example.com/v1.', field: 'base_url' };
+    return { body: { name: name, base_url: base, models_url: clean(v.models_url),
+                     signup_url: clean(v.signup_url), key_hint: clean(v.key_hint), notes: clean(v.notes) } };
   }
   function cpFormReset(){
     $('#cp-id').value = ''; $('#cp-name').value = ''; $('#cp-base-url').value = '';
@@ -15258,9 +15364,11 @@
     $('#cp-form').addEventListener('submit', function(ev){
       ev.preventDefault();
       var err = $('#cp-err'), btn = $('#cp-save'), id = $('#cp-id').value;
-      var body = { name: $('#cp-name').value, base_url: $('#cp-base-url').value,
-                   models_url: $('#cp-models-url').value, key_hint: $('#cp-key-hint').value,
-                   signup_url: $('#cp-signup-url').value, notes: $('#cp-notes').value };
+      var built = cpBuildBody({ name: $('#cp-name').value, base_url: $('#cp-base-url').value,
+                                models_url: $('#cp-models-url').value, key_hint: $('#cp-key-hint').value,
+                                signup_url: $('#cp-signup-url').value, notes: $('#cp-notes').value });
+      if (built.error){ err.textContent = built.error; err.hidden = false; return; }
+      var body = built.body;
       err.hidden = true; btn.disabled = true;
       var req = id ? api('/api/custom-providers/' + encodeURIComponent(id), { method: 'PUT', body: body })
                    : api('/api/custom-providers', { method: 'POST', body: body });
@@ -15270,6 +15378,248 @@
         .then(function(){ btn.disabled = false; });
     });
   }
+
+  /* add-prov-js:start */
+  /* ---------- Add a provider from the Providers page (2026-10-27) ----------
+     The "Add provider" button in the Providers toolbar opens #add-provider-dialog.
+     No backend of its own: it calls the routes Settings -> Custom providers
+     already uses (POST /api/custom-providers, then the ordinary
+     POST /api/providers/<id>/keys), so the same definition shows up in that
+     Settings list (edit / remove live there) and as a normal provider card here.
+
+     The logic is in top-level functions that reach the page only through
+     $ / api / toast, so tests/test_add_provider_from_providers_page.py can run
+     them in node against a fake DOM. Backend text (error messages, the provider
+     name the server echoes, the test detail) only ever goes in through
+     textContent -- the fake element in that test throws if markup is written.
+
+     The create body never carries an id: the server slugs the name, so a
+     second create after a later failure would mint "name-2". Once the provider
+     exists, a failed key save is retried as a key save only (_paPid). */
+  var _paSeq = 0;      /* bumped on open and on close: a reply that arrives for an older dialog only toasts */
+  var _paPid = '';     /* id of a provider this dialog created whose key did not save: the retry saves only the key */
+  var _paBusy = false;
+
+  /* Which input a server validation message is about (so it can be focused). */
+  function paErrorField(msg){
+    var m = /^\s*(name|base_url|models_url)\b/.exec(String(msg == null ? '' : msg));
+    if (!m) return '';
+    return m[1] === 'name' ? 'pa-name' : (m[1] === 'base_url' ? 'pa-base-url' : 'pa-models-url');
+  }
+  /* Create the provider, then (with a key) save the key for the id the server
+     returned. With `pid` the provider already exists: only the key is saved.
+     Never rejects for an API error -- the result says what happened. */
+  function paSubmit(body, key, apiFn, pid){
+    var info = { name: body.name, keyGiven: !!key, keySaved: false };
+    function saveKey(id){
+      if (!key) return Promise.resolve();
+      return apiFn('/api/providers/' + encodeURIComponent(id) + '/keys', { method: 'POST', body: { api_key: key } })
+        .then(function(){ info.keySaved = true; },
+              function(e){ info.keyError = (e && e.message) || 'The key could not be saved'; });
+    }
+    if (pid){
+      return saveKey(pid).then(function(){ return { ok: true, pid: pid, info: info }; });
+    }
+    return apiFn('/api/custom-providers', { method: 'POST', body: body }).then(function(row){
+      var id = row && row.id;
+      if (!id){
+        return { ok: false, field: '', disabled: false,
+                 error: 'The hub did not say which provider it created. Reload the page and check the list.' };
+      }
+      if (row.name) info.name = row.name;
+      return saveKey(id).then(function(){ return { ok: true, pid: id, info: info }; });
+    }, function(e){
+      var msg = (e && e.message) || 'The provider could not be added.';
+      return { ok: false, error: msg, field: paErrorField(msg), disabled: !!(e && e.body && e.body.code === 'disabled') };
+    });
+  }
+  /* The sentence for the toast (or the inline line when the key did not save). */
+  function paNotice(info, test){
+    info = info || {};
+    test = test || {};
+    var name = info.name || 'The provider';
+    function end(s){ s = String(s == null ? '' : s).trim(); return /[.!?]$/.test(s) ? s : s + '.'; }
+    if (!info.keyGiven){
+      return { err: false, text: name + ' was added. Paste its API key on its card to start using it.' };
+    }
+    if (!info.keySaved){
+      return { err: true, text: name + ' was added, but its key was not saved: ' +
+                                 end(info.keyError || 'unknown error') + ' Paste the key again and press Save key.' };
+    }
+    if (test.state === 'ok'){
+      return { err: false, text: name + ' is ready. The key works.' + (test.detail ? ' ' + end(test.detail) : '') };
+    }
+    if (test.state === 'bad'){
+      return { err: true, text: name + ' was added, but the test failed: ' +
+                                 end(test.detail || 'the provider did not accept the key') +
+                                 ' Check the base URL and the key, then press Test on its card.' };
+    }
+    return { err: true, text: name + ' was added and the key is saved, but the test could not finish' +
+                               (test.detail ? ': ' + end(test.detail) : '.') + ' Press Test on its card to try again.' };
+  }
+  /* The one error line (role=alert) plus the field it is about. '' clears both. */
+  function paShowError(msg, fieldId){
+    var ids = ['pa-name', 'pa-base-url', 'pa-key', 'pa-models-url', 'pa-signup-url', 'pa-key-hint', 'pa-notes'];
+    for (var i = 0; i < ids.length; i++){
+      var f = $('#' + ids[i]);
+      if (f) f.removeAttribute('aria-invalid');
+    }
+    var box = $('#pa-err');
+    if (box){ box.textContent = msg ? String(msg) : ''; box.hidden = !msg; }
+    var field = fieldId ? $('#' + fieldId) : null;
+    if (!field) return;
+    field.setAttribute('aria-invalid', 'true');
+    if (['pa-models-url', 'pa-signup-url', 'pa-key-hint', 'pa-notes'].indexOf(fieldId) !== -1){
+      var more = $('#pa-more');
+      if (more) more.open = true;
+    }
+    field.focus();
+  }
+  /* custom_providers_manual off -> the button goes, as Settings hides its form. No reply = no change. */
+  function paSetEnabled(r){
+    if (!r) return;
+    var btn = $('#pa-open');
+    if (btn) btn.hidden = (r.enabled === false);
+  }
+  /* Bring the new card into view (opening the group it sits in). */
+  function paRevealCard(pid, focusKey){
+    var card = cardForPid(pid);
+    if (!card) return false;
+    var group = card.closest ? card.closest('details') : null;
+    if (group && !group.open) group.open = true;
+    var calm = false;
+    try { calm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}
+    try { card.scrollIntoView({ block: 'center', behavior: calm ? 'auto' : 'smooth' }); }
+    catch (e2) { card.scrollIntoView(); }
+    if (focusKey){
+      var k = card.querySelector('.key-input');
+      if (k){ try { k.focus({ preventScroll: true }); } catch (e3) { k.focus(); } }
+    }
+    return true;
+  }
+  function initAddProvider(){
+    var dlg = $('#add-provider-dialog'), openBtn = $('#pa-open');
+    if (!dlg || !openBtn) return;
+    if (dlg.parentNode !== document.body) document.body.appendChild(dlg);
+    var form = $('#pa-form'), submitBtn = $('#pa-submit');
+    var providerFields = ['pa-name', 'pa-base-url', 'pa-models-url', 'pa-signup-url', 'pa-key-hint', 'pa-notes'];
+
+    function val(id){ var el = $('#' + id); return el ? el.value : ''; }
+    function lockProvider(on){
+      providerFields.forEach(function(id){ var el = $('#' + id); if (el) el.readOnly = on; });
+    }
+    function resetForm(){
+      providerFields.concat(['pa-key']).forEach(function(id){ var el = $('#' + id); if (el) el.value = ''; });
+      lockProvider(false);
+      var more = $('#pa-more'); if (more) more.open = false;
+      _paPid = ''; _paBusy = false;
+      submitBtn.disabled = false; submitBtn.textContent = 'Add provider';
+      paShowError('', '');
+    }
+    function open(){
+      if (openBtn.hidden) return;                 /* switched off */
+      resetForm();
+      _paSeq++;
+      try { if (!dlg.open) dlg.showModal(); } catch (e){ return; }
+      var first = $('#pa-name'); if (first) first.focus();
+    }
+    function close(){ if (dlg.open) dlg.close(); }
+
+    openBtn.addEventListener('click', open);
+    $('#pa-close').addEventListener('click', close);
+    $('#pa-cancel').addEventListener('click', close);
+    dlg.addEventListener('close', function(){
+      _paSeq++; _paBusy = false;
+      var k = $('#pa-key'); if (k) k.value = '';  /* never leave a key sitting in a closed form */
+      try { openBtn.focus({ preventScroll: true }); } catch (e){ openBtn.focus(); }
+    });
+    /* Close on the backdrop only when the press began AND ended there, so
+       dragging a text selection out of a field never throws the form away. */
+    var downOnBackdrop = false;
+    dlg.addEventListener('pointerdown', function(e){ downOnBackdrop = (e.target === dlg); });
+    dlg.addEventListener('click', function(e){
+      var outside = (e.target === dlg) && downOnBackdrop;
+      downOnBackdrop = false;
+      if (outside) close();
+    });
+
+    function afterCreated(res, live){
+      var pid = res.pid, info = res.info;
+      var search = $('#search');
+      if (search && search.value) search.value = '';        /* an active filter would hide the new card */
+      var refresh = Promise.all([loadProviders(), loadCustomProviders(true)]);
+      if (live && info.keyGiven && !info.keySaved){
+        _paPid = pid;                                       /* the retry saves only the key */
+        lockProvider(true);
+        submitBtn.disabled = false; submitBtn.textContent = 'Save key';
+        var k = $('#pa-key'); if (k) k.value = '';
+        paShowError(paNotice(info, null).text, 'pa-key');
+        return refresh;
+      }
+      if (live) close();
+      return refresh.then(function(){
+        paRevealCard(pid, !info.keySaved);
+        if (!info.keySaved){
+          var n0 = paNotice(info, null);
+          toast(n0.text, n0.err);
+          return null;
+        }
+        delete keyHealth[pid];
+        var more = Promise.all([loadStatus(), loadModels()]).catch(function(){});
+        return testKeyHealth(pid).then(function(){
+          var n1 = paNotice(info, keyHealth[pid]);
+          toast(n1.text, n1.err);
+          return more;
+        });
+      });
+    }
+
+    form.addEventListener('submit', function(ev){
+      ev.preventDefault();
+      if (_paBusy) return;
+      paShowError('', '');
+      var key = val('pa-key').trim();
+      var body;
+      if (_paPid){
+        if (!key){
+          paShowError('Paste the key to save it, or close this window: the provider is already added.', 'pa-key');
+          return;
+        }
+        body = { name: val('pa-name').trim() };
+      } else {
+        var built = cpBuildBody({ name: val('pa-name'), base_url: val('pa-base-url'), models_url: val('pa-models-url'),
+                                  signup_url: val('pa-signup-url'), key_hint: val('pa-key-hint'), notes: val('pa-notes') });
+        if (built.error){ paShowError(built.error, 'pa-' + built.field.replace(/_/g, '-')); return; }
+        body = built.body;
+      }
+      var mine = _paSeq;
+      _paBusy = true; submitBtn.disabled = true;
+      submitBtn.textContent = _paPid ? 'Saving key…' : 'Adding…';
+      paSubmit(body, key, api, _paPid).then(function(res){
+        _paBusy = false;
+        var live = (mine === _paSeq);
+        if (!res.ok){
+          if (res.disabled) paSetEnabled({ enabled: false });
+          if (live){
+            submitBtn.disabled = false; submitBtn.textContent = _paPid ? 'Save key' : 'Add provider';
+            paShowError(res.error, res.field);
+          } else {
+            toast(res.error, true);
+          }
+          return null;
+        }
+        return afterCreated(res, live);
+      }).catch(function(e){
+        _paBusy = false;
+        if (mine !== _paSeq) return;
+        submitBtn.disabled = false; submitBtn.textContent = _paPid ? 'Save key' : 'Add provider';
+        paShowError((e && e.message) || 'Something went wrong. Try again.', '');
+      });
+    });
+
+    loadCustomProviders(true);                            /* learns the custom_providers_manual flag at startup */
+  }
+  /* add-prov-js:end */
 
   /* ---------- enhance-opening-prompts toggle (Settings drawer) ---------- */
   function loadPromptEnhance(silent){
@@ -17009,6 +17359,7 @@
   initReasoning();
   initSkills();
   initCustomProviders();
+  initAddProvider();
   initLowres();
   initHeartbeats();
   initWhatsNewButton();

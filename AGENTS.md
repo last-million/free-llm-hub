@@ -7665,3 +7665,62 @@ suite was not run.
   daily bucket landing in its last minute would be misread as a per-minute limit
   (it can only TIGHTEN the figure, never loosen it, see the tightest-wins rule). The
   real header shapes of each provider were not re-read here.
+
+## Add a provider from the Providers page (2026-10-27)
+
+Owner: add a provider by hand from the Providers page itself, not only from
+Settings. Page-only change (`templates/index.html`); NO backend change and NO new
+`@app.route` (README route count unchanged). It is the page's half of "Custom
+providers (user-added) (2026-10-24)" above and uses exactly its routes.
+Covered by `tests/test_add_provider_from_providers_page.py` (static checks, the
+whole dialog and its helpers run in node against a fake DOM and a fake `api`,
+the page render + `node --check`; the node tests skip without node).
+
+- **Where**: an "Add provider" button (`#pa-open`, a `.btn-test-all` in the
+  Providers toolbar after "Test all") opens `#add-provider-dialog`, a native
+  modal `<dialog>` moved under `<body>`. It reuses the `.publish-dialog` layout
+  (head / scrolling body / footer, bottom sheet <= 640 px) and the
+  `.publish-field` / `.gh-details` classes; the only new CSS is the token-only
+  `/* add-prov-css */` block (inputs at `--pub-tap`, 16 rendered px on phones,
+  44 rendered px button on touch). JS is the `/* add-prov-js */` block; ids all
+  start `pa-` (never `cp-`: Settings' `$('#cp-...')` takes the first match).
+- **Fields**: name and base URL (required), API key (optional), and an
+  "Optional details" fold with models URL, where to get a key (a link or free
+  text), key hint, notes.
+- **Flow**: `POST /api/custom-providers` with the six trimmed fields and NO id
+  (the server slugs the name; a blind re-POST would mint `name-2`), then with a
+  key `POST /api/providers/<id from the 201>/keys` (the ordinary route; adding a
+  key auto-enables the provider). Then it reloads the cards and the Settings
+  list, clears an active search filter, opens the card's group, scrolls to the
+  new card (focusing its key field when no key was given) and runs the per-card
+  key test, ending with one toast in plain words (key works / test failed and
+  why / test could not finish / no key yet). A create error stays in the dialog
+  (`role=alert`) with the offending input marked `aria-invalid` and focused.
+  If the provider was created but only the KEY failed, the dialog stays open
+  with the provider fields locked, the button reads "Save key", and the retry
+  saves the key only (`_paPid`): it never creates a second provider.
+- **Shared with Settings**: `cpBuildBody` (trim, the six fields, the two
+  required ones) builds the body for BOTH forms; the Settings submit now shows
+  its friendly required-field messages from it instead of waiting for the
+  server's. Create/validation/ids stay the server's (`_custom_provider_body_
+  fields`); the dialog adds nothing the API does not already enforce.
+- **Flag**: `custom_providers_manual` (default on). `loadCustomProviders` (also
+  run once at startup by `initAddProvider`) hands the reply to `paSetEnabled`,
+  which hides `#pa-open` when `enabled` is false; a 403 `disabled` on create
+  hides it too. A failed GET leaves the button as it was (fail open). The
+  button is visible until the first reply arrives.
+- **Safety**: no backend string is ever written through `innerHTML` in the new
+  code (error text, the server-echoed provider name and the test detail all go
+  in via `textContent` / `toast`); the fake element in the node tests THROWS if
+  `innerHTML` is written. `renderCustomProviders` is unchanged and still free of
+  the new helpers (the existing escape test extracts it alone). The key field
+  is a password input, emptied when the dialog closes.
+- **Limits**: Edit / Remove stay in Settings -> Custom providers (the card has
+  no edit). Esc, X, Cancel and a press that begins and ends on the backdrop all
+  close the dialog and discard what was typed (same as Publish / GitHub).
+  Closing while the create is in flight leaves the provider created and says so
+  in a toast; reopening and submitting the same name before that answer arrives
+  would create a second one (`name-2`). `autocomplete="off"` is used on the key
+  like every other key field; a password manager may still offer to fill it.
+  Not exercised in a real browser: node + fake DOM, the Flask render and
+  `node --check` are the evidence.
