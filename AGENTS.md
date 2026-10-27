@@ -7321,3 +7321,57 @@ request has reached its budget ... raise the key budget (https://enter.pollinati
   chain walk on. Other gateways' billing wording on a DIRECT hop is still not phrase-listed (only the
   Pollinations signature is). NOT live until the hub restarts on this code: check `/api/version` against
   HEAD.
+
+## WSL mount health: a stale /mnt/c is detected and fixed (2026-10-27)
+
+Owner: "some agents work in WSL -- make the hub facilitate things for Windows users, and do some
+things in WSL too." MEASURED (opencode `coding-max`, folder `bount en`, 2026-10-27 01:10-01:39):
+opencode's `write` tool reported success writing `...\bount en\pass_b_js.py` on the Windows side,
+but `wsl bash -c "cp /mnt/c/.../pass_b_js.py ..."` answered `No such file or directory` over and
+over, 20+ minutes later too. The model then confabulated an elaborate transport-failure story
+(OneDrive files-on-demand holding the file in the cloud; nested `wsl.exe` failing; PowerShell->WSL
+quoting) and burned many turns. The real cause, found by reading the distro read-only: `/etc/wsl.conf`
+had `[automount] enabled=false` and `[interop] enabled=false`. `/mnt/c` was not a mount at all --
+`stat -f` showed it on the distro's OWN ext4 root device, a one-time stale copy of part of the
+folder from hours earlier. Any file written from Windows after that snapshot can NEVER appear under
+`/mnt/c`, however long you wait -- not a sync delay, not quoting. (`interop=false` is also why
+`wsl.exe` was "command not found" from inside WSL -- the same file, not a general WSL limit.) Fixed
+by hand: back up the stale dir, flip both to true in wsl.conf as root (`wsl.exe -u root`, no password
+-- WSL's own design for the distro owner, never an interactive `sudo` that would hang on a TTY),
+`wsl --shutdown`, verify `/mnt/c` is `9p drvfs` on the live `C:\`.
+
+- **`wslfix.py`** (pure stdlib, never raises; every outside effect is a `run`/`clock` argument, so
+  it is tested with no real wsl.exe -- `tests/test_wslfix.py`). `diagnose(distro)` reads
+  `/proc/mounts` + `/etc/wsl.conf` and reports `{healthy, reason, mount_type, automount_enabled,
+  interop_enabled}`: healthy only when `/mnt/c` is `9p` and automount is not false; `healthy=None`
+  (not False) for an unreachable distro, so "can't reach it" is never mistaken for "broken". An
+  ABSENT section is WSL's own default (enabled), never a fault. `parse_wsl_conf` / `mount_fstype`
+  are the pure readers. `patch_wsl_conf(text)` flips only an EXISTING `enabled = false` under
+  `[automount]`/`[interop]` to true and keeps every other line (comments, `[boot]`, user keys) byte
+  for byte; `changed=False` when there is nothing to flip, so a caller never rewrites an identical
+  file or claims a fix it did not make. `brief_note(rows)` is the agent-facing warning. `apply(
+  distro, confirm=True)` does the whole repair: refuse without confirm; already-healthy ->
+  nothing touched; root must be reachable WITHOUT a password (`can_use_root`), else it changes
+  NOTHING and returns `needs_manual` + a one-line command the user runs themselves; otherwise back
+  up the stale dir and the old wsl.conf inside the distro, write the patched conf via stdin (never a
+  shell string, so nothing escapes), `wsl --shutdown`, re-diagnose to confirm. Every failure names
+  what earlier steps already did (backup dir, conf backup path) so nothing done is hidden.
+- **The agent brief carries the warning** (`agent_servers.wsl_section`, cached per distro
+  `_WSL_HEALTH_TTL` 120 s, fails open to ""): a WSL project whose `/mnt/c` is stale gets a block
+  telling the agent the ACTUAL cause and that a file written from Windows will never appear there --
+  so it stops guessing OneDrive sync or a quoting bug -- plus how to fix it (Settings) or avoid it
+  (pipe content in from Windows: `<content> | wsl.exe -d <distro> bash -c "cat > ~/file"`).
+- **Routes** (control-token gated by the global guard like every `/api/*`; README route count
+  198 -> 200): `GET /api/wsl-health` (read-only: each installed distro's diagnosis + whether the hub
+  can fix it here) and `POST /api/wsl-health/fix {distro, confirm:true}` (DESTRUCTIVE -- the shutdown
+  ends every WSL distro's processes -- so it needs `confirm`; `needs_manual` + a paste-able command
+  when root is not reachable; 500 only on a hard failure).
+- **Dashboard** (`#wsl-health-group`, Settings): hidden unless a distro is broken; names it, and a
+  "Fix it" button (confirm dialog that says the shutdown ends everything in every WSL distro) when
+  fixable, else the one-line command to run by hand. Backend strings via `textContent` only; the
+  render is run in node against a fake DOM in the test.
+- **Scope / limits.** Only `/mnt/c` is checked (the realistic Windows case). The fix needs
+  passwordless root in that distro (WSL's default for the owner); where that is off, the hub never
+  touches anything and hands the user the command. `wsl --shutdown` is machine-wide -- it restarts
+  EVERY distro, not only the broken one -- which is why it is confirm-gated. The hub still runs no
+  build/test itself inside WSL; this only repairs the mount so the agent's own commands work.

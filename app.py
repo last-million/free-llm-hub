@@ -28574,6 +28574,62 @@ def api_low_resource_update():
     return jsonify(lowres.status())
 
 
+def _wsl_distros():
+    """The installed WSL distro names, or [] on any platform without WSL. Never raises."""
+    try:
+        import wslpath
+        return list(wslpath.distros() or [])
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+@app.route("/api/wsl-health", methods=["GET"])
+def api_wsl_health():
+    """Each installed WSL distro's /mnt/c health (wslfix.diagnose): is it the live Windows
+    drive, or a stale leftover that makes files written from Windows invisible inside WSL.
+    Read-only -- runs two `cat` reads per distro, starts and changes nothing. `fixable` is
+    whether the hub can repair it here (root reachable without a password)."""
+    try:
+        import wslfix
+    except Exception as e:                                       # noqa: BLE001
+        return jsonify({"available": False, "error": str(e), "distros": []})
+    rows = []
+    for d in _wsl_distros():
+        row = wslfix.diagnose(d)
+        if row.get("healthy") is False:
+            try:
+                row["fixable"] = wslfix.can_use_root(d)
+            except Exception:                                    # noqa: BLE001
+                row["fixable"] = False
+        rows.append(row)
+    return jsonify({"available": bool(rows) or os.name == "nt", "distros": rows})
+
+
+@app.route("/api/wsl-health/fix", methods=["POST"])
+def api_wsl_health_fix():
+    """Repair one distro whose /mnt/c is not the live drive (wslfix.apply): back up, flip
+    automount/interop on in /etc/wsl.conf, `wsl --shutdown`, verify. DESTRUCTIVE -- the
+    shutdown ends every WSL distro's processes -- so it needs `confirm: true`. When root is
+    not reachable without a password the hub changes NOTHING and returns a one-line command
+    the user runs themselves (`needs_manual`)."""
+    import wslfix
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    distro = body.get("distro")
+    if not distro or distro not in _wsl_distros():
+        return jsonify({"error": "unknown distro", "distros": _wsl_distros()}), 400
+    if body.get("confirm") is not True:
+        return jsonify({"error": "confirm must be true", "code": "confirm_required"}), 400
+    try:
+        result = wslfix.apply(distro, confirm=True)
+    except wslfix.WslFixError as e:
+        return jsonify({"error": e.message, "code": e.code}), 400
+    _log.info("[wsl-health] fix %s -> ok=%s code=%s", distro, result.get("ok"),
+              result.get("code"))
+    return jsonify(result), (200 if result.get("ok") or result.get("needs_manual") else 500)
+
+
 def _multi_parallel_status():
     info = swarm_windows.concurrency_info()
     info["setting"] = swarm_windows.parallel_cap()

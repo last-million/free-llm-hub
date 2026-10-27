@@ -300,6 +300,29 @@ def stop_examples(port="PORT", windows=None):
     ]
 
 
+_WSL_HEALTH_CACHE = {}           # distro -> (checked_at_monotonic, note)
+_WSL_HEALTH_TTL = 120.0          # seconds; diagnose() runs 2 wsl.exe reads, so cache it
+
+
+def _wsl_health_note(distro):
+    """A short warning (or "") when `distro`'s /mnt/c is not the live Windows drive
+    (wslfix.diagnose). Cached per distro for _WSL_HEALTH_TTL so a brief never runs the
+    wsl.exe reads more than once every couple of minutes. Fails open to "" -- a brief is
+    never blocked or broken by this."""
+    try:
+        import time as _t
+        import wslfix
+        now = _t.monotonic()
+        hit = _WSL_HEALTH_CACHE.get(distro)
+        if hit and now - hit[0] < _WSL_HEALTH_TTL:
+            return hit[1]
+        note = wslfix.brief_note([wslfix.diagnose(distro)])
+        _WSL_HEALTH_CACHE[distro] = (now, note)
+        return note
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 def wsl_section(project_dir):
     """The brief's block for a project that lives INSIDE WSL (a
     \\\\wsl.localhost\\<distro>\\... folder), or "" for any other folder. Any
@@ -313,13 +336,14 @@ def wsl_section(project_dir):
     if not p:
         return ""
     distro, linux = p
+    health = _wsl_health_note(distro)
     run = wslpath.run_hint(project_dir, "<command>")
     test = wslpath.run_hint(project_dir, "python3 -m pytest -q")
     serve = wslpath.run_hint(project_dir, "nohup <server command> > server.log 2>&1 & "
                                            "echo $! > %s" % PID_FILE)
     stop = wslpath.run_hint(project_dir, "kill $(cat %s)" % PID_FILE)
     nl = chr(10)
-    return nl.join([
+    return nl.join(([health, ""] if health else []) + [
         "## This project lives in WSL (%s: `%s`)" % (distro, linux),
         "",
         "- Your file tools read and write it through this Windows path; the "

@@ -5001,6 +5001,11 @@
       </select>
       <p class="sd-help" id="cm-approval-help">When a terminal CLI (opencode / codex / claude) picks the Multi tier, it runs real helper agents that edit files and run commands in the project folder.</p>
     </div>
+    <div class="sd-group" id="wsl-health-group" hidden>
+      <div class="sd-label">WSL health</div>
+      <p class="sd-help" id="wsl-health-status">Checking WSL&hellip;</p>
+      <div id="wsl-health-list"></div>
+    </div>
     <div class="sd-group sd-wide" id="heartbeats-group">
       <div class="sd-label">Heartbeats</div>
       <label><input type="checkbox" id="hb-enabled"> Let agents wake themselves on a schedule</label>
@@ -14927,6 +14932,57 @@
     });
   }
 
+  /* ---------- WSL health (Settings) ----------
+     A WSL distro whose /mnt/c is not the live Windows drive makes files written from
+     Windows invisible inside WSL. Detect is read-only; Fix is confirm-gated and restarts
+     every WSL distro (wsl --shutdown). Backend strings go in via textContent only. */
+  function wslFixOne(distro, btn){
+    if (!window.confirm('Fix ' + distro + '?\n\nThis backs up and turns the Windows drive mount '
+        + 'back on, then runs "wsl --shutdown" — which ENDS everything currently running in '
+        + 'EVERY WSL distro. Continue?')) return;
+    btn.disabled = true; btn.textContent = 'Fixing…';
+    api('/api/wsl-health/fix', { method: 'POST', body: { distro: distro, confirm: true } })
+      .then(function(r){
+        if (r && r.ok) toast('WSL: ' + distro + ' fixed — /mnt/c is the live drive now.');
+        else if (r && r.needs_manual) toast('WSL: run the command shown, then re-check.', true);
+        else toast('WSL fix failed: ' + ((r && (r.message || r.code)) || 'unknown'), true);
+        loadWslHealth(true);
+      })
+      .catch(function(e){ toast('WSL fix: ' + e.message, true); loadWslHealth(true); });
+  }
+  function renderWslHealth(r){
+    var grp = $('#wsl-health-group'), list = $('#wsl-health-list'), st = $('#wsl-health-status');
+    if (!grp || !list || !st) return;
+    var bad = ((r && r.distros) || []).filter(function(d){ return d && d.healthy === false; });
+    if (!bad.length){ grp.hidden = true; return; }
+    grp.hidden = false;
+    st.textContent = bad.length + ' WSL distro' + (bad.length === 1 ? '' : 's')
+      + ' cannot see the live Windows drive — files written from Windows never appear inside it.';
+    list.textContent = '';
+    bad.forEach(function(d){
+      var row = document.createElement('div'); row.className = 'sd-help';
+      var name = document.createElement('b'); name.textContent = d.distro + ': ';
+      row.appendChild(name);
+      row.appendChild(document.createTextNode('/mnt/c is not the live C: drive '
+        + '(automount=' + d.automount_enabled + '). '));
+      if (d.fixable){
+        var btn = document.createElement('button');
+        btn.className = 'btn'; btn.type = 'button'; btn.textContent = 'Fix it';
+        btn.addEventListener('click', function(){ wslFixOne(d.distro, btn); });
+        row.appendChild(btn);
+      } else {
+        row.appendChild(document.createTextNode('Needs a one-line command in a WSL terminal '
+          + '(root is not reachable without a password).'));
+      }
+      list.appendChild(row);
+    });
+  }
+  function loadWslHealth(silent){
+    return api('/api/wsl-health').then(renderWslHealth)
+      .catch(function(e){ if (!silent) toast('WSL health: ' + e.message, true);
+                          var g = $('#wsl-health-group'); if (g) g.hidden = true; });
+  }
+
   /* ---------- Heartbeats (Settings drawer) ---------- */
   function hbFmtWhen(t){ return esc(t.when || ''); }
   function renderHeartbeats(r){
@@ -16206,6 +16262,7 @@
     try { loadSkills(silent); } catch (e) {}
     try { loadCustomProviders(silent); } catch (e) {}
     try { loadLowres(silent); } catch (e) {}
+    try { loadWslHealth(silent); } catch (e) {}
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
     try { loadSdModels(silent); } catch (e) {}
