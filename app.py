@@ -4586,13 +4586,26 @@ def _long_ctx_band(pid, model):
         return 1
 
 
-def _prefer_fast_long_context(chain, est, keep_head=0):
+def _prefer_fast_long_context(chain, est, keep_head=0, tools=False):
     """For a request of >= LONG_CTX_SPEED_TOKENS, move hops MEASURED fast at
     long context ahead and hops measured slow behind the unmeasured ones --
     a stable reorder inside each last-resort class, so ranking still decides
     within a band and the _LOW_QUALITY_RE tail stays the tail. The first
     `keep_head` entries (a pinned model) never move. Below the threshold, or
-    with no long-context measurements at all, the chain is returned as is."""
+    with no long-context measurements at all, the chain is returned as is.
+
+    SPEED BREAKS TIES, IT DOES NOT BUY A LEAD (2026-10-27, flag
+    long_ctx_speed_within_band, default on). A hop measured FAST goes ahead of
+    unmeasured ones only when it is as good as the hop that would go next
+    (within _AUTO_TOP_BAND on the score the chain was ordered by:
+    _agentic_score on a tool turn, the learned score otherwise). MEASURED on the
+    owner's hub: a ~71K-token context-max request went to inception/mercury-3
+    (hub score 26, ~2 s) as its ONLY hop while dahl's GLM-5.3-Flash (133.6,
+    3-15 s, healthy) sat unmeasured behind it, and so did 24 of 29 OpenCode
+    requests. Only the model with fast big-request samples ever went first, so
+    no other model could earn one -- a loop. Measured-slow hops still go behind
+    the unmeasured ones (the timeout protection this rule exists for), and an
+    unmeasured model that proves slow is demoted by its first stall."""
     try:
         if int(_rr_fit(est) or 0) < LONG_CTX_SPEED_TOKENS or not chain:
             return chain
@@ -4600,18 +4613,58 @@ def _prefer_fast_long_context(chain, est, keep_head=0):
         bands = [_long_ctx_band(e[0], e[1]) for e in rest]
         if all(b == 1 for b in bands):
             return chain
+        within = bool(config.get_flag("long_ctx_speed_within_band", True))
         # Recent failures stay at the tail too (see _recent_hop_failure), and
         # a junk-benched pair behind everything, measured fast or not (see
         # _bench_last): speed is no reason to serve a model caught answering
         # garbage.
-        order = sorted(range(len(rest)),
-                       key=lambda i: (_is_pair_benched(rest[i][0], rest[i][1]),
-                                      _is_low_quality(rest[i][1]),
-                                      _recent_hop_failure(rest[i][0], rest[i][1]) is not None,
-                                      bands[i], i))
+        keys = [(_is_pair_benched(rest[i][0], rest[i][1]),
+                 _is_low_quality(rest[i][1]),
+                 _recent_hop_failure(rest[i][0], rest[i][1]) is not None,
+                 (bands[i] == 2) if within else bands[i]) for i in range(len(rest))]
+        order = sorted(range(len(rest)), key=lambda i: keys[i] + (i,))
+        if within:
+            order = _fast_among_equals(order, keys, rest, bands, tools)
         return head + [rest[i] for i in order]
     except Exception:                                            # noqa: BLE001
         return chain
+
+
+def _fast_among_equals(order, keys, rest, bands, tools):
+    """Inside each run of `order` that shares its class key (benched, low
+    quality, recent failure, measured-slow), let a hop measured FAST go before
+    the hop that would go next when it scores within _AUTO_TOP_BAND of it. A
+    run is walked in rank order; only a promotion changes anything, and a
+    hop whose score cannot be read is never promoted."""
+    def score(i):
+        try:
+            trip = (_benchmark_score(rest[i][0], rest[i][1]), rest[i][0], rest[i][1])
+            return _agentic_score(trip) if tools else _learned_score(trip)
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    out, run = [], []
+    for i in list(order) + [None]:
+        if i is not None and (not run or keys[i] == keys[run[0]]):
+            run.append(i)
+            continue
+        left = list(run)
+        while left:
+            nxt = left[0]
+            pick = nxt
+            if not keys[nxt][3]:                                 # not the measured-slow run
+                s0 = score(nxt)
+                if s0 is not None and bands[nxt] != 0:
+                    for j in left[1:]:
+                        if bands[j] == 0:
+                            sj = score(j)
+                            if sj is not None and sj >= s0 - _AUTO_TOP_BAND:
+                                pick = j
+                                break
+            out.append(pick)
+            left.remove(pick)
+        run = [i] if i is not None else []
+    return out
 
 
 def _note_ttft(resp, pid, model):
@@ -12164,7 +12217,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # _prefer_fast_long_context). A pinned model keeps hop one.
     chain = _prefer_fast_long_context(
         chain, est,
-        keep_head=1 if (pinned and chain and tuple(chain[0]) == (primary_pid, model_id)) else 0)
+        keep_head=1 if (pinned and chain and tuple(chain[0]) == (primary_pid, model_id)) else 0,
+        tools=bool(require_tools))
     # A CATEGORY MODE'S WAY OUT, after every in-mode hop (recent failures
     # included) and ahead of the paid subscriptions: the best few healthy
     # models the mode filtered out, one per provider (see _mode_fallback_tail).

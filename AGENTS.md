@@ -7724,3 +7724,57 @@ the page render + `node --check`; the node tests skip without node).
   like every other key field; a password manager may still offer to fill it.
   Not exercised in a real browser: node + fake DOM, the Flask render and
   `node --check` are the evidence.
+
+## Big requests: speed breaks ties, it does not buy a lead (2026-10-27)
+
+Covered by `tests/test_long_ctx_speed_within_band.py` (hermetic: fake scores, fake ledger).
+Owner: "is Mercury 3 our best model? why does it get used so much?" It is not: the hub
+scores `inception/mercury-3` at 26 (no board lists it yet; the hub's own notes put the
+Mercury family mid-tier) against ~134 for GLM-5.3 / DeepSeek V4.1 Flash. It is fast
+(~2 s to first content on tool turns) and 1M-context, and that is all.
+
+- **MEASURED on the live hub, 2026-10-27.** 24 of the last 29 OpenCode (`context-max`)
+  requests served by Mercury had it as their ONLY hop. One `context-max` tool request of
+  ~71K estimated tokens went to `inception/mercury-3` as its only hop (4.2 s); the same
+  mode, tools and system prompt with a small request went to `nvidia/z-ai/glm-5.3-flash`
+  first (it stalled, Mercury answered as hop 2) and a small real task to
+  `nvidia/minimax-m3.1-flash`. Only the SIZE differed. The hub's own saved speeds
+  (`learned-state.json`, tool-turn time to first content): Mercury ~1.7-4.7 s; nvidia
+  GLM-5.3 47-174 s (median ~115 s) and GLM-5.3-Flash 96-143 s, both stalled at long context;
+  nvidia GLM-5.3 and DeepSeek V4.1 Flash resting for hours after repeated deadlines; dahl's
+  GLM-5.3-Flash 133.6 / DeepSeek-V4-Flash 133.9 (3-15 s, quota not exhausted) and nvidia
+  minimax-m3.1-flash 99.1 (5-55 s) healthy but with NO long-context samples.
+- **Cause.** `_prefer_fast_long_context` (requests >= `LONG_CTX_SPEED_TOKENS` = 60K) sorted
+  the chain by (benched, low quality, recent failure, **speed band**, rank): band 0 =
+  measured fast at long size, 1 = unmeasured, 2 = measured slow. The band came BEFORE
+  rank, so the one model with fast big-request samples always went first whatever its
+  score, and no other model ever got a first try at that size to earn samples of its own.
+- **Fix** (flag `long_ctx_speed_within_band`, `config.get_flag`, default ON; off = the old
+  ordering byte for byte). Measured-slow hops still go behind the unmeasured ones (the
+  timeout protection this rule was built for), the low-quality tail, the junk bench and the
+  recent-failure tail are unchanged and a pinned head never moves. What changed: a hop
+  measured FAST goes ahead of the hop that would go next ONLY when it is as good as that hop
+  (within `_AUTO_TOP_BAND` on the score the chain was ordered by: `_agentic_score` on a tool
+  turn, `_learned_score` otherwise; `_fast_among_equals`). A score that cannot be read never
+  promotes. Reorder only. An unmeasured strong model that proves slow at long size is
+  demoted by its first stall (band 2 for `LONG_CTX_SPEED_TTL`, 6 h), so the price of letting
+  it try first is one hop budget, once.
+- **A wrong theory, recorded so nobody repeats it.** First guess: a short last message
+  ("continue" / "go") classifies as `simple` (difficulty is judged on the LAST user message,
+  `_latest_user_text`) and the quick-turn rule sends it to a cheap fast model. For `best` /
+  `max` / `<category>-max` requests that is NOT what happens: `quality_mode` already lifts
+  `simple` to `medium` (`_route_by_difficulty`), and a live `context-max` "continue"
+  probe's first pick was `nvidia/z-ai/glm-5.3-flash`, not Mercury. A change built on that
+  theory was written, found not to touch the observed behaviour and reverted before
+  commit. NOT measured: whether a short "continue" inside a running loop in plain `auto`
+  (Normal) mode takes the quick-turn path to a fast model; if the owner sees that, the
+  signal to use is two or more `role: "tool"` messages in the conversation (a one-call
+  trivial task has exactly one), on every protocol.
+- **Not changed, by design.** A session pin still holds its model for the 4 h pin TTL, so a
+  session that pinned Mercury before this fix keeps it until the pin expires or the
+  conversation ends. Mercury stays in every chain as a fast fallback. Qwen 3.8 on groq
+  (133.1, top band, ~8K request cap) is untouched.
+- Limits: the fix lets unmeasured models try first at big sizes, so it can cost one extra
+  slow hop the first time; the effect on real session mix is not yet measured (check
+  `/api/activity` rows for `context-max`: first hop should now be a strong model, with
+  Mercury appearing as hop 2+).
