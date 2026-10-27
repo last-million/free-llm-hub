@@ -7375,3 +7375,46 @@ by hand: back up the stale dir, flip both to true in wsl.conf as root (`wsl.exe 
   touches anything and hands the user the command. `wsl --shutdown` is machine-wide -- it restarts
   EVERY distro, not only the broken one -- which is why it is confirm-gated. The hub still runs no
   build/test itself inside WSL; this only repairs the mount so the agent's own commands work.
+
+## The completeness check: did this Build turn actually finish? (2026-10-27)
+
+Owner: after a relay's non-answer ended an agent's turn -- "the hub should be sure, like a human
+checker, whether it is finished or not yet, and if it stalled retry on the same model or another".
+Covered by `tests/test_stallcheck.py` (the decision) and `tests/test_stall_recheck.py` (the wiring,
+including a real chain of durable turns). Flag `stall_recheck` (`config.get_flag`, default ON; OFF =
+byte-identical).
+
+- **Scope: hub-owned Build turns only.** A plain terminal CLI (opencode/codex/claude in the user's own
+  terminal) is out of reach: the hub never started that process and has no channel into it, so it can
+  only refuse to SERVE a bad reply (answer_check / the stream peek). A Build conversation's turn is the
+  hub's own: `agentic_chat.send_message_stream_durable`'s durable thread calls the registered
+  `agentic_chat.set_turn_end_hook` once when the turn ENDS (after the reply is recorded, so it fires
+  whether or not a page is watching). A Multi conversation and a Multi helper are skipped -- they have
+  their own phase retries (`multi_auto_retry_failed`).
+- **`stallcheck.py`** (pure, no imports from the app): `assess(made_progress, answer_ok, errored,
+  attempts_used)` -> `Decision(retry, reason, switch_model, attempt)`. A real answer (with or without
+  tools) is DONE; an error switches model at once; an empty / unfinished turn retries on the SAME model
+  first, then switches. **At most `MAX_RETRIES` = 2 automatic retries per instruction**, then it stops and
+  leaves the turn to the user (`EXHAUSTED`).
+- **What counts as a real answer** (`app._stall_answer_ok`, a conservative reuse of the hub's own
+  detectors): NOT blank-after-thinking, an idle greeting, an upstream billing notice, "your message was
+  empty", a missing-capability refusal, or a bare announcement of a step never taken. A truthful
+  "I'm blocked because X" IS an answer and is never retried (a stalled model and an honest dead end look
+  alike; retrying the latter would waste tokens).
+- **Never retried:** a user Stop (reported as `stopped`, distinct from `errored` -- `interrupted` covers
+  both), a refused (409) turn, a turn when the conversation's spend cap is reached
+  (`_conversation_budget_block`) or the hub is draining for an update (`_UPDATE_DRAIN`).
+- **The retry** re-sends `_CONTINUE_TEXT` through `send_message_stream_durable` on its own thread (waits
+  for the ended turn to release the session), after a visible notice ("The agent stopped without
+  finishing (...) -- continuing automatically, retry N of 2 on the same/another model"). "Another model"
+  = `_session_pin_drop(session_id)`, so the router picks again. The retry's own turn end fires the hook
+  again; `_STALL_RETRIES[sid] = (original instruction, retries used, auto-send pending)` keeps the count
+  across the chain, a new human instruction resets it, and an exhausted count is KEPT so a repeat of the
+  same instruction cannot restart it. A finished or stopped chain leaves nothing behind.
+- **Proven bounded:** `test_the_whole_chain_is_bounded...` drives real durable turns into each other with a
+  CLI that never finishes: exactly 1 + 2 turns run and the second retry (only) drops the pin.
+  `tests/conftest.py` unhooks it for every other test file (a fake CLI's odd final replies would otherwise
+  trigger a real second turn).
+- **Limits.** Detects "did nothing / said nothing real / errored / announced and stopped" -- not "did the
+  wrong thing". Only `/mnt`-independent: it is about the turn, not the project. Terminal CLIs and Multi are
+  covered by other mechanisms, not this one. Not live until the hub restarts on this code.

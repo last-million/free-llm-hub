@@ -946,6 +946,19 @@ def set_goal_brief_source(fn):
     _goal_brief_source = fn if callable(fn) else None
 
 
+_turn_end_hook = None
+
+
+def set_turn_end_hook(fn):
+    """Register `fn(session_id, info)` (or None to clear), called once on the durable
+    thread when a Build turn ENDS, after the reply is recorded. `info` carries what the
+    turn did (final_reply, used_tools, observed, interrupted, rejected, errored,
+    instruction, cli, project_dir, quality). The app uses it for the completeness check.
+    It must return at once and never raise into the turn (the caller swallows anything)."""
+    global _turn_end_hook
+    _turn_end_hook = fn if callable(fn) else None
+
+
 def _goal_brief_section(project_dir):
     if _goal_brief_source is None:
         return ""
@@ -4719,6 +4732,7 @@ def send_message_stream_durable(session_id, text):
 
     def _run():
         final_reply = None
+        interrupted = False      # bound before the loop so the finally/hook never NameErrors
         _live_begin(session_id)
         # What the turn was doing, for the moment it does not finish: its
         # last tool calls and the text it had written. Filed by
@@ -4849,6 +4863,29 @@ def send_message_stream_durable(session_id, text):
             if began:            # never another turn's marker (see above)
                 try:
                     memory.end_inflight(session_id)
+                except Exception:                                # noqa: BLE001
+                    pass
+            # THE COMPLETENESS CHECK (app registers it): a human-like "did this turn
+            # actually finish, or stall?" look at the ended turn, which may schedule ONE
+            # bounded auto-retry. Runs here, on the durable thread, so it fires whether or
+            # not a page was watching. Never blocks the queue (it spawns its own thread) and
+            # never raises into the turn.
+            if _turn_end_hook is not None:
+                try:
+                    _turn_end_hook(session_id, {
+                        "cli": (sess_info or {}).get("cli"),
+                        "project_dir": project_dir,
+                        "quality": (sess_info or {}).get("quality"),
+                        "final_reply": final_reply,
+                        "used_tools": bool(tools_all),
+                        "observed": len(observed),
+                        "interrupted": bool(interrupted),
+                        "rejected": bool(rejected),
+                        # a user Stop is NEVER an error and NEVER retried; an error is
+                        "stopped": why[0] == "stopped",
+                        "errored": bool(interrupted and why[0] and why[0] != "stopped"),
+                        "instruction": text,
+                    })
                 except Exception:                                # noqa: BLE001
                     pass
             q.put(None)          # sentinel: no more events, thread is done

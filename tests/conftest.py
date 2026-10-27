@@ -391,6 +391,23 @@ def _multi_auto_retry_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stall_recheck_off_unless_tested(request, monkeypatch):
+    """THE COMPLETENESS CHECK (app._stall_on_turn_end, registered as agentic_chat's
+    turn-end hook; flag `stall_recheck`) is default ON, but it RE-SENDS Continue to a Build
+    session whose turn ended unfinished. Every other test file that drives a real durable
+    turn through a fake CLI (empty or odd final replies) pins the pre-feature behaviour --
+    one turn, no automatic second one -- so the hook is unhooked here. Its own file keeps it."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_stall_recheck":
+        try:
+            import agentic_chat
+            monkeypatch.setattr(agentic_chat, "_turn_end_hook", None)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
     """STAY IN THE CLI UNTIL THE RUN ENDS (app, flag `cli_multi_stay_live`) is
     default ON for opencode (2026-10-11), but the CLI-Multi test files pin the

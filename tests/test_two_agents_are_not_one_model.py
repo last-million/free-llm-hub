@@ -112,6 +112,18 @@ def test_it_never_invents_a_candidate():
     assert all(c in POOL for c in left)
 
 
+def test_the_log_says_when_a_pick_is_real_sharing():
+    """"pool 1, held elsewhere 2" was ambiguous: a worker taking the last FREE model and a worker
+    SHARING one logged the same. Only a model a sibling holds is sharing."""
+    taken = {A._normalize_model_identity("glm-5.3"), A._normalize_model_identity("kimi-k3")}
+    assert A._spread_shared_note("glm-5.3", taken) == ", SHARED with another live session"
+    assert A._spread_shared_note("nvidia/z-ai/glm-5.3", taken) != ""       # same model, other host
+    assert A._spread_shared_note("deepseek-v4.1-flash", taken) == ""        # took a free one
+    assert A._spread_shared_note("glm-5.3", set()) == ""
+    assert A._spread_shared_note("glm-5.3", None) == ""
+    assert A._spread_shared_note(None, taken) == ""                         # never raises
+
+
 def test_a_broken_pin_store_does_not_break_routing(monkeypatch):
     monkeypatch.setattr(A, "_pinned_elsewhere",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))

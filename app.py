@@ -9218,6 +9218,19 @@ def _spread_target_ok(c):
         return True
 
 
+def _spread_shared_note(model, taken):
+    """", SHARED with another live session" when `model` is one a sibling already holds, else
+    "". MEASURED 2026-10-27: "pool 1, held elsewhere 2" read as "all on one model" but is mostly
+    a worker taking the LAST FREE model (the logged pool is after the quality-band and
+    least-loaded-host narrowing, so it is nearly always 1); only a pick that lands on a model
+    another session holds is real sharing, and the log could not say which. Never raises."""
+    try:
+        return (", SHARED with another live session"
+                if _normalize_model_identity(model) in (taken or ()) else "")
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 def _spread_pool(pool, exclude_key=None):
     """`pool` with models other live conversations already hold, dropped --
     as long as what is left is comparable.
@@ -10237,9 +10250,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             _session_pin_set(_skey, pid, model)
             _note_worker_model(_skey, model, pid)
             _note_route_pick(pid)
-            _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
-                      (_skey or "-")[:8], pid, model, len(_pool),
-                      len(_pinned_elsewhere(_skey)))
+            _taken_now = _pinned_elsewhere(_skey)
+            _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d%s)",
+                      (_skey or "-")[:8], pid, model, len(_pool), len(_taken_now),
+                      _spread_shared_note(model, _taken_now))
         return pid, model, difficulty
     # ════════════════════════════════════════════════════════════════════════
     # CONVERSATION PIN FOR PLAIN CHAT. Agentic turns have had this since the
@@ -23888,6 +23902,153 @@ def _auto_continue_one(sid, plan, forced):
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[resume] %s could not continue by itself: %s",
                      sid[:12], _sanitize(str(exc), 160))
+
+
+# --------------------------------------------------------------------------- #
+# THE COMPLETENESS CHECK: did this Build turn actually finish? (stall re-check)
+# --------------------------------------------------------------------------- #
+# Owner (2026-10-27): after a relay's non-answer ended an agent's turn -- "the hub should be
+# sure, like a human checker, whether it is finished or not yet, and if it stalled retry on
+# the same model or another". A plain terminal CLI is out of reach (the hub never started that
+# process), but a hub-owned Build turn is not: its durable thread calls this hook when the
+# turn ENDS (agentic_chat.set_turn_end_hook). stallcheck.assess decides; this module reads
+# the turn into booleans and, at most STALL RETRIES times per instruction, re-sends Continue --
+# the first time on the same model, after that on another (the session pin is dropped so the
+# router picks again). A real answer, a user Stop, a Multi conversation/helper (their own
+# retries), an exhausted budget cap or an update drain is NEVER retried.
+import stallcheck                                          # noqa: E402
+
+_STALL_RETRIES = {}        # session id -> (original instruction, retries used[, auto-send pending])
+_STALL_LOCK = threading.Lock()
+
+
+def _stall_answer_ok(reply, instruction=""):
+    """Does the turn's last message read as a REAL, finished answer? False for: nothing,
+    only thinking, an idle greeting, an upstream billing notice, "your message was empty", a
+    missing-capability refusal, or a bare announcement of a step never taken. A truthful
+    "I'm blocked because X" IS an answer -- retrying it would be wrong. Never raises (False)."""
+    try:
+        if not isinstance(reply, str) or not reply.strip():
+            return False
+        text = reply.strip()
+        if answer_check.is_blank_after_thinking(text):
+            return False
+        for bad in (answer_check.is_idle_greeting(text, instruction),
+                    answer_check.is_empty_message_claim(text, instruction),
+                    answer_check.is_cannot_do_capability(text, instruction),
+                    answer_check.is_provider_notice(text, instruction, relay=True)):
+            if bad:
+                return False
+        if _ends_with_announcement(text):
+            return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _stall_prior(session_id, instruction):
+    """(original instruction, retries already used, was-it-our-own-retry) for this turn END.
+    A turn that ends because WE re-sent Continue belongs to the chain that sent it; any other
+    turn is a fresh instruction (the count restarts), unless it repeats the stored one."""
+    with _STALL_LOCK:
+        prev = _STALL_RETRIES.get(session_id)
+    if not prev:
+        return instruction, 0, False
+    orig, used = prev[0], int(prev[1])
+    ours = len(prev) > 2 and bool(prev[2])
+    if ours:
+        return orig, used, True
+    return (orig, used, False) if orig == instruction else (instruction, 0, False)
+
+
+def _stall_decide(session_id, info):
+    """stallcheck.Decision for one ended Build turn. Pure apart from reading the retry
+    count; never raises (a surprise = do not retry)."""
+    try:
+        if info.get("stopped") or info.get("rejected"):
+            return stallcheck.Decision(False, "stopped")
+        instruction = info.get("instruction") or ""
+        _orig, used, _ours = _stall_prior(session_id, instruction)
+        errored = bool(info.get("errored"))
+        made_progress = bool(info.get("used_tools") or info.get("observed"))
+        answer_ok = (not errored) and _stall_answer_ok(info.get("final_reply"), instruction)
+        return stallcheck.assess(made_progress, answer_ok, errored=errored, attempts_used=used)
+    except Exception:                                            # noqa: BLE001
+        return stallcheck.Decision(False, stallcheck.DONE)
+
+
+def _stall_send(session_id, text):
+    """Send `text` to a live Build session and drain the turn (so its own end-of-turn hook
+    runs). Waits briefly for the ended turn to release the session first."""
+    deadline = time.monotonic() + 20
+    while agentic_chat.turn_busy(session_id) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    for _ev in agentic_chat.send_message_stream_durable(session_id, text):
+        pass
+
+
+def _stall_on_turn_end(session_id, info, send=None, sync=False):
+    """The turn-end hook. Never raises, never blocks the turn (the re-send runs on its own
+    thread unless `sync`, which only the tests use)."""
+    try:
+        if not config.get_flag("stall_recheck", True):
+            return
+        if (info.get("quality") or "") == "multi" or swarm_windows.worker_info(session_id):
+            return          # a Multi conversation / helper has its own phase retries
+        d = _stall_decide(session_id, info)
+        instruction = info.get("instruction") or ""
+        orig, used, _ours = _stall_prior(session_id, instruction)
+        if not d.retry:
+            with _STALL_LOCK:
+                if d.reason == stallcheck.EXHAUSTED:
+                    # keep the spent count so a repeat of the SAME instruction cannot restart it;
+                    # a new instruction (the human's next move) resets it
+                    _STALL_RETRIES[session_id] = (orig, used, False)
+                else:
+                    _STALL_RETRIES.pop(session_id, None)
+            if d.reason == stallcheck.EXHAUSTED:
+                _log.info("[stall] %s still unfinished after %d automatic retries -- left to the "
+                          "user", str(session_id)[:12], used)
+            return
+        # never spend tokens past the owner's cap or while the hub is about to restart
+        if _conversation_budget_block(session_id) or _UPDATE_DRAIN.active():
+            return
+        with _STALL_LOCK:
+            _STALL_RETRIES[session_id] = (orig, d.attempt, True)
+        _log.info("[stall] %s turn did not finish (%s) -- retry %d of %d on %s model",
+                  str(session_id)[:12], d.reason, d.attempt, stallcheck.MAX_RETRIES,
+                  "another" if d.switch_model else "the same")
+        sender = send or _stall_send
+
+        def _go():
+            try:
+                if d.switch_model:
+                    _session_pin_drop(session_id)       # the router picks again next request
+                try:
+                    agentic_chat.live_notice(
+                        session_id,
+                        "The agent stopped without finishing (%s) -- continuing automatically, "
+                        "retry %d of %d on %s model." % (
+                            d.reason.replace("_", " "), d.attempt, stallcheck.MAX_RETRIES,
+                            "another" if d.switch_model else "the same"))
+                except Exception:                           # noqa: BLE001
+                    pass
+                sender(session_id, _CONTINUE_TEXT)
+            except Exception as exc:                        # noqa: BLE001
+                with _STALL_LOCK:
+                    _STALL_RETRIES.pop(session_id, None)
+                _log.warning("[stall] %s retry could not be sent: %s",
+                             str(session_id)[:12], _sanitize(str(exc), 160))
+        if sync:
+            _go()
+        else:
+            threading.Thread(target=_go, daemon=True,
+                             name="stall-" + str(session_id)[:8]).start()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+agentic_chat.set_turn_end_hook(_stall_on_turn_end)
 
 
 def _resume_interrupted_swarms():
