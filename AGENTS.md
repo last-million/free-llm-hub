@@ -7778,3 +7778,45 @@ Mercury family mid-tier) against ~134 for GLM-5.3 / DeepSeek V4.1 Flash. It is f
   slow hop the first time; the effect on real session mix is not yet measured (check
   `/api/activity` rows for `context-max`: first hop should now be a strong model, with
   Mercury appearing as hop 2+).
+
+## "Everything goes to Mercury": it was availability, and a category mode yields to the tool bar (2026-10-27)
+
+Covered by `tests/test_mode_yields_to_tool_bar.py` (13 tests, hermetic). Owner: "i see all requests go to
+mercrury wtf", then "the orchestrator should always be set automatically, best models available -- of
+course in intelligence available".
+
+- **MEASURED on the live hub after fe0117d** (activity rows + hub.log + a replica of the real router on a
+  COPY of the hub's state, `FREE_LLM_HUB_CONFIG` pointed at a temp folder): all 40 recent requests were one
+  OpenCode loop on `context-max`, each with exactly ONE hop, `inception/mercury-3`, 2-9 s. No `[spread]`
+  pick was logged for them. The orchestrator was NOT the cause (global `auto`; the per-conversation store
+  held only old `space-bunny` entries).
+- **Why: the strong models were failing, not out-ranked.** The hub's own ledgers at that moment: dahl
+  GLM-5.3-Flash 6 ok / 32 fail and DeepSeek-V4-Flash 0 / 27 (reliability band 2; a one-line pinned request
+  to either got `dahl: HTTP 429` and was served by groq instead), nvidia kimi-k2.6 0 / 29, nvidia GLM-5.3
+  and GLM-5.3-Flash resting 30 min after repeated hop-budget deadlines, g4f parked (4 of 4 keys rejected
+  401/403, so its three relay slots at the head of the chain are skipped without a call), and
+  mercury-3 39 ok / 0 fail. The replica with NO category restriction produced the same chain (g4f x3, Mercury,
+  zenmux, dahl 429, nemotron-vl which is not tool-capable): at ~62K tokens there was no healthy, strong,
+  tool-capable model anywhere for Mercury to be ranked behind. Request size was ~60-64K estimated but only
+  ~34-37K SENT after old-result clearing, so the long-context speed band (fe0117d) never engaged; that fix
+  addressed a real ordering flaw but not this traffic.
+- **A real gap found on the way, now closed (flag `mode_yields_to_tool_bar`, default on; off = the previous
+  behaviour exactly).** A category mode could put a model BELOW the tool bar (`_TOOLS_MIN_SCORE`, 90) in front
+  of a healthy model at or above it from outside the category: the router's `agentic = [score >= bar] or
+  pool` fell open to whatever the category had left, and `_mode_fallback_tail` (the mode's way out) is
+  appended after EVERY in-mode hop, score-10 ones included. `_mode_yields_to_tool_bar` (router) and
+  `_weak_mode_hops_behind_tail` (chain) apply one rule: the mode keeps a tool turn while it has a model that
+  clears the bar; once it has none, healthy out-of-category models that do clear it go first and the weak
+  category members become the last resort. Reorder only (nothing dropped), the primary never moves, tool-free
+  and trivial turns are untouched. Negative control: with both helpers neutralised exactly the two
+  bug-encoding tests fail. 1387 tests in the 67 routing-related files pass.
+- **What it did NOT change today**: in the live state above the way-out list was empty, so this rule alters
+  nothing yet; it applies the moment a healthy strong model exists outside the category.
+- **The fix for the symptom is provider-side**: dahl's 429s (its key allowance/rate on the account), g4f's
+  rejected keys, and nvidia's ~2 min first token on long tool turns. Reasons for dahl's 429 were not read.
+- **OpenRouter** (asked the same day): enabled, key ok, 168 of 200 daily requests left, 0 router picks since
+  the restart. Its free catalog is weak or excluded: nemotron-3-ultra is skipped, inkling, gemma-4,
+  north-mini-code, laguna, xing4.0, dots and lfm are on the owner's blocklist (verified), the rest score
+  <= 76 (`nemotron-3.5-super-vl` is a `-vl-` model, not routed for tool turns), and `stealth/space-bunny-alpha`
+  is no longer in the live catalog. The hub offers only its `:free` models by design.
+- **AgentRouter** stays removed (see "AgentRouter: removed"); its row sits in `retired_providers` with the keys.

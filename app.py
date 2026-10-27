@@ -10447,7 +10447,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # MODE: "use the coding models on this project" and the like. A filter, not
     # a rewrite of the blocked list -- see _MODE_SETTING. Fail-open, so a mode
     # whose models are all busy degrades to answering rather than to refusing.
+    _before_mode = cands
     cands = _apply_mode(cands)
+    if require_tools and cands is not _before_mode:
+        # ...but a mode left with nothing that clears the tool bar does not get to
+        # put a weak member in front of a healthy strong model outside it.
+        cands = _mode_yields_to_tool_bar(_before_mode, cands)
     if require_tools:
         # A tools request must never land on a completion-only model. FAIL-OPEN:
         # keep the unfiltered list if NO candidate is known tool-capable.
@@ -12225,7 +12230,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # The mode still owns every retry while it has a hop left; on a tool or
     # trivial turn the walk reaches this tail early only once each remaining
     # in-mode provider has stalled or failed its share (_ChainClock.walk).
-    for e in _mode_fallback_tail(_out_of_mode, seen, require_tools, require_vision):
+    _tail = _mode_fallback_tail(_out_of_mode, seen, require_tools, require_vision)
+    # ...with the in-mode hops under the tool bar behind the tail's strong ones
+    # (see _weak_mode_hops_behind_tail): a score-26 model must not answer first
+    # while a healthy 130 waits at the end of the chain.
+    chain, _tail = _weak_mode_hops_behind_tail(chain, _tail, require_tools)
+    for e in _tail:
         chain.append(e)
         seen.add(e)
     if require_tools:
@@ -28505,6 +28515,74 @@ def _apply_mode(cands, mode=None, key=lambda c: (c[1], c[2])):
         return cands
     kept = [c for c in cands if _mode_allows(m, *key(c))]
     return kept or cands
+
+
+# A CATEGORY MODE YIELDS TO THE TOOL BAR (2026-10-27). MEASURED, OpenCode on
+# `context-max`: all 40 requests since a restart were served by inception/mercury-3
+# (hub score 26, 39 ok / 0 fail) as their ONLY hop. The `context` category (known
+# window >= 400K) held only Mercury and zenmux's score-10 models as healthy members --
+# dahl answered HTTP 429 to everything, nvidia's GLM models rested after repeated
+# deadlines, g4f was parked -- while healthy strong models OUTSIDE the category existed
+# (groq/qwen3.8 answered in 1-2 s, nvidia minimax-m3.1-flash 99, freemodel DeepSeek 130).
+# Two gaps kept them behind Mercury: the router's `agentic = [score >= bar] or pool`
+# falls open to whatever the category left, and the chain's way out of a mode
+# (_mode_fallback_tail) is appended after EVERY in-mode hop, weak ones included.
+# Owner: "the orchestrator should always be set automatically, best models available --
+# of course in intelligence available".
+#
+# The rule: the mode still owns a tool turn while it has a model that clears
+# _TOOLS_MIN_SCORE; once it has none, healthy out-of-category models that do clear it go
+# first and the weak category members become the last resort. Reorder only: nothing is
+# dropped, the primary always opens, tool-free and trivial turns are untouched.
+# Flag mode_yields_to_tool_bar (default on); off = the previous behaviour exactly.
+_MODE_YIELD_NOTE_EVERY = 60.0
+_mode_yield_noted = {}
+
+
+def _mode_yields_to_tool_bar(before, after):
+    """`after` (the candidates a category mode kept) unless it holds nothing at or
+    above the tool-turn bar while `before` (the same list before the mode) does --
+    then `before`, and the caller's own bar filter picks the best of the rest.
+    Never raises (the mode's pick stands on any error)."""
+    try:
+        if not config.get_flag("mode_yields_to_tool_bar", True):
+            return after
+        if any(c[0] >= _TOOLS_MIN_SCORE for c in after):
+            return after
+        if not any(c[0] >= _TOOLS_MIN_SCORE for c in before):
+            return after
+        mode = _active_mode()
+        now = time.monotonic()
+        if now - _mode_yield_noted.get(mode, -1e9) >= _MODE_YIELD_NOTE_EVERY:
+            _mode_yield_noted[mode] = now
+            _log.info("[mode] %s: no model in the category clears the tool bar (%d); "
+                      "the best healthy model outside it leads this turn",
+                      mode, int(_TOOLS_MIN_SCORE))
+        return before
+    except Exception:                                            # noqa: BLE001
+        return after
+
+
+def _weak_mode_hops_behind_tail(chain, tail, require_tools):
+    """(chain, tail) with the in-mode hops under the tool bar moved behind the tail's
+    hops at or above it, when there is at least one such hop. `chain[0]` (the primary)
+    never moves; tool turns only, and not a trivial one (those walk quick models first
+    on purpose). Both returned lists together hold exactly what the inputs held."""
+    try:
+        if not (require_tools and chain and tail) or _simple_turn():
+            return chain, tail
+        if not config.get_flag("mode_yields_to_tool_bar", True):
+            return chain, tail
+        good = [e for e in tail if _benchmark_score(e[0], e[1]) >= _TOOLS_MIN_SCORE]
+        if not good:
+            return chain, tail
+        weak = [e for e in chain[1:] if _benchmark_score(e[0], e[1]) < _TOOLS_MIN_SCORE]
+        if not weak:
+            return chain, tail
+        kept = [e for e in chain if e not in weak]
+        return kept, good + weak + [e for e in tail if e not in good]
+    except Exception:                                            # noqa: BLE001
+        return chain, tail
 
 
 _BLOCKED_SETTING = "blocked_models"
