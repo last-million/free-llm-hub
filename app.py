@@ -9062,6 +9062,49 @@ def _session_key(messages):
         return None
 
 
+def _agent_pin_key(messages):
+    """The key an agent's model PIN is held under -- the hub's own session id first, then the
+    request's conversation (ctxwin.conversation_key via ctxwin.pin_key), then the old content hash.
+
+    PARALLEL AGENTS USED ONE MODEL (owner, 2026-10-27). `_session_key` hashes the system prompt and
+    the first USER message, and the first user message of a Codex session is AGENTS.md plus the
+    environment block (4-17K chars, 0.4-2.4K) while Claude Code's is the CLAUDE.md
+    <system-reminder> (500K chars on the owner's machine) with the question AFTER it: identical for
+    every session in a folder, and the hash only reads the first 4000 characters. Measured on the
+    owner's real transcripts: 6 Claude Code sub-agents = ONE old key, 22 Codex sub-agent rollouts of
+    one folder = 2. One key is one pin is one model, and the spread could not see a sibling that
+    was "itself". The conversation key skips those wrapper blocks (is_real_instruction) and prefers
+    the CLI's own session id, which also survives the CLI compacting its history.
+
+    The ids and the request's messages come from `_ctx_begin`, which every /v1 handler runs before
+    it routes. A call with other messages (the recap, fact-extraction, prompt-enhancement and
+    intent helpers route from inside a request) or none (worker threads, direct callers) keeps the
+    old key, so a helper never inherits the conversation's pin. Setting flag `agent_pin_key`
+    (default on) off = the old key for everyone.
+
+    ONLY THE AGENTIC PIN USES IT. The plain-chat pin (`_ckey`) stays on `_session_key`: a tool-free
+    side request of an agent (a title, a CLI's own compaction call, a tool-free "continue") would
+    otherwise land on the agent's pin under the same key, and `_session_pin_set(..., agentic=False)`
+    OVERWRITES that row -- the agent would lose its hold and its model. Tool-free requests take the
+    single best model anyway (route_always_best), so they have nothing to spread."""
+    sid = _build_sid()
+    if sid:
+        return sid
+    try:
+        if config.get_flag("agent_pin_key", True):
+            pin = _ctx_g("_ctx_pin_key")
+            ref = _ctx_g("_ctx_pin_msgs")
+            if pin and ref is not None:
+                if ref is messages:
+                    return pin
+                fb = ctxwin.fallback_conversation_key(messages)
+                if fb is not None and fb == ctxwin.fallback_conversation_key(ref):
+                    return pin
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _session_key(messages)
+
+
 _SAME_HOST_EPS = 0.02   # headroom fractions this close count as tied
 # How far a host may score BELOW the best host of the same model and still take
 # an equal share of it. Sized deliberately between the two things that separate
@@ -10094,8 +10137,11 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # first user turn was the only handle before every CLI carried its
         # session on the URL; it changes when the CLI compacts its history
         # (a new "first" turn, a new key, a new model mid-job) and it cannot
-        # be released when the session ends. The hub's own id does both.
-        _skey = _build_sid() or _session_key(messages)
+        # be released when the session ends. The hub's own id does both, and
+        # `_agent_pin_key` gives a terminal CLI the same footing (its own session
+        # id, else a hash of its first REAL instruction) so parallel Codex /
+        # Claude Code sessions in one folder stop sharing ONE pin and one model.
+        _skey = _agent_pin_key(messages)
         _pinned = _session_pin_get(_skey)
         # A PIN MUST NOT OUTLIVE THE WINDOW. MEASURED 2026-10-08, session
         # c39a30c1 (~504K tokens): pinned to uncloseai/Qwen3.8-27B (65K, "pool
@@ -13744,6 +13790,14 @@ def _ctx_begin(body, messages, est, signal=True):
     except Exception:                                            # noqa: BLE001
         conv = None
     _ctx_set("_ctx_conv", conv)
+    # The key this request's model pin lives under (_agent_pin_key reads both back and only
+    # trusts them for these very messages).
+    try:
+        pin = ctxwin.pin_key(conv, request.headers, messages)
+    except Exception:                                            # noqa: BLE001
+        pin = None
+    _ctx_set("_ctx_pin_key", pin)
+    _ctx_set("_ctx_pin_msgs", messages)
 
 
 def _ctx_fixed_part_est(messages, body):

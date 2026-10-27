@@ -1091,22 +1091,37 @@ def _session_from_metadata(meta):
     return None
 
 
-def fallback_conversation_key(messages):
+def fallback_conversation_key(messages, tail=0, min_chars=0):
     """A stable id for a conversation that carries none: its system prompt head
     plus its first REAL instruction (Codex's AGENTS.md / environment blocks are
-    identical for every session in a folder, so they alone would collide)."""
-    sys_head, first = "", ""
+    identical for every session in a folder, so they alone would collide).
+
+    `tail` > 0 also reads the last `tail` characters of an instruction longer than the 2000
+    that are hashed from the head: agents a lead started from ONE template (a long shared
+    preamble, then each one's own task) differ only there. An instruction that fits the head
+    window hashes exactly as it always did, so the recap keys already stored stay valid.
+
+    `min_chars` > 0 returns None when the system head and first instruction together are
+    shorter than that: too little to tell one conversation from another (the old
+    `_session_key` used 16)."""
+    sys_head, first, last = "", "", ""
     for m in messages or []:
         if not isinstance(m, dict):
             continue
         if m.get("role") == "system" and not sys_head:
             sys_head = message_text(m)[:2000]
         elif is_real_instruction(m):
-            first = instruction_text(message_text(m))[:2000]
+            whole = instruction_text(message_text(m))
+            first = whole[:2000]
+            if tail and len(whole) > 2000:
+                last = whole[-int(tail):]
             break
     if not first and not sys_head:
         return None
-    h = hashlib.sha256((sys_head + "\x00" + first).encode("utf-8", "replace"))
+    if min_chars and len((sys_head + "\x00" + first).strip()) < min_chars:
+        return None
+    basis = sys_head + "\x00" + first + ("\x00" + last if last else "")
+    h = hashlib.sha256(basis.encode("utf-8", "replace"))
     return "h:" + h.hexdigest()[:32]
 
 
@@ -1136,6 +1151,50 @@ def conversation_key(headers=None, body=None, agent_sid=None, messages=None):
         if sid:
             return "meta:" + sid
     return fallback_conversation_key(messages)
+
+
+# Session-id headers whose id is ALSO sent by the other agents of the same conversation. MEASURED
+# 2026-10-27 in the owner's own Claude Code transcripts: every Task sub-agent request carries the
+# PARENT's sessionId (6 sub-agents + their parent = one id, seven different first instructions).
+# Every other id source above names one agent: a hub agent session, an OpenCode session (a child
+# session has its own id), a Codex thread (prompt_cache_key; a sub-agent thread has its own id --
+# the rollouts' per-thread `id`, not yet seen on the wire for a sub-agent, see AGENTS.md).
+SHARED_ID_HEADERS = ("X-Claude-Code-Session-Id",)
+PIN_TAIL_CHARS = 1000      # see fallback_conversation_key(tail=)
+PIN_MIN_CHARS = 16         # under this a content-made key identifies nothing (as _session_key's rule)
+
+
+def pin_key(conv, headers=None, messages=None):
+    """The key a MODEL PIN (and the spread across concurrent agents) is held under, from the
+    request's `conversation_key` -- never a second identity function.
+
+    A key that names ONE agent is used as it is: it does not move while the history grows nor when
+    the CLI compacts it, so an agent keeps its model for the whole job. A session id that other
+    agents of the conversation carry too (SHARED_ID_HEADERS, Claude Code's metadata.user_id) gets
+    the agent's own first real instruction on top, so the sub-agents of one session are told apart;
+    the price is one re-pick when a CLI compaction replaces that first instruction. Opaque and
+    short (20 hex), like the hub's session ids in the logs. None when there is no basis."""
+    if not conv or not isinstance(conv, str):
+        return None
+    shared = conv.startswith("meta:")
+    if conv.startswith("hdr:") and headers is not None:
+        for name in SHARED_ID_HEADERS:
+            try:
+                if headers.get(name):
+                    shared = True
+                    break
+            except Exception:                                    # noqa: BLE001
+                pass
+    basis = conv
+    if shared or conv.startswith("h:"):
+        # a key made of content needs enough of it to mean something (`_session_key`'s old 16)
+        fb = fallback_conversation_key(messages, tail=PIN_TAIL_CHARS,
+                                       min_chars=PIN_MIN_CHARS if conv.startswith("h:") else 0)
+        if conv.startswith("h:") and not fb:
+            return None
+        if fb:
+            basis = fb if conv.startswith("h:") else conv + "|" + fb
+    return hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:20]
 
 
 def message_hash(msg):

@@ -7418,3 +7418,111 @@ byte-identical).
 - **Limits.** Detects "did nothing / said nothing real / errored / announced and stopped" -- not "did the
   wrong thing". Only `/mnt`-independent: it is about the turn, not the project. Terminal CLIs and Multi are
   covered by other mechanisms, not this one. Not live until the hub restarts on this code.
+
+## Parallel agents use different models (2026-10-27)
+
+Owner: "when it runs many sub-agents at once they use the same model; it should work perfectly in all
+modes, categories, efforts and in all supported CLIs." Covered by
+`tests/test_parallel_agents_diversity.py` (129 tests) and `tests/test_two_agents_are_not_one_model.py`.
+New names: `app._agent_pin_key`, `ctxwin.pin_key`, `ctxwin.SHARED_ID_HEADERS`, `ctxwin.PIN_TAIL_CHARS`,
+`ctxwin.PIN_MIN_CHARS`, `fallback_conversation_key(messages, tail=0, min_chars=0)`,
+`g._ctx_pin_key` / `g._ctx_pin_msgs` (set by `_ctx_begin`).
+
+- **Measured (the owner's own captures, structure and lengths only, 2026-10-27).**
+  Claude Code's transcript holds the model-facing requests: `system` is a LIST of three text blocks;
+  the first user message is [CLAUDE.md `<system-reminder>` (515K-547K chars on this machine), two more
+  `<system-reminder>`s (1.3K, 0.6K), slash-command echoes, the question LAST]. Its six Task
+  sub-agents send the PARENT's `sessionId` with a 3.4K-5.8K-char task prompt of their own. Run through
+  the hub's real conversion: the old `_session_key` gives the six sub-agents ONE key (the parent another,
+  because its system prompt differs); `ctxwin.fallback_conversation_key` gives 7 of 7 distinct.
+  Codex's rollouts (`~/.codex/sessions`, 123 rollouts): developer message with two parts, then ONE user
+  message with two parts [the AGENTS.md block 3.9K-17.9K, `<environment_context>` 0.4K-2.4K], then the
+  task as its own user message. 22 sub-agent rollouts of one folder: 2 old keys, 18 conversation-hash keys,
+  22 thread ids. The old key hashes `system[:4000] + first user message[:4000]`: for both CLIs that is
+  wrapper text, identical for every session in a folder.
+- **Root cause (confirmed).** `_skey = _build_sid() or _session_key(messages)` keyed the model pin.
+  One key = one pin = one model, and `_pinned_elsewhere(own_key)` skips the caller's own key, so the spread
+  never saw a sibling that shared it. opencode (question first, own session ids) was never affected, which
+  is why only codex and Claude Code collapsed.
+- **The fix.** One function, `_agent_pin_key(messages)`: the hub's own agent session id first (unchanged),
+  then `ctxwin.pin_key(conversation_key(...))`, then the old content hash. `_ctx_begin` (which every /v1
+  handler runs before it routes) computes the conversation key once and stashes the pin key plus the
+  messages list it belongs to; `_agent_pin_key` trusts it only for those very messages (identity, else equal
+  `fallback_conversation_key`). Helper calls that route from inside a request with their own messages (recap,
+  fact extraction, intent, prompt enhancement, swarm stages) and direct callers keep the old key, so a
+  helper never inherits the conversation's pin.
+  - **Only the AGENTIC pin (`_skey`) uses it. The plain-chat pin (`_ckey`) stays on `_session_key`, on
+    purpose** (found in review, reproduced, then pinned by 12 tests). With the same key, a tool-free side
+    request of an agent (a title, a CLI's own compaction call; for a hub `/build/<sid>` worker, any tool-free
+    call under its id) seeds the agent's pin from the always-best chat path, and `_session_pin_set(...,
+    agentic=False)` overwrites an existing row: the agent loses its hold and its model. With the switch, the
+    "tool-free request BEFORE the agentic turn" cells collapsed for opencode, codex, Claude Code and the
+    Build/Multi worker. Cost of keeping `_ckey` as it was: a tool-free turn of an agentic conversation no
+    longer finds the agent's pin and takes the single best model (tool-free turns are side tasks, and take the
+    best anyway).
+  - Quality rules are untouched: nothing here changes `_AUTO_TOP_BAND`, `_SPREAD_MAX_DROP`, the floors or the
+    order of the pick; only WHICH key a pin sits under.
+  - A key that names one agent is used as is (opencode `X-Session-Id`, codex `prompt_cache_key`, any body
+    id): it does not move while the history grows nor when the CLI compacts.
+  - An id other agents share (`SHARED_ID_HEADERS` = `X-Claude-Code-Session-Id`, and Claude Code's
+    `metadata.user_id`) gets the agent's first REAL instruction hash on top, so the sub-agents of one session
+    are told apart.
+  - The instruction hash for those two shapes and for no-id CLIs also reads the LAST `PIN_TAIL_CHARS`
+    (1000) of an instruction longer than the 2000-char head window, because agents a lead starts from one
+    template differ only there. An instruction that fits the head window hashes exactly as before, so the
+    stored recap keys stay valid (pinned by a test).
+  - A key made of content only (no session id) needs the minimum the old key had: 16 characters of system head +
+    first instruction (`PIN_MIN_CHARS`). Under it there is no key, as before, so a bare "hi" is not pinned
+    alongside every other "hi". A session id is a basis whatever the content.
+  - Result: opaque 20-hex keys (the `[spread]` log shows `key[:8]`; a readable `hdr:ses_..` prefix would have
+    made every opencode session print the same eight characters).
+- **Flag** `agent_pin_key` (`config.get_flag`, default ON). Off = `_session_key` for everyone, byte for byte.
+  Negative controls: with it off, 61 of the 129 tests fail (every codex / Claude Code cell collapses to one
+  model); with `_ckey` switched to `_agent_pin_key`, 8 of the 12 side-request cells fail; as shipped, all pass.
+- **What the harness proves.** Six concurrent sessions per cell through the REAL handlers
+  (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`) against a fake upstream and a fake healthy fleet:
+  every mode (auto, best, swarm, multi) x CLI, every category x CLI, the compound ids and codex's
+  (category, reasoning level) pairs, simultaneous starts, streams, identical prompts with distinct ids, Claude
+  Code sub-agents on one id (plain and from a shared template, and with a 520K-char CLAUDE.md block), the
+  key staying put as the history grows, and coherence (a session keeps its model on turn 2). Tool-free side
+  requests carrying the agent's own session id, before, after and around its agentic turns, for opencode,
+  codex, Claude Code and a hub worker: diversity holds, every pin stays agentic and does not move.
+  Quality is asserted per cell: no session is served more than `_SPREAD_MAX_DROP` under the best model of
+  its pool and the weak tail never serves while the band has room.
+- **What it only simulates.** The fleet, scores and upstream are synthetic (the plumbing, not a live
+  provider). Request shapes for codex and Claude Code were checked against the captures above;
+  opencode, the "kimi-like" no-id CLI and "bare-wrapped" are modelled from the hub's own notes, not
+  captured. The CLI Multi tier is stubbed (`_cm_multi_cli_intercept`): a terminal Multi run is a
+  `swarm_windows` run whose helpers reach the router as `/build/<sid>` sessions, covered by the
+  "6 workers of one run" test and the worker side-request cells, not by pins.
+- **By-design cells (cannot reach 6 distinct, and must not be "fixed").** (1) A category with fewer
+  than six members in the fleet reaches min(6, members). OBSERVED counts in this fleet (the oracle is only
+  a FLOOR, computed from the real `_mode_allows` and `_may_lead_pool`: it printed expected >= 1 for
+  `reasoning`, `fast`, `uncensored` and `seo`, >= 4 for `context`, >= 2 for `vision`): `reasoning` 1, `fast` 1
+  (one member each), `uncensored` 2, `vision` 3, `context` 5, and `seo` 6 (its single named member fails
+  open to the whole fleet, so the oracle's 1 is not what the router does). (2) A tool-free request takes
+  the single best model (`route_always_best`, default on): plain chat has no sessions to spread, and
+  sub-agents always carry tools. (3) A fleet degraded all at once collapses onto the one model that works.
+  (4) The weak tail (128 / 121 / 110) never serves while the band has room.
+- **Limits.**
+  - Compaction (DEVIATES from "the key stays put across a CLI's own compaction"): an agent whose key comes
+    from content is re-picked ONCE when its CLI replaces the first instruction by a summary, and keeps the
+    new key afterwards. That covers a CLI with no session id AND every Claude Code agent, the MAIN session
+    included (all of them need the instruction hash, because the sub-agents share its id). Pinned by a test
+    so it stays a decision, not a surprise. Agents with their own id (opencode, codex) keep their key through
+    compaction. A safe bridge would need a signal that a new first instruction is the old agent's summary
+    and not a new sibling; none was found.
+  - UNVERIFIED: that a Codex sub-agent sends its OWN thread id as `prompt_cache_key`. The rollouts show a
+    sub-agent has its own `id` and the parent's `session_id`; the hub's recap store holds no `pck:` key to
+    compare. If codex sends the parent's, codex sub-agents share one pin (no worse than before); the fix is one
+    line in `ctxwin.pin_key` (treat `pck:` as shared) and costs the compaction stability for codex.
+  - A pin of a finished terminal session still holds its model in `_pinned_elsewhere` until the 4-hour pin
+    TTL (a terminal CLI gives no end signal; Build sessions are released). Before this change codex / Claude
+    Code sessions collapsed to one pin so this was invisible; now each leaves one, like opencode always did.
+    The spread is fail-open and capped at `_SPREAD_MAX_DROP`, but many short sessions can steer a new one off
+    the very best model for a while. A bounded follow-up (not done): stop counting a pin that has not been
+    used for ~30 minutes as "held".
+  - Cost: `fallback_conversation_key` takes ~9 ms on the owner's 530K-char worst case, ~0.1 ms on a 6 KB
+    CLAUDE.md. Requests with their own unshared id pay nothing; Claude Code and no-id CLIs pay one extra
+    hash per `_ctx_begin` (called up to twice per request).
+  - Two sessions with the same prompt and NO id of any kind still share a key: there is nothing to tell them apart.

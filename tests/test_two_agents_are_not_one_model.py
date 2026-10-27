@@ -188,9 +188,28 @@ def test_a_finished_worker_releases_its_model():
 
 def test_the_pin_is_keyed_by_the_session_when_there_is_one():
     """The hub's own id survives the CLI compacting its history (which changed
-    the hashed key, and the model, mid-job) and can be released."""
+    the hashed key, and the model, mid-job) and can be released. Since 2026-10-27
+    the router asks ONE function, `_agent_pin_key`: the hub's session id first,
+    then the request's conversation key (the CLI's own session id, else a hash
+    of the first REAL instruction), and the old content hash last."""
     src = open("app.py", encoding="utf-8").read()
-    assert "_skey = _build_sid() or _session_key(messages)" in src
+    # the AGENTIC pin is keyed by it. The plain-chat pin deliberately stays on the content hash:
+    # a tool-free side request of an agent sharing the agent's key would overwrite its pin row
+    # with agentic=False (see `_agent_pin_key`'s docstring and the side-request tests in
+    # test_parallel_agents_diversity.py)
+    assert "_skey = _agent_pin_key(messages)" in src
+    assert "_ckey = _session_key(messages)" in src
+    assert "_build_sid() or _session_key(messages)" not in src
+    body = src[src.index("def _agent_pin_key("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert (body.index("_build_sid()") < body.index('_ctx_g("_ctx_pin_key")')
+            < body.rindex("return _session_key(messages)")), "order: hub id, conversation, old hash"
+    # and behaviourally: the hub's own id wins over any conversation key the request carried
+    body_json = {"messages": [{"role": "user", "content": "x" * 40}], "prompt_cache_key": "t-1"}
+    with A.app.test_request_context("/v1/chat/completions", json=body_json,
+                                    environ_base={"flh.build_session": "w-9"}):
+        A._ctx_begin(body_json, body_json["messages"], 10, signal=False)
+        assert A._agent_pin_key(body_json["messages"]) == "w-9"
 
 
 def test_spreading_does_not_reach_down_to_junk():
