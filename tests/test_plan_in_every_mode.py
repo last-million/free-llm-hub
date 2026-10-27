@@ -107,4 +107,5 @@ def test_the_budget_still_holds():
                  "create a landing page for my saas",
                  "build me a restaurant website"))
     # 0.135 since DESIGN DECISIONS FIRST + the anti-slop list (2026-10-04).
-    assert worst / 4 < 32768 * 0.135, "briefs cost ~%d tokens" % (worst // 4)
+    # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (see test_craft_briefs).
+    assert worst / 4 < 32768 * 0.16, "briefs cost ~%d tokens" % (worst // 4)

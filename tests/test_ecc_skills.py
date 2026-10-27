@@ -191,7 +191,8 @@ def test_worst_case_with_all_ecc_enabled_stays_under_ceiling():
             "build and deploy a secure rest api with tdd, a security review, "
             "e2e playwright tests, backend and frontend react patterns, api design",
             "set up tdd with test coverage and run a security review for auth"))
-        assert worst / 4 < 32768 * 0.135, "ECC pushed briefs to ~%d tokens" % (worst // 4)
+        # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (see test_craft_briefs).
+        assert worst / 4 < 32768 * 0.16, "ECC pushed briefs to ~%d tokens" % (worst // 4)
     finally:
         craft.set_skill_source(app._skill_source)
 

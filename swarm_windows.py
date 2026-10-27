@@ -616,7 +616,9 @@ _WEB_PLAN_ASK = """
 WEB/UI GOAL: "design" must also carry "visual", chosen for THIS product (no defaults):
 "visual": {"palette": ["#hex role", ...4-6, text >=4.5:1], "type": "display face + body face",
  "layout": "the composition and why this product needs it, not hero+3 cards+CTA",
- "motion": "what moves + reduced-motion fallback", "copy": "where the real words come from"}.
+ "motion": "hero mouse-depth + idle loop, transitions between sections, reduced-motion fallback",
+ "images": "image plan: role, source (generated / own SVG / licensed), size, format",
+ "icons": "a custom SVG set for this niche", "copy": "where the real words come from"}.
 """
 
 

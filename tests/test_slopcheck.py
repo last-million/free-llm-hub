@@ -217,7 +217,9 @@ def test_the_sloppy_page_trips_every_rule():
 
 
 def test_the_crafted_page_is_clean():
-    found = S.check_files([("index.html", GOOD)])
+    # a clean page preloads its first-view image (rule no_preload, 2026-10-27)
+    page = GOOD.replace("</head>", '<link rel="preload" as="image" href="oven.webp" fetchpriority="high"></head>', 1)
+    found = S.check_files([("index.html", page)])
     assert found == [], found
     assert S.summary(found) == {"score": 100, "high": 0, "medium": 0, "low": 0,
                                 "line": "Slop check: 100/100 -- nothing found"}
@@ -245,6 +247,7 @@ def test_where_points_at_the_line():
 # --------------------------------------------------------------------------- #
 
 HTML_HEAD = ('<!doctype html><html><head><meta name="viewport" content="width=device-width">'
+             '<link rel="preload" as="image" href="x.webp" fetchpriority="high">'
              '</head><body>%s</body></html>')
 
 
@@ -487,6 +490,8 @@ GOOD_SPEC = """Visual decisions
 - type: Libre Caslon Text for headings, Work Sans for body
 - layout: an editorial two-column hero (the oven photo right, opening hours left) because regulars come for the hours; the menu is a priced list, not cards
 - motion: one rise on the hero line, list items slide in; static under prefers-reduced-motion
+- images: six photographs of the wood oven and loaves in one warm light, WebP with srcset
+- icons: a custom SVG set drawn from the bakery trade (wheat ear, peel, loaf scoring)
 - copy: the owner's own menu, prices and story from the brief; anything missing is [NEEDS INPUT]
 No purple gradient anywhere, and not Inter."""
 
@@ -496,7 +501,8 @@ def test_a_sloppy_spec_is_named_choice_by_choice():
     by = {f["rule"]: f["severity"] for f in found}
     assert by == {"default_gradient": "high", "vague_style": "high", "no_palette": "high",
                   "no_type_pairing": "high", "stock_skeleton": "medium",
-                  "no_layout_concept": "medium", "no_copy_source": "medium"}
+                  "no_layout_concept": "medium", "no_copy_source": "medium",
+                  "no_motion_plan": "medium", "no_image_plan": "medium", "no_icon_plan": "low"}
     assert all(f["where"] == "design" and f["fix"] for f in found)
 
 
@@ -560,6 +566,8 @@ GOOD_PLAN = {
                           "type": "Libre Caslon Text for headings, Work Sans for body",
                           "layout": "editorial two-column hero with the opening hours, because regulars come for them",
                           "motion": "one rise on the hero line; static under reduced motion",
+                          "images": "six photographs of the oven in one warm light, WebP with srcset",
+                          "icons": "a custom SVG set drawn from the bakery trade",
                           "copy": "the owner's menu, prices and story from the brief; gaps are [NEEDS INPUT]"}},
     "phases": [
         {"title": "Markup", "files": ["index.html"],
@@ -583,7 +591,8 @@ def test_a_web_plan_with_slop_gets_replan_findings_for_the_highs():
     assert {f["rule"] for f in slop if f["action"] == "replan"} == {
         "default_gradient", "vague_style", "no_palette", "no_type_pairing"}
     assert {f["rule"] for f in slop if f["action"] == "warn"} == {
-        "stock_skeleton", "no_layout_concept", "no_copy_source"}
+        "stock_skeleton", "no_layout_concept", "no_copy_source",
+        "no_motion_plan", "no_image_plan", "no_icon_plan"}
     assert all(f["text"].startswith("design: ") and f["fix"] for f in slop)
     ask = plan_check.replan_ask(WEB_GOAL, [f for f in slop if f["action"] == "replan"],
                                 _phases(SLOPPY_PLAN), SLOPPY_PLAN["design"])
@@ -621,7 +630,7 @@ def test_the_web_design_switch_turns_the_check_off(monkeypatch):
 def test_the_visual_decisions_survive_normalize_and_lead_the_design_block():
     d = plan_check.normalize_design(GOOD_PLAN["design"])
     assert d["visual"][0].startswith("palette: #1F2A24 ink (text), #F6F1E7")
-    assert [v.split(":")[0] for v in d["visual"]] == ["palette", "type", "layout", "motion", "copy"]
+    assert [v.split(":")[0] for v in d["visual"]] == ["palette", "type", "layout", "motion", "images", "icons", "copy"]
     assert plan_check.normalize_design(d) == d, "a stored run reads back the same"
     flat = plan_check.normalize_design({"components": ["a"], "palette": "#111111, #fafafa",
                                         "typography": {"display": "Gambarino", "body": "Switzer"}})
@@ -764,7 +773,8 @@ def test_the_new_blocks_stay_within_budget():
     # 5088 chars before 2026-10-04; the owner's cap for the WEB_DESIGN increase
     # is ~120 tokens (chars / 4, the suite's convention).
     assert (len(craft.WEB_DESIGN) - 5088) / 4 <= 120
-    assert len(craft.DESIGN_FIRST) / 4 <= 125
+    # 125 -> 160 on 2026-10-27, deliberately and once: the motion / image / icon plan lines
+    assert len(craft.DESIGN_FIRST) / 4 <= 160
 
 
 @pytest.mark.parametrize("text,web", [

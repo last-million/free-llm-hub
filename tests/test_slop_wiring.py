@@ -49,7 +49,9 @@ def test_a_non_web_goal_plan_prompt_is_unchanged():
 
 
 def test_the_visual_ask_is_small():
-    assert len(SW._WEB_PLAN_ASK) // 4 < 130          # ~tokens
+    # 130 -> 190 on 2026-10-27, deliberately and once: the planner is also asked for the image plan
+    # and the niche icon set (craft.WEB_MOTION), and for the hero's mouse-depth in "motion".
+    assert len(SW._WEB_PLAN_ASK) // 4 < 190          # ~tokens
 
 
 def test_plan_sends_the_web_ask_to_the_planner_only_for_web(monkeypatch):

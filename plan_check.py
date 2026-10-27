@@ -83,6 +83,9 @@ _VISUAL_KEYS = (
     ("type", ("type", "typography", "fonts", "font", "font_pairing", "type_pairing", "typefaces")),
     ("layout", ("layout", "layout_concept", "composition")),
     ("motion", ("motion", "animation", "motion_stance")),
+    # 2026-10-27 (craft.WEB_MOTION): the image plan and the niche icon set the planner is asked for.
+    ("images", ("images", "image_plan", "imagery", "photos")),
+    ("icons", ("icons", "icon_set", "iconography")),
     ("copy", ("copy", "copy_source", "content_source")),
     ("look", ("look", "art_direction", "visual_direction", "direction", "mood")),
 )

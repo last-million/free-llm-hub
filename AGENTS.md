@@ -7865,3 +7865,78 @@ Covered by `tests/test_capacity_429.py` (15), `tests/test_documented_rate_hints.
 - **Evidence gaps, said plainly.** Several rows are medium or low confidence (modelscope, iflow, clarifai, llama,
   upstage, novita, nova: pages did not load). The per-provider docs summaries are the agents' reports of those pages,
   checked here only where a number drove a code change (github-models, hyperbolic, the dahl docs themselves).
+
+## Web builds get a motion, image, icon and loading plan; a provider's keys share the load (2026-10-27)
+
+Covered by `tests/test_web_motion_brief.py` (47) and `tests/test_keys_share_load.py` (9).
+
+- **Owner ask**: when the hub detects a landing page / website build it should aim for maximum design
+  perfection: motion design and parallax that reacts to the mouse and auto-reverses, zero AI slop and all
+  original, a PLAN FOR IMAGES, perfect transitions between sections, fast preloaded loading, icons drawn for
+  the page's niche, and the hyperframes skill's motion know-how.
+- **What already existed** (not rebuilt): `craft.WEB_DESIGN` (varied entrances, hero video/3D, the anti-slop
+  list), `DESIGN_FIRST`, `IMAGES`, the `slopcheck` rules. What was missing: mouse-reactive depth with an idle
+  auto-reverse, designed section-to-section transitions, a written image plan, a per-niche icon set, an explicit
+  preload recipe, and checks for the two commonest speed/jank mistakes.
+- **`craft.WEB_MOTION`** (2.8K chars, shipped beside `DESIGN_FIRST` on every `web_design` hit, tool-carrying or
+  not; a non-web request pays nothing): ONE signature interaction (3-5 depth layers, `pointermove` sets a target,
+  one `requestAnimationFrame` loop lerps and writes `translate3d`; idle >2.5 s or touch/`pointer: coarse` falls back
+  to a slow `animation-direction: alternate` drift; paused off-screen; the composed still under
+  `prefers-reduced-motion`), scroll choreography with a designed transition at every section BOUNDARY (clip-path
+  wipe, colour bleed, overlapping panel, shared element; CSS scroll-driven animations with an
+  IntersectionObserver fallback; View Transitions for multi-page), the easing doctrine, a custom per-niche inline
+  SVG icon set (`<symbol>` sprite on `currentColor`, SVG path draw), an image plan BEFORE building, and "fast by
+  construction" (preload the LCP image and display font, `fetchpriority`, AVIF/WebP + `srcset` + width/height,
+  `loading=lazy`, critical CSS inline, deferred JS, first view under ~1MB / ~150KB JS, content visible without JS).
+- **HyperFrames contributed TECHNIQUE only**, read from the installed `hyperframes-animation` skill: smooth beats
+  bouncy (`power3.out` for entrances, `sine.inOut` for ambient loops, `expo.inOut` for the one dramatic move,
+  `back`/`elastic` only for a playful brand), three easing characters per page, SVG path drawing, clip-path reveal
+  masks, velocity-matched transitions. Its determinism rules (no infinite loops, seek-safe timelines) belong to its
+  VIDEO renderer and were NOT carried over (a live page needs idle loops), and its `data-*` / `class="clip"` markup
+  must never reach a page (the brief says so). Free models cannot read a Claude Code skill, so the technique is
+  distilled into the brief rather than referenced.
+- **Planning**: `DESIGN_FIRST` now also asks for the hero's mouse-depth + idle loop, the section transitions, the
+  image plan and the icon set; the Multi planner's `design.visual` schema asks for `images` and `icons` keys
+  (`_WEB_PLAN_ASK`; the schema already kept keys it did not foresee). `slopcheck.check_design` gained
+  `no_motion_plan` (medium), `no_image_plan` (medium), `no_icon_plan` (low): warnings on the "Plan check:" line, never a
+  re-plan.
+- **Output checks** (`slopcheck.check_files`): `layout_animation` (medium) when a `transition` / `transition-property`
+  or an `@keyframes` body animates width/height/top/left/right/bottom/inset/margin/padding (the CSS parser does not
+  expose keyframe bodies, so they are brace-matched by `_keyframes_layout_pos`); `no_preload` (low) for a whole HTML
+  document with an `<img>` and no `rel=preload` / `fetchpriority`. A fragment, a page without images and a
+  colour/shadow transition are not flagged.
+- **Budgets moved once, on purpose**: `craft.BRIEF_CEILING_CHARS` 0.135 -> 0.16 of the 32K floor (the heaviest request
+  is still a saas landing page; the machine block is dropped before WEB_MOTION when they do not both fit),
+  `DESIGN_FIRST` 125 -> 160 tokens, `_WEB_PLAN_ASK` 130 -> 190 tokens. Fixtures that modelled a "clean" page or spec
+  now preload their hero image / name their images and icons.
+- **Not verified, said plainly**: nothing here proves a free model will build a better site. The brief steers and the
+  checks catch what they can read in the output; no real end-to-end build was run, and whether a given model follows a
+  3K-character brief closely is unmeasured. Mouse-depth correctness, the idle drift and the transitions are not checked
+  by any rule (only by the model following the brief).
+- **Keys share the load at the same time.** `_next_key_start` was already a per-request round-robin (N keys get 1/N of
+  the requests each; a key is only left on a 429 / dead mark), so even spread by count already held. What it ignored
+  was who is busy right now: a key holding a slow stream still got its turn. `_pick_key_start` (main
+  `_upstream_chat` path) now starts each request on the key with the fewest requests IN FLIGHT, ties broken by the same
+  cursor. The count is taken around the real send in `_rh_counted_post` (from the request's bearer; only a SHA-256
+  fingerprint is stored, `_KEY_INFLIGHT`) and is released when the response headers arrive, or when the send raises.
+  A streamed body still being read is therefore not counted (the header wait is the long part for slow thinkers).
+  Flag `key_least_loaded` (default on; off = the plain cursor). The embeddings, image-generation and Puter driver
+  paths keep the plain cursor. A provider with one key is untouched.
+
+## Dead API keys listed at the top of the Providers page (2026-10-27)
+
+Covered by `tests/test_dead_keys_section.py` (7: static checks, the pure builder run under node, the page
+render + `node --check` of every inline script). Owner: "show that APIs are dead, and on the provider page,
+on top, a section declaring the dead API keys and in which provider". Page-only change: no new route.
+
+- The data already existed: every `/api/providers` row carries `keys[]` with `dead` / `dead_why` /
+  `dead_until` / `masked` (see "Provider status: no key, dead keys"), but it was only visible inside each
+  provider's own card.
+- `#dead-keys` (a `<section>`, `hidden` until something is dead, `aria-labelledby`) sits above `#grid`.
+  `deadKeyRows(list, now)` (pure) -> one row per dead key: provider name, key number + masked key, the reason,
+  "checked again in Xm" from `dead_until`, and "all N keys of this provider are dead" ONCE per provider when
+  every key is. `renderDeadKeys()` runs at the top of `renderGrid()`, so it redraws with every provider
+  reload; it writes backend strings with `textContent` only. The provider name is a button that opens the
+  provider's group and scrolls to its card (`paRevealCard`). CSS is the token-only
+  `/* dead-keys-css:start/end */` block (danger tokens), 44 rendered px on phones.
+- Not done: no remove / re-test button in the section itself (both live on the card it links to).

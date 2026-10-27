@@ -422,4 +422,5 @@ def test_worst_case_brief_stays_under_the_ceiling():
     worst = max(len(craft.system_message(t)["content"]) for t in (
         "build an online store and deploy it", "create a landing page for my saas",
         "build me a restaurant website"))
-    assert worst / 4 < 32768 * 0.135
+    # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (see test_craft_briefs).
+    assert worst / 4 < 32768 * 0.16

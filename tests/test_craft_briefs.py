@@ -177,7 +177,9 @@ def test_worst_case_brief_cost():
     # web/UI turns only, 479 chars) and the anti-slop list in WEB_DESIGN (+353
     # chars, funded in part by tightening three of its lines). The heaviest
     # request lands at ~13.27%; a non-web request pays nothing more.
-    assert worst / 4 < 32768 * 0.135, "briefs cost ~%d tokens" % (worst // 4)
+    # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (owner: maximum web-design
+    # perfection: mouse depth + idle drift, section transitions, image plan, niche icons, preload).
+    assert worst / 4 < 32768 * 0.16, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #

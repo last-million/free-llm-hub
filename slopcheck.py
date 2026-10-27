@@ -836,6 +836,26 @@ def _layout_rules(doc, centered_classes):
     return out
 
 
+_LAYOUT_PROP_RE = re.compile(r"width|height|top|left|right|bottom|inset|margin(?:-[a-z]+)?|padding(?:-[a-z]+)?|"
+                             r"min-width|min-height|max-width|max-height")
+_KEYFRAME_SEL_RE = re.compile(r"(?:from|to|\d+(?:\.\d+)?%)(?:\s*,\s*(?:from|to|\d+(?:\.\d+)?%))*", re.I)
+
+
+def _keyframes_layout_pos(text):
+    """Offset of the first layout property (left/top/width/height/margin/padding...) declared inside an
+    @keyframes block, else None. The CSS parser does not expose keyframe bodies, so they are brace-matched here."""
+    for m in re.finditer(r"@(?:-webkit-)?keyframes\s+[\w-]+\s*\{", text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += (text[i] == "{") - (text[i] == "}")
+            i += 1
+        body = text[m.end():i]
+        for d in re.finditer(r"[{;]\s*([a-z-]+)\s*:", body, re.I):
+            if _LAYOUT_PROP_RE.fullmatch(d.group(1).lower()):
+                return m.end() + d.start(1)
+    return None
+
+
 def _site_rules(docs, rvars):
     """Rules that judge the whole set: type, blur, focus, motion."""
     out = []
@@ -952,6 +972,38 @@ def _site_rules(docs, rvars):
         out.append(_f("reduced_motion", "medium", d.where(pos),
                       "heavy animation with no prefers-reduced-motion fallback",
                       "wrap it in @media (prefers-reduced-motion: no-preference) or stop it under reduce"))
+    # Layout-property animation (2026-10-27): width/height/top/left/margin/padding in a transition or in
+    # keyframes forces layout every frame -- the commonest source of jank. transform/opacity stay on the compositor.
+    layout_at = None
+    for d, r, _s in css_rules:
+        props = []
+        if r.decls.get("transition"):
+            props += [i.strip().split(None, 1)[0] for i in r.decls["transition"].split(",") if i.strip()]
+        if r.decls.get("transition-property"):
+            props += [i.strip() for i in r.decls["transition-property"].split(",") if i.strip()]
+        if any(_LAYOUT_PROP_RE.fullmatch(p.lower()) for p in props):
+            layout_at = layout_at or (d, r.pos)
+    if layout_at is None:
+        for d in docs:
+            hit = _keyframes_layout_pos(d.text)
+            if hit is not None:
+                layout_at = (d, hit)
+                break
+    if layout_at:
+        d, pos = layout_at
+        out.append(_f("layout_animation", "medium", d.where(pos),
+                      "animates a layout property (width/height/top/left/margin/padding): it re-lays-out every frame",
+                      "animate transform and opacity instead (translate3d, scale, clip-path)"))
+    # A page with images and no preload / fetchpriority: the first view's image arrives late.
+    for d in docs:
+        if d.kind != "html" or not re.search(r"<head\b", d.code, re.I):
+            continue
+        first = next((pos for tg, _a, pos in d.tags if tg.lower() == "img"), None)
+        if first is not None and not re.search(r"rel\s*=\s*[\"']?(?:module)?preload|fetchpriority", d.text, re.I):
+            out.append(_f("no_preload", "low", d.where(first),
+                          "images with no preload or fetchpriority: the first view's image loads late",
+                          "<link rel=preload as=image fetchpriority=high> for the LCP image, loading=lazy below the fold"))
+            break
     return out
 
 
@@ -1104,6 +1156,16 @@ _LAYOUT_RE = re.compile(
     r"sticky|horizontal scroll|scrollytelling|overlap\w*|offset|broken grid|swiss|brutalis\w*|"
     r"poster|long[- ]scroll|composition|stacked|scroll[- ]driven|menu board|index page)\b|"
     r"layout\s*(?:concept)?\s*[:=]", re.I)
+# Motion / image / icon plan (2026-10-27, craft.WEB_MOTION): a web design that never says what moves,
+# which images it uses or what its icons are will ship defaults. Medium/low only -- a warning on the
+# "Plan check:" line, never a replan.
+_MOTION_PLAN_RE = re.compile(r"parallax|mouse|pointer|scroll|transition|reveal|stagger|animat|motion|easing|"
+                             r"\bmov(?:e|es|ing)\b|hover|marquee|morph", re.I)
+_IMAGE_PLAN_RE = re.compile(r"\b(?:images?|imagery|photos?|photograph\w*|illustrations?|svg|artwork|"
+                            r"art direction|picture\w*|visuals?)\b", re.I)
+_ICON_PLAN_RE = re.compile(r"\bicon(?:s|ography|set)?\b|pictogram|glyph set", re.I)
+
+
 _COPY_SRC_RE = re.compile(
     r"\b(?:real|actual|client'?s?|owner'?s?|user'?s?|customer'?s?|provided|existing|supplied|"
     r"approved|their own|brand'?s?|business'?s?|restaurant'?s?|shop'?s?)\s+(?:own\s+)?"
@@ -1235,6 +1297,18 @@ def check_design(design_text, request=""):
         out.append(_f("no_copy_source", "medium", "design",
                       "no source for the real copy",
                       "say where the words, facts and prices come from; missing ones are [NEEDS INPUT]"))
+    if not _MOTION_PLAN_RE.search(full):
+        out.append(_f("no_motion_plan", "medium", "design",
+                      "no motion plan",
+                      "say what moves: the hero's mouse-depth + idle drift, the transition between sections, the reduced-motion fallback"))
+    if not _IMAGE_PLAN_RE.search(full):
+        out.append(_f("no_image_plan", "medium", "design",
+                      "no image plan",
+                      "list the images: role, source (generated / own SVG / licence-named), size, format"))
+    if not _ICON_PLAN_RE.search(full):
+        out.append(_f("no_icon_plan", "low", "design",
+                      "no icon plan",
+                      "draw a custom SVG icon set for this niche (one grid, one stroke, trade metaphors)"))
     return _order(out)
 
 

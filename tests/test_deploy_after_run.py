@@ -226,7 +226,8 @@ def test_the_brief_carries_the_block_for_app_builds_only(monkeypatch):
 
 
 def test_the_brief_never_crosses_the_cost_ceiling(monkeypatch):
-    assert craft.BRIEF_CEILING_CHARS == int(32768 * 0.135 * 4)
+    # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (see test_craft_briefs).
+    assert craft.BRIEF_CEILING_CHARS == int(32768 * 0.16 * 4)
     block = envprobe.block(_win_snap(), who="session")
     monkeypatch.setattr(craft, "_ENV_SOURCE",
                         lambda t: block if envprobe.wants_block(t) else "")

@@ -412,9 +412,27 @@ DESIGN_FIRST = """DESIGN DECISIONS FIRST (web/UI, before any code -- no defaults
 - Palette: 4-6 hex with roles (bg, text, accent, muted); text >=4.5:1.
 - Type: a named display + body pairing (or a system stack, said so).
 - Layout: the composition and why THIS product needs it, not hero + 3 cards + testimonials + CTA.
-- Motion: what moves, and the reduced-motion fallback.
+- Motion: hero mouse-depth + idle auto-reverse, the transition between sections, reduced-motion fallback.
+- Image plan: role, source, size, format per image.
+- Icons: a custom SVG set for THIS niche.
 - Copy: the user's real words and facts; missing = [NEEDS INPUT], never lorem."""
 
+
+# WEB_MOTION, added 2026-10-27 at the owner's request: a website / landing-page build should reach for
+# maximum design perfection -- mouse-reactive parallax that auto-reverses when idle, designed
+# section-to-section transitions, a written image plan, per-niche icons, fast preloaded loading, zero AI
+# slop. HyperFrames contributed TECHNIQUE only (easing doctrine, SVG path drawing, clip-path reveals, velocity
+# match); its data-*/class="clip" markup belongs to its video runtime and the text says never to paste it.
+# Shipped with DESIGN_FIRST on every web_design hit (see system_message).
+WEB_MOTION = """WEB MOTION + SPEED PLAN (web/UI builds: fix these in the design step, then build exactly them)
+- ONE signature hero interaction, done well: mouse-reactive depth. 3-5 layers (backdrop shape, subject, foreground detail, type), each with its own depth factor (0.02-0.12). pointermove only sets a target; a single requestAnimationFrame loop lerps toward it (~0.08) and writes translate3d. When the pointer idles (~2.5s) or there is none (touch, pointer: coarse), the layers drift on a slow auto-reverse loop (animation-direction: alternate, 8-14s, sine.inOut) and hand back to the pointer smoothly. Pause off-screen (IntersectionObserver); under prefers-reduced-motion show the composed still.
+- Scroll choreography: every section gets its own entrance (clip-path mask reveal, sticky-stack overlap, horizontal pan, scale-from-image, counter-parallax type) and every BOUNDARY a designed transition (clip-path wipe, colour bleed, overlapping panel, shared element), never a hard cut. Prefer CSS scroll-driven animations (animation-timeline: view()/scroll()) with an IntersectionObserver fallback; multi-page: the View Transitions API.
+- Easing is tone of voice: smooth beats bouncy. power3.out / cubic-bezier(0.16,1,0.3,1) for entrances, sine.inOut for ambient loops, expo.inOut for the one dramatic move; back/elastic only for a playful brand. Use three easing characters per page (whisper, normal, punch) and match a transition's exit velocity to the next section's entrance.
+- Smooth: transform/opacity only, will-change only while moving, passive listeners, no layout reads inside the loop, 60fps on a mid phone or cut the effect.
+- Icons: draw a custom inline-SVG set for THIS niche: one 24px grid, one stroke width, one corner style, metaphors from the trade (not generic checks, stars, rockets), as an SVG <symbol> sprite on currentColor. Reveal key ones with an SVG path draw (stroke-dashoffset). No emoji, no icon in a rounded-square tile.
+- Image plan BEFORE building: one row per image: role, composition, source (generated with the image tool / original SVG or CSS art / licence-named photo), size, format. One art direction across all (one light, one palette, one crop language); no stock-photo grid.
+- Fast by construction: <link rel=preload as=image fetchpriority=high> for the LCP image and as=font crossorigin for the display face, preconnect to each origin used, font-display: swap, AVIF/WebP with srcset/sizes and width/height, loading=lazy + decoding=async below the fold, critical CSS inline, JS deferred, nothing render-blocking, first view under ~1MB and ~150KB JS, content visible with JS off.
+- Skills: if hyperframes-animation / gsap / ui-ux-pro-max are installed, read them for technique (easing, stagger, choreography, palettes). Never paste their data-* / class="clip" markup into the page."""
 
 # PUBLISH_ASK, added 2026-10-08 at the owner's request: when an agent has FINISHED
 # a web app and given the user its LOCAL url, it must ASK whether to also put it
@@ -464,7 +482,9 @@ _ENV_SOURCE = None
 # whenever it would push a brief over it, so it can never cost the ceiling:
 # the heaviest bundle (a saas landing page) has ~44 chars of room and is not an
 # app build anyway.
-BRIEF_CEILING_CHARS = int(32768 * 0.135 * 4)
+# 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (the owner's web-design perfection ask);
+# the heaviest request is still a saas landing page and still a small slice of even the 32K floor.
+BRIEF_CEILING_CHARS = int(32768 * 0.16 * 4)
 
 
 def set_env_source(fn):
@@ -583,7 +603,7 @@ def system_message(text, tools=True, session_id=None):
                   for n, _b in hits)
     # Web/UI: the design decisions come right after the plan (tools) or right
     # after the briefs (tool-less) -- decided before any code either way.
-    design = [DESIGN_FIRST] if any(n == "web_design" for n, _b in hits) else []
+    design = [DESIGN_FIRST, WEB_MOTION] if any(n == "web_design" for n, _b in hits) else []
     tail = ([PLAN_PHASES] + design + [ACT_RUN, VERIFY_RUN] if tools
             else design + [VERIFY_READ] if builtin else [])
     body = "\n\n".join([b for _n, b in hits] + pub + env + tail)

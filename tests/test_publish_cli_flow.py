@@ -436,7 +436,7 @@ def test_the_log_line_names_the_project_and_port_but_never_the_url(engine, proj,
 def _expected_without_publish(text):
     """The brief as it was before PUBLISH_ASK existed (tool-carrying)."""
     hits = craft.match(text)
-    tail = [craft.PLAN_PHASES] + ([craft.DESIGN_FIRST] if any(
+    tail = [craft.PLAN_PHASES] + ([craft.DESIGN_FIRST, craft.WEB_MOTION] if any(
         n == "web_design" for n, _ in hits) else []) + [craft.ACT_RUN, craft.VERIFY_RUN]
     return "\n\n".join([b for _n, b in hits] + tail)
 
@@ -533,4 +533,5 @@ def test_the_heaviest_request_with_the_line_stays_under_the_unchanged_ceiling():
     sits under 32768 * 0.135 tokens. The ceiling did not move for it."""
     body = craft.system_message("create a landing page for my saas")["content"]
     assert craft.PUBLISH_ASK in body
-    assert len(body) / 4 < 32768 * 0.135, "briefs cost ~%d tokens" % (len(body) // 4)
+    # 0.135 -> 0.16 on 2026-10-27 for WEB_MOTION (see test_craft_briefs.test_worst_case_brief_cost).
+    assert len(body) / 4 < 32768 * 0.16, "briefs cost ~%d tokens" % (len(body) // 4)

@@ -10313,7 +10313,14 @@ def _rh_counted_post(pid, model):
     it. `requests.post` is looked up per call, so a test's fake is honoured."""
     def _post(*args, **kwargs):
         _RATE_WATCH.note_start(pid, model)
-        return requests.post(*args, **kwargs)
+        key = _key_from_headers(kwargs)
+        if key:
+            _key_inflight_add(pid, key, 1)       # in flight until the response headers arrive
+        try:
+            return requests.post(*args, **kwargs)
+        finally:
+            if key:
+                _key_inflight_add(pid, key, -1)
     return _post
 
 
@@ -12686,6 +12693,60 @@ def _next_key_start(pid, n):
     with _key_cursor_lock:
         start = _provider_key_cursor.get(pid, 0) % n
         _provider_key_cursor[pid] = (start + 1) % n
+    return start
+
+
+# KEYS SHARE THE LOAD AT THE SAME TIME (2026-10-27). _next_key_start alone is a round-robin by request
+# COUNT: N keys get 1/N of the requests each, but it ignores who is busy -- a key holding a slow stream
+# still got its turn while siblings sat idle (per-key parallel limits bite there; dahl documents
+# `parallel_key_limit`). _pick_key_start starts each request on the key with the FEWEST requests in flight
+# right now (counted around the real send, in _rh_counted_post), ties broken by the same cursor, so an idle
+# key is always preferred and equal load still rotates. Only fingerprints are kept, never a key. Flag
+# key_least_loaded (default on; off = the plain cursor).
+_KEY_INFLIGHT = {}                       # (pid, key fingerprint) -> requests in flight now
+_key_inflight_lock = threading.Lock()
+
+
+def _key_from_headers(kwargs):
+    try:
+        auth = (kwargs.get("headers") or {}).get("Authorization") or ""
+        return auth[7:] if auth.startswith("Bearer ") else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _key_inflight_add(pid, key, delta):
+    fp = quota.key_fingerprint(key)
+    if not fp:
+        return
+    with _key_inflight_lock:
+        v = _KEY_INFLIGHT.get((pid, fp), 0) + delta
+        if v > 0:
+            _KEY_INFLIGHT[(pid, fp)] = v
+        else:
+            _KEY_INFLIGHT.pop((pid, fp), None)
+
+
+def _pick_key_start(pid, keys):
+    """Index in `keys` to try first: the least-loaded key, rotating among equals. Never raises."""
+    n = len(keys)
+    start = _next_key_start(pid, n)
+    if n <= 1:
+        return start
+    try:
+        if not config.get_flag("key_least_loaded", True):
+            return start
+        with _key_inflight_lock:
+            loads = [_KEY_INFLIGHT.get((pid, quota.key_fingerprint(k)), 0) for k in keys]
+        least = min(loads)
+        if least == max(loads):
+            return start
+        for off in range(n):
+            idx = (start + off) % n
+            if loads[idx] == least:
+                return idx
+    except Exception:                                            # noqa: BLE001
+        pass
     return start
 
 
@@ -17304,7 +17365,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     # -- see quota.usable_keys, which fails OPEN when they are all cooling down.
     keys = quota.usable_keys(pid, keys)
     n = len(keys)
-    start = _next_key_start(pid, n)
+    start = _pick_key_start(pid, keys)
     last_exc = None
     refit_done = False        # one context re-fit per request, never a loop
     # Every real request below goes out through this, which counts it as STARTED
