@@ -7940,3 +7940,155 @@ on top, a section declaring the dead API keys and in which provider". Page-only 
   provider's group and scrolls to its card (`paRevealCard`). CSS is the token-only
   `/* dead-keys-css:start/end */` block (danger tokens), 44 rendered px on phones.
 - Not done: no remove / re-test button in the section itself (both live on the card it links to).
+
+## Sub-agents actually run; the hub stops telling models to fake it (2026-10-28)
+
+Owner, across all CLIs / model pickers: "I see it doesn't run anything and it
+tells me it ran sub-agents." Covered by `tests/test_sub_agents_actually_run.py`
+(11) + the two tests added to `tests/test_cli_multi_sessions.py` and the updated
+marker in `tests/test_crew_auto_escalate.py`.
+
+**What the evidence actually showed (opencode DB + hub.log, read-only, STRUCTURAL
+ONLY -- the session content is the owner's private work and was never read or
+dumped; only counts, lengths, booleans and tier ids).** The recent sessions were
+on `coding-max` / `context-max` (single-model Max tier), NOT swarm or multi, so
+the hub's swarm/multi pipeline was never involved. opencode's OWN native
+sub-agent tool DID run: 13 child sessions, each ~4.7-8.1K chars of output, 20-46
+completed tool calls, ~0 errors; no `context-max` failures in hub.log that day. A
+FIRST loose-regex count (bare "in parallel" / "spawn" / "delegat") reported "38
+fake claims" -- WRONG: a tight rule (a sub-agent/worker NOUN + a doing verb)
+finds 8, and the one inspected was TRUE -- its matching child sub-agent sessions
+exist; it only lacked a tool call in that same MESSAGE because the delegation
+calls were in earlier messages of the same turn (a summary after real
+delegation). So a per-message "claims delegation, no tool call" detector would
+mostly fire on legitimate summaries; the owner declined it. The planner-empty /
+0-phase `[swarm]` lines in hub.log are from five days earlier and several were
+valid plans `plan_readable` rejected or correct 0-phase "all tasks done" -- a
+separate, older matter, not this.
+
+Two real, tier-independent things were fixed; the owner picked these and
+declined the per-turn detector.
+
+- **The honest sub-agent hint** (`_crew_agent_hint(tools)`, flag
+  `honest_crew_hint`, default on; under the existing master `crew_agent_hint`).
+  The old `_CREW_AGENT_HINT` told EVERY agentic opening turn it could "delegate a
+  big subtask via a tool-free crew POST with model 'crew'". An agent mid-loop
+  carries its own tools and cannot make that tool-free POST, so weak free models
+  NARRATED delegation instead of doing it. The replacement is built from the
+  request's OWN tools (the `_cmem_apply_note` pattern): `_delegating_tool_offered`
+  finds a sub-agent tool in the offered list (opencode `task`, Claude Code
+  `Task`, codex `spawn_agent` -- flattened from its `multi_agent_v1` namespace by
+  `_responses_ns_entries` before `_upstream_chat` -- the hub MCP
+  `swarm_windows_start` / `crew_run` / `crew_start`, or any `*subagent*` name);
+  when one is offered the hint NAMES it and says to CALL it, when none is it says
+  so, and either way it BANS claiming delegation that did not happen. The old
+  text is kept verbatim behind the flag (`honest_crew_hint` off = byte-identical).
+  `_apply_craft_brief` gained a `tools=` parameter; its one caller
+  (`_upstream_chat`) passes `payload.get("tools")`.
+  - **Scope / limit, said plainly:** the hint ships on the OPENING turn only
+    (the `_awaiting_new_instruction` rule `_apply_craft_brief` already enforces --
+    a running tool loop gets only the ACT block, never the brief/hint). So it
+    reduces the narration SOURCE at task start; it does not police a mid-task
+    "I ran sub-agents" on every continuation. The per-turn detector that would
+    have is the one the owner declined (it was a false-positive magnet on real
+    summaries).
+
+- **The swarm tier runs real agents** (`_cm_resolves_to_multi`, flag
+  `cli_swarm_runs_agents`, default on). It returned True only for `multi`;
+  picking `swarm` / `<category>-swarm` in a CLI took the single-actor roles path,
+  so a user expecting parallel sub-agents got one model. It now also returns True
+  for `swarm`, so the swarm tier goes through the SAME `_cm_multi_cli_intercept`
+  -> real parallel `swarm_windows` run as multi, in every CLI. All the existing
+  safe gates still apply downstream (a hub-driven /build session never, the
+  dashboard header never, tools required, a KNOWN trusted folder from the CLI's
+  own env block, `_multi_wants_a_swarm` says WORK, the `cli_multi_approval` mode),
+  so a trivial swarm ask still falls through to the roles path and nothing starts
+  without the folder. Flag off = swarm behaves exactly as before. Behaviour
+  change, intended: a WORK ask on the swarm tier now starts a minutes-long
+  parallel run instead of the one-shot roles answer. The user-facing run text
+  still says "Multi" (the shared machinery); cosmetic, left as is.
+
+- **Config note:** the live `cli_multi_approval` is `off` (memory had said the
+  owner chose `chat`). With `off`, an unauthenticated /v1 "swarm"/"multi" WORK
+  turn starts helper agents directly -- so this fix sends MORE turns through that
+  direct start. Flagged to the owner; not changed here.
+
+Release-note: improved: picking the Swarm tier in any CLI now runs real parallel sub-agents (not one model), and the hub no longer nudges models to pretend they delegated work they didn't.
+
+## A category switch keeps the memory, and the session keeps acting (2026-10-28)
+
+Owner, every CLI: "even switching between model categories it should keep the same memory
+and be able to continue normally." Covered by `tests/test_session_keeps_acting_after_a_switch.py`
+(35: unit rules, the orchestrator seam, key stability per CLI request shape, and the three real
+handlers stream and non-stream, with four negative controls).
+
+**What was measured (the owner's opencode DB + the live hub's activity rows, STRUCTURAL ONLY --
+counts, lengths, model ids and timestamps; the session content is private and was never read).**
+In the session where "it says it ran sub-agents but nothing runs" was reported: on `context-max`
+149 of 162 assistant turns made a tool call (92%); the picker moved to `coding-max` at 21:45 and the
+next 6 assistant turns made NONE -- 1.6-9.6K-character text answers to messages of 5-51
+characters. The hub's activity rows put those 6 turns on `dahl/GLM-5.3-Flash` (the first) and then
+`g4f/GLM:GLM-5.3` (the other five), held by the 4 h session pin; nothing in the hub's learned state
+named the pair. The history was NOT lost (the new model describes the earlier work): the memory
+key never depended on the model. What failed was ACTING. A category is a different POOL, not just
+a different model: 59 alive tool-capable models in `context` vs 105 in `coding`, 41 in both; the
+18 `context`-only ones include big-window models that score low (mercury-3, 1M window, score 26:
+in `context` by window, never in `coding` whose evidence rule needs score >= 130), and earlier
+the same week every `context-max` request was served by mercury-3. UNPROVEN (said plainly): WHICH
+pairs served the 149 acting turns (the activity table only keeps 40 rows); that mercury was one of
+them is an inference from the earlier measurement. Also UNTESTED as a suspect: the live hub still
+ran the old crew hint on every fresh turn (see the previous section, not yet restarted).
+
+**Why nothing caught it.** `_never_chains` counts text-only replies to tool-result CONTINUATIONS only
+-- on a fresh user message text may simply be an answer -- and these were fresh messages. The 4 h
+pin then kept the session on the pair. A new conversation "fixed" it only because a new session id
+means a new pin.
+
+**The fix: the session watch** (`_file_session_reply`, `_quiet_in_session`, `_session_return_pair`,
+`_quiet_context`; flags `session_quiet_watch` and `session_return_to_actor`, both default on).
+- Ground truth, no wording: a session whose history holds >= `_QUIET_MIN_TOOL_RESULTS` (3) tool
+  results is a working session. A pair that has NEVER made a tool call in it and answers
+  `_QUIET_STREAK` (2) turns in a row with text only has stopped acting. A pair that HAS acted in
+  the session is never judged (its text is an answer, e.g. to a question); any tool call by a pair
+  clears its streak and its ban; a reply without text, a tool-free request, and a session below the
+  floor count nothing.
+- On the second quiet turn: (1) the session's pin is released (`_session_pin_drop` under the exact
+  key the router pins by, `_agent_pin_key`), (2) the pair is banned FOR THAT SESSION for 4 h through
+  `_tool_turn_sick` -- the one test the router's fresh pick, the chain's sick group, the quality
+  fallback and the spread already use, so it is a reorder: the pair stays the last resort and
+  everything fails open -- and (3) the global never-chains ledger gets +1 (4 quiet sessions demote
+  the pair for everyone for 6 h; one tool call anywhere clears it).
+- **Return to whoever was acting:** the pair that last made a tool call in this session
+  (`_session_acted`) is put back in front through `_apply_orchestrator`, OUTSIDE the new category if
+  need be. It only applies when the owner has chosen no orchestrator (his explicit choice wins), skips
+  the "simple turn keeps the router's pick" rule (a "continue" nudge is classed simple and is exactly
+  the turn that needs the recovery), and is skipped for the turn with a log line when the pair is
+  unusable (`_orch_unusable`). Activity shows it as the orchestrator chip.
+- **The session context is set BEFORE routing**, at the end of `_ctx_begin` (the early call runs
+  before the pick in all three handlers). The first version set it in `_mark_continuation`, which runs
+  where the chain clock is built -- after the router had already re-picked -- so a weighted-random
+  re-pick could land on the banned pair (intermittent in testing; `no_early_context` negative control).
+- Roles path (swarm/crew tiers): `_tool_turn_roles_run` sets the context and
+  `_note_continuation_outcome` files the reply. Persistence: in memory only, like the pins (a restart
+  clears every table AND every pin, so a stuck conversation recovers on restart whether or not the
+  watch works -- the replay tests are the proof, not the restart).
+- Log: `[quiet] <key8> <pid>/<model> answered 2 turns in a row without a tool call although this
+  session works with tools (N tool results so far): pin released[, returning to <pid>/<model> which
+  was acting]` -- ids and counts only.
+- `tests/conftest.py` clears the four module-level tables around every test (session ids like
+  `ses_00` repeat across hundreds of tests).
+
+**Limits, said plainly.**
+- It costs two quiet turns before it reacts, and after a restart the hub has no record of who was
+  acting, so a recovered session first re-picks in the category (ban only) and finds an actor to go
+  back to only once some pair has made a tool call in it.
+- Going back to the acting pair means a turn can be served from OUTSIDE the category the user
+  picked (and by a low-scored pair): the trade is deliberate, "continue normally" over category
+  purity, and the Activity chip says so.
+- A pair that is simply a poor actor but did one tool call early in the session is never judged.
+- Existing conversations: the pin table is in memory, so they pick this up after the next restart
+  with no new conversation needed.
+- Not a fix for the model's own habits: `g4f` relay GLMs that answer in prose are still picked first
+  by a fresh session; the watch just stops the session from staying with them.
+
+Release-note: fix: when you switch the model category in any CLI and the new models stop doing the work, the hub now notices after two turns, lets go of them and carries on with the model that was actually working, without starting a new conversation.

@@ -166,9 +166,26 @@ def test_flag_off_is_byte_identical_fall_through(cm, monkeypatch):
 
 def test_not_the_multi_tier_falls_through(cm):
     assert _call(model="best")[0] is None
-    assert _call(model="swarm")[0] is None
     assert _call(model="auto")[0] is None
     assert not cm["turn_events"]
+
+
+def test_swarm_tier_also_starts_a_run(cm):
+    # owner 2026-10-27: picking "swarm" in a CLI should run real parallel
+    # sub-agents too, not the single-actor roles path. Default on.
+    resp, raw = _call(model="swarm")
+    assert resp is not None
+    assert cm["turn_events"], "swarm tier started a real swarm_windows run"
+
+
+def test_swarm_tier_falls_through_when_flag_off(cm, monkeypatch):
+    real = A.config.get_flag
+    monkeypatch.setattr(A.config, "get_flag",
+                        lambda k, d=None: False if k == "cli_swarm_runs_agents" else real(k, d))
+    assert _call(model="swarm")[0] is None
+    assert not cm["turn_events"]
+    # multi is unaffected by the swarm flag.
+    assert _call(model="multi")[0] is not None
 
 
 def test_a_build_request_is_never_turned_into_a_run(cm, monkeypatch):

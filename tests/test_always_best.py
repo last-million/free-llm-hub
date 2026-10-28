@@ -17,7 +17,9 @@ def _pool():
 
 
 def _route(monkeypatch, pool, always_best):
-    config.set_flag("route_always_best", always_best)
+    # No config.set_flag here: nothing below reads the flag (the branch is chosen
+    # by the `always_best` argument), and a write persists in the shared sandbox
+    # config, leaving route_always_best=False for every later test and run.
     monkeypatch.setattr(app, "_available_providers", lambda: ["g4f-nvidia"])
     monkeypatch.setattr(app, "_quota_headroom", lambda pid: 1.0)
     picks = set()

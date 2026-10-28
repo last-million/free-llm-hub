@@ -123,6 +123,28 @@ def _reset_recent_hop_failures():
     yield
 
 
+def _clear_quiet_tables():
+    """SESSION-QUIET WATCH (app._file_session_reply): module-level tables keyed by the session
+    key. Test session ids (ses_00 ...) repeat across hundreds of tests, so a ban or an
+    "acting" record left by one test would demote or steer the next test's pair."""
+    mod = sys.modules.get("app")
+    lock = getattr(mod, "_quiet_lock", None) if mod else None
+    if lock is None:
+        return
+    with lock:
+        mod._quiet_text.clear()
+        mod._quiet_ban.clear()
+        mod._session_acted.clear()
+        mod._session_return.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_quiet_tables():
+    _clear_quiet_tables()
+    yield
+    _clear_quiet_tables()
+
+
 def _clear_thinking_ledgers():
     """THINKING LEDGERS: which (provider, model) reasons (catalog flags and
     runtime evidence) and which rejected reasoning_effort. Tests feed fake

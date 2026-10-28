@@ -874,7 +874,7 @@ def _hop(monkeypatch, messages, tools=TOOLS, budget=None, no_craft=False, header
     monkeypatch.setattr(A, "_post_with_header_deadline",
                         lambda deadline, post, **kw: posted.append(kw.get("json")) or _Resp())
     monkeypatch.setattr(A, "_summarize_dropped", lambda dropped: None)
-    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False: m)
+    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False, tools=None: m)
     monkeypatch.setattr(A, "_with_model_guide", lambda m, pid, model, tools: m)
     monkeypatch.setattr(A, "_apply_goal_note", lambda m: m)
     if budget:
@@ -908,7 +908,7 @@ def route(monkeypatch, quiet):
                         lambda deadline, p, **kw: post(**kw))
     monkeypatch.setattr(A, "_model_ctx_info", lambda pid, model: (400000, "catalog"))
     monkeypatch.setattr(A, "_summarize_dropped", lambda dropped: None)
-    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False: m)
+    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False, tools=None: m)
     monkeypatch.setattr(A, "_with_model_guide", lambda m, pid, model, tools: m)
     monkeypatch.setattr(A, "_apply_goal_note", lambda m: m)
     return sent
@@ -957,7 +957,7 @@ def test_a_plain_worker_thread_still_files_and_notes(monkeypatch):
     monkeypatch.setattr(A, "_post_with_header_deadline",
                         lambda deadline, post, **kw: posted.append(kw.get("json")) or _Resp())
     monkeypatch.setattr(A, "_summarize_dropped", lambda dropped: None)
-    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False: m)
+    monkeypatch.setattr(A, "_apply_craft_brief", lambda m, agentic=False, tools=None: m)
     monkeypatch.setattr(A, "_with_model_guide", lambda m, pid, model, tools: m)
     monkeypatch.setattr(A, "_apply_goal_note", lambda m: m)
     monkeypatch.setattr(A, "_model_ctx_info", lambda pid, model: (400000, "catalog"))

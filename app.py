@@ -11498,6 +11498,9 @@ def _note_continuation_outcome(pid, model, messages, msg):
             return
         _file_chain_reply(pid, model, _turn_used_tools(messages),
                           bool(msg.get("tool_calls")), msg.get("content"))
+        _file_session_reply(getattr(g, "hub_quiet_key", None) or _agent_pin_key(messages),
+                            _count_tool_results(messages), pid, model,
+                            bool(msg.get("tool_calls")), msg.get("content"))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -11510,6 +11513,7 @@ def _mark_continuation(messages):
         g.hub_continuation = bool(_turn_used_tools(messages))
     except Exception:                                            # noqa: BLE001
         pass
+    _quiet_context(messages)                                     # session-quiet watch
 
 
 def _note_request_reply(pid, model, *, called, text):
@@ -11521,6 +11525,9 @@ def _note_request_reply(pid, model, *, called, text):
             return
         _file_chain_reply(pid, model, bool(getattr(g, "hub_continuation", False)),
                           bool(called), text)
+        _file_session_reply(getattr(g, "hub_quiet_key", None),
+                            int(getattr(g, "hub_tool_results", 0) or 0),
+                            pid, model, bool(called), text)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -11545,6 +11552,164 @@ def _never_chains(pid, model):
                     and config.get_flag("tool_chain_watch", True))
     except Exception:                                            # noqa: BLE001
         return False
+
+
+# A SESSION THAT STOPPED ACTING AFTER A CATEGORY SWITCH (2026-10-28).
+# MEASURED on the owner's opencode session (structural counts only): on `context-max` 149 of
+# 162 assistant turns made a tool call; the moment the picker went to `coding-max` the next 6
+# made NONE -- six long text answers to short "carry on" messages, five from one g4f relay
+# pair, all held by the 4 h session pin. A category is a different POOL, not just a
+# different model: the pairs that were doing the work (mercury-3 is in `context` by its 1M
+# window and can never be in `coding`) may be unreachable, and the new pool's pairs may
+# answer in prose. The never-chains ledger above cannot see it: it counts continuations
+# only, and these were fresh user messages. The owner's rule: switching category keeps the
+# same memory (the CLI re-sends the history; the conversation key ignores the model) and the
+# session must CONTINUE NORMALLY, without a new conversation.
+#
+# Ground truth, no wording: a session whose history already holds >= _QUIET_MIN_TOOL_RESULTS
+# tool results is a working session. A pair that has NEVER made a tool call in it and answers
+# _QUIET_STREAK turns in a row with text only has stopped acting -> (1) the session's pin is
+# released, (2) the pair is demoted FOR THAT SESSION through _tool_turn_sick (reorder only,
+# nothing dropped), and (3) the pair that last made a tool call in this session, if any, is
+# put back in front through the orchestrator seam (_apply_orchestrator), outside the category
+# if need be. A pair that HAS acted in the session is never judged: its text is an answer.
+# In memory, session-scoped, 4 h like the pin. Flags `session_quiet_watch` and
+# `session_return_to_actor` (default on).
+_QUIET_MIN_TOOL_RESULTS = 3
+_QUIET_STREAK = 2
+_QUIET_TTL = 4 * 3600
+_QUIET_MAX_SESSIONS = 512
+_quiet_lock = threading.Lock()
+_quiet_text = {}       # (key, pid, model) -> {"n": consecutive text-only replies, "last": ts}
+_quiet_ban = {}        # (key, pid, model) -> expiry
+_session_acted = {}    # key -> {(pid, model): ts of its last tool call in this session}
+_session_return = {}   # key -> (pid, model, expiry): the pair to put back in front
+
+
+def _count_tool_results(messages):
+    """How many tool results the conversation holds (any protocol's shape)."""
+    n = 0
+    try:
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            if (m.get("role") == "tool" or _carries_tool_results(m)
+                    or m.get("type") in ("function_call_output", "custom_tool_call_output")):
+                n += 1
+    except Exception:                                            # noqa: BLE001
+        return 0
+    return n
+
+
+def _quiet_context(messages):
+    """Remember, for THIS request, which session it belongs to and how many tool results its
+    history holds. Set where _mark_continuation is (every protocol's handler) and at the start
+    of the roles path. Never raises."""
+    try:
+        if getattr(g, "hub_quiet_msgs", None) is messages:
+            return                       # _ctx_begin already did this for these very messages
+        g.hub_quiet_msgs = messages
+        if not config.get_flag("session_quiet_watch", True):
+            g.hub_quiet_key = None
+            return
+        g.hub_quiet_key = _agent_pin_key(messages)
+        g.hub_tool_results = _count_tool_results(messages)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _quiet_prune(now):
+    """Bound the three tables (called with _quiet_lock held)."""
+    for tbl in (_quiet_ban,):
+        for k in [k for k, exp in tbl.items() if exp <= now]:
+            tbl.pop(k, None)
+    for k in [k for k, rec in _quiet_text.items() if now - rec.get("last", 0) > _QUIET_TTL]:
+        _quiet_text.pop(k, None)
+    for k in [k for k, row in _session_return.items() if row[2] <= now]:
+        _session_return.pop(k, None)
+    if len(_session_acted) > _QUIET_MAX_SESSIONS:
+        old = sorted(_session_acted, key=lambda s: max(_session_acted[s].values() or [0]))
+        for s in old[:len(_session_acted) - _QUIET_MAX_SESSIONS]:
+            _session_acted.pop(s, None)
+
+
+def _file_session_reply(key, tool_results, pid, model, called, text):
+    """File one served reply of a tool turn against its SESSION. Never raises."""
+    try:
+        if not (key and pid and model) or not config.get_flag("session_quiet_watch", True):
+            return
+        now = time.time()
+        quiet_n = 0
+        actor = None
+        with _quiet_lock:
+            if called:
+                _session_acted.setdefault(key, {})[(pid, model)] = now
+                _quiet_text.pop((key, pid, model), None)
+                _quiet_ban.pop((key, pid, model), None)       # it acts here: forgiven
+                if len(_session_acted) > _QUIET_MAX_SESSIONS:
+                    _quiet_prune(now)
+                return
+            if not str(text or "").strip() or tool_results < _QUIET_MIN_TOOL_RESULTS:
+                return
+            if (pid, model) in (_session_acted.get(key) or {}):
+                return                    # it has acted in this session: its text is an answer
+            rec = _quiet_text.get((key, pid, model))
+            if not rec or now - rec.get("last", 0) > _QUIET_TTL:
+                rec = {"n": 0, "last": now}
+            rec["n"] += 1
+            rec["last"] = now
+            _quiet_text[(key, pid, model)] = rec
+            if rec["n"] < _QUIET_STREAK or _quiet_ban.get((key, pid, model), 0) > now:
+                return
+            _quiet_ban[(key, pid, model)] = now + _QUIET_TTL
+            quiet_n = rec["n"]
+            acted = [(ts, p, m) for (p, m), ts in (_session_acted.get(key) or {}).items()
+                     if (p, m) != (pid, model) and now - ts <= _QUIET_TTL]
+            if acted and config.get_flag("session_return_to_actor", True):
+                _ts, apid, amodel = max(acted)
+                _session_return[key] = (apid, amodel, now + _QUIET_TTL)
+                actor = (apid, amodel)
+            _quiet_prune(now)
+        # outside the lock: release the pin so the next turn re-picks, and teach the global
+        # never-chains ledger (4 such sessions demote the pair for every session).
+        _session_pin_drop(key)
+        _file_chain_reply(pid, model, True, False, text)
+        _log.info("[quiet] %s %s/%s answered %d turns in a row without a tool call although "
+                  "this session works with tools (%d tool results so far): pin released%s",
+                  str(key)[:8], pid, model, quiet_n, tool_results,
+                  (", returning to %s/%s which was acting" % actor) if actor else "")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _quiet_in_session(pid, model):
+    """True while (pid, model) is banned for the session this request belongs to. Cheap when
+    nothing is banned; False outside a request (threads without a request context)."""
+    if not _quiet_ban:
+        return False
+    try:
+        key = getattr(g, "hub_quiet_key", None)
+        if not key:
+            return False
+        with _quiet_lock:
+            exp = _quiet_ban.get((key, pid, model), 0)
+        return exp > time.time()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _session_return_pair(key):
+    """The pair to put back in front for this session, or None. Never raises."""
+    if not key or not _session_return:
+        return None
+    try:
+        with _quiet_lock:
+            row = _session_return.get(key)
+        if row and row[2] > time.time():
+            return (row[0], row[1])
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
 
 
 # A PROVIDER THAT STALLS ON TWO DIFFERENT MODELS IS SLOW, NOT UNLUCKY (2026-10-24).
@@ -11584,7 +11749,8 @@ def _tool_turn_sick(pid, model):
     the same way again and again (see _note_pair_failure), or never chaining a
     tool call mid-loop (see _never_chains), or on a provider that is stalling on
     several of its models at once (see _provider_stalling)."""
-    if _pair_resting(pid, model) or _never_chains(pid, model) or _provider_stalling(pid):
+    if (_pair_resting(pid, model) or _never_chains(pid, model) or _provider_stalling(pid)
+            or _quiet_in_session(pid, model)):
         return True
     r = _tool_turn_reliability(pid, model)
     return r is not None and r < _TOOL_SICK_RATE
@@ -14314,6 +14480,10 @@ def _ctx_begin(body, messages, est, signal=True):
         pin = None
     _ctx_set("_ctx_pin_key", pin)
     _ctx_set("_ctx_pin_msgs", messages)
+    # The session this request belongs to, BEFORE routing: a pair banned for it (it stopped
+    # acting after a category switch) must be seen by the router's fresh pick, not only by the
+    # chain built afterwards.
+    _quiet_context(messages)
 
 
 def _ctx_fixed_part_est(messages, body):
@@ -15501,6 +15671,65 @@ _CREW_AGENT_HINT = (
     "never for quick questions, never for a turn that needs YOUR tools."
 )
 
+# Sub-agent / delegation tool names across the CLIs we serve, matched
+# case-insensitively on the function name in the request's OpenAI-shaped tool
+# list. EXACT (the leaf names): opencode `task`, Claude Code `Task` / `Agent`,
+# codex `spawn_agent` (flattened from its multi_agent_v1 namespace by
+# _responses_ns_entries before this point). SUFFIX (the hub's own MCP crew/swarm
+# tools, which every MCP client PREFIXES -- `mcp__<server>__swarm_windows_start`,
+# `<server>_crew_run`): match the tail so the prefix does not hide them.
+_DELEG_TOOL_EXACT = ("task", "agent", "spawn_agent", "dispatch_agent", "run_agent")
+_DELEG_TOOL_SUFFIX = ("swarm_windows_start", "crew_run", "crew_start",
+                      "spawn_agent", "dispatch_agent", "run_agent")
+
+
+def _delegating_tool_offered(tools):
+    """The name of the FIRST sub-agent / delegation tool the request actually
+    offers, or None. The honest hint below names it when present (the
+    _cmem_apply_note pattern: speak definitely only about what is really in the
+    request). It never ASSERTS absence -- an MCP client often defers its tools,
+    so None does not prove there is no sub-agent tool."""
+    try:
+        for t in tools or []:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function") if isinstance(t.get("function"), dict) else t
+            name = str((fn or {}).get("name") or t.get("name") or "").strip()
+            low = name.lower()
+            if not low:
+                continue
+            if low in _DELEG_TOOL_EXACT or "subagent" in low or "sub_agent" in low:
+                return name
+            if any(low == s or low.endswith("_" + s) for s in _DELEG_TOOL_SUFFIX):
+                return name
+    except Exception:                                            # noqa: BLE001
+        return None
+    return None
+
+
+def _crew_agent_hint(tools):
+    """The sub-agent guidance injected on an agentic opening turn, built from
+    the request's OWN tools. It replaces _CREW_AGENT_HINT, whose "delegate via a
+    tool-free crew POST" instruction an agent mid-loop cannot carry out, so weak
+    free models narrated delegation ("I ran 3 sub-agents in parallel") instead
+    of doing it -- owner 2026-10-27, "he says he ran sub-agents but nothing
+    runs". The load-bearing line is the BAN on claiming delegation that did not
+    happen; the rest points at the real path. Flag `honest_crew_hint` (default
+    on) selects this over the old text."""
+    name = _delegating_tool_offered(tools)
+    if name:
+        return ("SUB-AGENTS: to run work in parallel, actually CALL your `%s` "
+                "tool. Never say you delegated, spawned sub-agents, or ran work "
+                "in parallel unless you called it in THIS turn -- otherwise do "
+                "the work yourself with your own tools. The user can also pick "
+                "the Multi or Swarm tier in their model picker for a full "
+                "hub-run parallel build." % name)
+    return ("SUB-AGENTS: only say you delegated, spawned sub-agents, or ran "
+            "work in parallel if you actually invoked a tool that does it THIS "
+            "turn -- otherwise do the work yourself with your own tools. The "
+            "user can pick the Multi or Swarm tier in their model picker for a "
+            "full hub-run parallel build.")
+
 
 def _awaiting_new_instruction(messages):
     """True when the model is about to answer a FRESH user instruction rather
@@ -15620,9 +15849,10 @@ def _with_model_guide(msgs, pid, model, has_tools):
     return msgs[:i] + [{"role": "system", "content": text}] + msgs[i:]
 
 
-def _apply_craft_brief(messages, agentic=False):
+def _apply_craft_brief(messages, agentic=False, tools=None):
     """Prepend a domain craft brief when the OPENING turn calls for one —
-    plus, for tool-carrying (agentic) requests, the crew-delegation hint.
+    plus, for tool-carrying (agentic) requests, the sub-agent hint built from
+    the request's own `tools`.
 
     Deliberately opening-turn-only. By the second turn a tool loop may be in
     flight, and injecting instructions into a running agent turn is the failure
@@ -15686,7 +15916,11 @@ def _apply_craft_brief(messages, agentic=False):
         brief = craft.system_message(text or "", tools=bool(agentic))
         extra = [brief] if brief else []
         if agentic and config.get_flag("crew_agent_hint", True):
-            extra.append({"role": "system", "content": _CREW_AGENT_HINT})
+            hint = (_crew_agent_hint(tools)
+                    if config.get_flag("honest_crew_hint", True)
+                    else _CREW_AGENT_HINT)
+            if hint:
+                extra.append({"role": "system", "content": hint})
         if not extra:
             return messages
         # After any leading system messages, so the caller's own instructions
@@ -17172,7 +17406,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # for. Skipping them is also ~1.8k tokens back per stage.
         msgs = (payload["messages"] if payload.get("_no_craft")
                 else _apply_craft_brief(payload["messages"],
-                                        agentic=bool(payload.get("tools"))))
+                                        agentic=bool(payload.get("tools")),
+                                        tools=payload.get("tools")))
         if not payload.get("_no_craft"):
             # Per HOP: the guide is for the model answering THIS call.
             msgs = _with_model_guide(msgs, pid, payload.get("model"),
@@ -19180,7 +19415,22 @@ def _apply_orchestrator(pid, resolved, messages, est=0, tools=False, images=Fals
         choice, scope = _orch_effective(_orch_key(body, messages))
         pair = orchestrator.split_choice(choice)
         if not pair:
-            return pid, resolved
+            # No orchestrator chosen: a session whose current pair stopped acting after a
+            # category switch goes back to the pair that WAS acting in it (see
+            # _file_session_reply). A recovery, not a preference, so the "simple turn keeps the
+            # router's pick" rule below does not apply -- "continue" is exactly such a turn.
+            back = _session_return_pair(_agent_pin_key(messages))
+            if not back:
+                return pid, resolved
+            why = _orch_unusable(back[0], back[1], est, tools, images, veto)
+            if why:
+                _log.info("[quiet] returning to %s/%s skipped this turn: %s",
+                          back[0], back[1], why)
+                return pid, resolved
+            g.hub_orchestrator = ("%s/%s (it was doing this session's work)"
+                                  % (back[0], back[1]))
+            g.hub_orchestrator_pair = tuple(back)
+            return tuple(back)
         if diff == "simple" and (est or 0) < STREAM_BIG_REQUEST_TOKENS and pid:
             g.hub_orchestrator = "resting (simple turn)"
             return pid, resolved
@@ -25333,8 +25583,23 @@ def _cm_pending_take(mapkey, convkey, folder_key):
 
 def _cm_resolves_to_multi(body):
     """True when the id (already normalized by _apply_category_effort /
-    _mode_and_effort in the handler) is the Multi tier."""
-    return (body.get("model") or "").strip().lower() == "multi"
+    _mode_and_effort in the handler) is the Multi tier -- or the Swarm tier when
+    `cli_swarm_runs_agents` is on, so picking "swarm" / "<category>-swarm" in
+    ANY CLI's model picker also runs a real parallel swarm_windows run instead of
+    the single-actor roles path (owner 2026-10-27: sub-agents should actually run
+    whatever tier is picked). The same safe gates still apply downstream (a known
+    folder, _multi_wants_a_swarm says WORK, the approval mode), so a trivial
+    swarm ask still falls through to the roles path. Flag off = swarm behaves
+    exactly as today."""
+    m = (body.get("model") or "").strip().lower()
+    if m == "multi":
+        return True
+    if m == "swarm":
+        try:
+            return bool(config.get_flag("cli_swarm_runs_agents", True))
+        except Exception:                                        # noqa: BLE001
+            return False
+    return False
 
 
 # SECURITY (second review, of main 608dfd6): WHERE helper agents run must come
@@ -46061,6 +46326,7 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     # than halves a big tool turn. Stash it for routing's roomy filter and the
     # clock (_rr_fit) and keep it locally for the walk's window check below.
     fit_est = _rr_set_request_fit(messages, tools, est)
+    _quiet_context(messages)          # a pair banned for this session is demoted below too
     pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
                                              require_tools=True,
                                              force_difficulty="hard")
