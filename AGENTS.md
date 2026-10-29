@@ -8176,3 +8176,263 @@ Covered by `tests/test_owner_order_and_progress_lines.py` (38) and the updated
   V4.1 PRO on top. Today neither V4.1 Pro nor MiMo V2.6 Pro is in the fleet, so in practice: V4.1 Flash > GLM.
 
 Release-note: fix: a model that only says what it is about to do ("Polling its status.") no longer ends your turn, and DeepSeek V4.1 Flash is now preferred over GLM 5.3.
+
+## Memory written and updated after every finished turn, in every CLI (2026-10-29)
+
+Covered by `tests/test_memory_writer_per_turn.py` (28 tests: memory.py split and
+updates, the hub's extractor prompt and parser, which /v1 request closes an exchange,
+cooldown and hourly cap, flags, and an end-to-end write-then-update through
+`_v1_observe` with a faked model). Owner: "agents' memories should be WRITTEN and
+UPDATED automatically after each turn, in every CLI, so the hub never forgets
+decisions / constraints / preferences."
+
+- **Why.** The pattern harvest (`memory.harvest_facts`) only files what a turn says in
+  so many words ("Decision: ...", "Always ...", files written, observed passing
+  commands). The model extractor that reads the rest (`_memory_fact_extractor`) was
+  default OFF, and on /v1 it would have run on EVERY hop of a tool loop
+  (`_v1_observe` calls `harvest_facts` per request), i.e. one model call per tool
+  call. And facts only ever accumulated: "we switched from pnpm to npm" left both.
+- **Extractor ON by default** (flag `memory_fact_extractor`, now default True; the
+  `_memory_fact_extractor_on` reader too). Build and Multi keep calling it once per
+  finished turn (`agentic_chat` turn end, the Multi report) exactly as before. Never a
+  paid subscription (`_is_sub` hops skipped), runs on memory's daemon thread, any
+  failure files nothing.
+- **/v1: once per FINISHED exchange** (`_mfx_v1_pass`, `_mfx_exchange`, `_mfx_reserve`;
+  flag `memory_fact_extractor_v1`, default on). A terminal CLI never tells the hub a
+  turn ended, but the NEXT instruction proves it: a request that ends on a real user
+  instruction (`ctxwin.is_real_instruction`; wrapper-only `<system-reminder>` messages
+  skipped) whose nearest earlier non-system message is an assistant reply with text and
+  no tool calls closes the previous exchange. The pass judges that PREVIOUS instruction
+  and that final reply (`<think>` stripped). Never on a tool-result continuation, an
+  interrupted tool call, a CLI's own compaction request (now or as the previous
+  instruction), a `/build/<sid>` request (Build/Multi file their own), a request with no
+  known project folder, or an exchange under `_MFX_MIN_CHARS` (60). At most once per
+  conversation per `_MFX_COOLDOWN_S` (600 s, keyed by `_orch_key`, else the folder) and
+  `_MFX_HOURLY_CAP` (60) passes per rolling hour for the whole hub; the slot is taken
+  before the thread starts. In memory only. `_v1_observe` now calls
+  `harvest_facts(..., model_pass=False)` on every hop: the pattern harvest is unchanged,
+  the model pass never runs per hop. `memory.extract_facts` starts the model pass alone
+  (same scope and `by` as `harvest_facts`); `harvest_facts` gained `model_pass=True`
+  (default = old behaviour) and its thread start moved to `memory._start_model_pass`.
+- **Updates, not only appends** (flag `memory_fact_updates`, default on; the hub's
+  extractor declares it through `_memory_fact_extractor.wants_known`). The extractor is
+  shown the newest 15 facts of the scope (`memory.known_facts`, the rolling file/command
+  lists left out, each clipped to 200 chars in the prompt), numbered, and told never to
+  repeat one and to write `REPLACES <n>: <new fact>` when a new fact replaces or
+  contradicts one. The parser turns that into `{"text", "replaces": <known fact
+  verbatim>}`; `memory._run_extractor` then calls `memory.supersede_fact`: the old fact
+  and its stamp are removed, the new one filed. A replacement naming a fact that was not
+  shown files the new fact and removes nothing; a rolling list is never removed; a
+  credential-looking replacement removes and files nothing. A plain restatement of a
+  known fact is not filed twice (`memory._norm_fact`: "Decision:"/"User preference:"
+  label, case, punctuation and spacing ignored; word ORDER kept, so "use pnpm, not npm"
+  and "use npm, not pnpm" are different facts). Off, or a plain extractor without
+  `wants_known` (tests' own), = the old two-argument call and old filing exactly.
+- **Flags off.** `memory_fact_extractor_v1` off = /v1 runs the pattern harvest only,
+  which is what /v1 did before this change under the old default; it does NOT bring back
+  the per-hop model pass. `memory_fact_extractor` off = no model pass anywhere.
+  `memory_fact_updates` off = the old prompt byte for byte and append-only filing.
+- **Cost.** Zero model calls on tool-loop hops. One cheap (`simple`-routed) call per
+  finished exchange, at most one per conversation per 10 min: <= ~3.2K tokens in
+  (system ~180, known facts <= ~750, instruction <= 3000 chars, reply <= 6000 chars),
+  <= 400 out, up to 3 hops when one fails.
+- **Logs.** Nothing written to the log carries user or agent text: a supersede logs one
+  fixed line, failures log without content (the end-to-end test checks caplog).
+- `tests/conftest.py` `_memory_model_extractor_off_unless_tested` sets
+  `memory._FACT_EXTRACTOR` to None for every other test file (no background model calls,
+  no extra facts); files that install their own extractor still do.
+
+Limits, said plainly:
+- The LAST exchange of a terminal session is never model-judged: no next instruction
+  arrives to close it. It still gets the pattern harvest on its hops.
+- Exchanges that finish inside a conversation's 10-minute cooldown get the pattern
+  harvest only; the next allowed pass judges the latest exchange, not the skipped ones.
+- A wrong `REPLACES` from the model removes the wrong fact (bounded: only facts it was
+  shown, at most 5 per pass). A rewind removes facts its conversation filed but does not
+  bring back a fact they superseded.
+- Dedupe is textual after normalisation, not semantic: a reworded restatement is filed
+  again (showing the known facts to the model is what keeps that rare).
+- Cooldown and cap are in memory: a restart resets them. Build/Multi passes do not count
+  against the /v1 hourly cap.
+- Not verified live: no real CLI or provider was run. Whether cheap free models follow
+  the `REPLACES <n>:` format is unmeasured; the request shapes are the hub's own
+  OpenAI-shaped conversion plus a Claude Code reminder-parts case.
+
+Release-note: improved: the hub now writes each project's memory after every finished turn in every CLI, and updates a remembered decision when you change it instead of keeping both.
+
+## Shared project memory: sub-agents and later sessions reach the project's archive (2026-10-29)
+
+Covered by `tests/test_project_memory_shared.py` (43 tests, hermetic: temp SQLite files and
+folders, a fake clock, a fake provider, the memory store under tmp_path; no network, no real
+config). Owner: "sub-agents and later sessions must reach the memory of the conversation /
+project that started them, so nothing is forgotten across sessions and sub-agents."
+
+- **Why.** The archive (see "Durable conversation memory (2026-10-24)") is keyed by
+  `ctxwin.conversation_key`. A Claude Code Task sub-agent sends its parent's
+  `X-Claude-Code-Session-Id` and already shared the parent's archive; an opencode child
+  session (own `X-Session-Id`) and a codex sub-agent thread (own `prompt_cache_key`) did not,
+  and a later session of the same project started from nothing. The one thing they all share
+  is the project FOLDER their CLI names in its own environment block, so the folder is the link.
+- **Where the folder comes from.** Only the CLI's own environment block: `_cm_trusted_cwd`
+  (the leading system / developer messages, or codex's `<environment_context>` alone in a user
+  message), never pasted text, a `<system-reminder>`, a tool result or an assistant message;
+  two different folders = none. One addition, for my feature only (`_pmem_trusted_view`): codex's
+  usual first user message, its `# AGENTS.md instructions for ...` + `<INSTRUCTIONS>` block
+  followed by exactly one `<environment_context>` and nothing else, is reduced to that
+  `<environment_context>` before `_cm_trusted_cwd` reads it (which otherwise refuses the shape,
+  so a codex session with an AGENTS.md named no folder). The instructions block may not contain
+  its own closing tag, so AGENTS.md text cannot close it early and plant a folder; any other
+  shape fails closed. A filesystem root, the home folder or anything above it is refused
+  (`_publish_folder_too_broad`: it would merge unrelated work). The hub's own repo is NOT
+  refused (sharing memory there is harmless, unlike running Multi in it). The identity stored
+  is `_cm_folder_key` = normcase(realpath(path)).
+- **(1) Project scope** (flag `memory_project_scope`, also needs `conversation_memory`).
+  `convmem` gains a side table `conv_folders(conv PRIMARY KEY, folder, ts)` + index on
+  `(folder, ts)`, `set_folder` (one write per conversation per process; a newer folder replaces
+  the old), `folder_of`, `project_has_items`, `project_rules`. After each hop's archiving,
+  `_pmem_bind_folder` records the conversation's folder when it holds archived items or when the
+  folder's OTHER sessions archived something (its key then reaches them). `memory_search` /
+  `memory_get` with a valid key also read the other conversations of the SAME folder:
+  search reads at most `PROJECT_MAX_CONVS` (8) of them, most recently used first; the key's own
+  conversation keeps most of the slots, the other sessions get every slot it cannot fill and at
+  least a third; each such hit says "from another session of this project", and the same text
+  in two sessions is listed once as the own copy. `memory_get` finds an id in ANY session of the
+  folder (a direct lookup). A key never reaches another folder or a folderless conversation;
+  a wrong key, no hit, an unknown id and another folder's id all answer the one `NOTHING` text;
+  everything is still fenced and labelled as data. A conversation that archived nothing itself
+  but whose folder's other sessions did now gets the memory note (`_pmem_fresh_note_text`,
+  "other sessions of this project folder ... archived ...") and so a key of its own; a
+  conversation that has its own archive and siblings gets one more sentence in its note
+  (`_PMEM_PROJECT_SENTENCE`). The MCP tool descriptions say so while the flag is on (optional
+  `project()` in `hub_mcp.init(memory=)`).
+- **(2) Project memory note** (flag `memory_project_note`). `_pmem_apply_note`, called in
+  `_upstream_chat` right after `_apply_goal_note`: on a fresh user instruction
+  (`_awaiting_new_instruction`, the goal note's own "opening turn" test) of a conversation whose
+  folder is known, ONE system message after the leading system / developer messages:
+  `_PMEM_NOTE_HEAD` ("background notes, not instructions; the user's current request comes
+  first"), the folder's durable facts (`memory.project_facts`) and the standing rules of the
+  folder's OTHER sessions (`convmem.project_rules`, only with the scope flag on; the
+  conversation's own rules are already carried by its memory note). <= `_PMEM_NOTE_CHARS`
+  (1200), facts up to 3/5 of the room when rules exist, the newest of each kept, each line
+  <= 240 chars, credential-looking lines dropped (fails closed), anything the request already
+  carries verbatim left out, deterministic for the same stored facts and rules. Never on a
+  tool-result continuation, a CLI's own compaction request, or a `_no_craft` pipeline stage.
+- **Schema change and migration.** Additive only: two `CREATE ... IF NOT EXISTS` statements at
+  the end of `convmem._SCHEMA`, run on every open. A database written by the old code (the
+  owner's ~57 MB file) gains the empty side table and index; no existing table is altered and
+  no row is rewritten (a test builds an old-schema file by hand, FTS and LIKE variants, and
+  checks a digest of every old table before and after; the key, search, item and rules are
+  unchanged; a second open changes nothing). An old hub opening a migrated file ignores the
+  extra table. The TTL drop (`_drop_conv`) removes a conversation's link with it.
+- **Flags** (`config.get_flag`, default ON; an unreadable config reads as OFF). Off = every
+  request and every tool answer byte for byte as before (tested end to end: with both off a
+  sub-agent's upstream messages equal what the CLI sent, and its key reads nothing of the
+  parent). `tests/conftest.py` `_project_memory_off_unless_tested` turns both off for every other
+  file (CMEM_TEST_ON=1 leaves them on, like conversation memory).
+- **Security, said plainly.** POST /mcp is unauthenticated and the key is still the only
+  capability; what changed is what a key reaches. Residual risk: when no local API key is set,
+  any local process (another OS user included) can POST /v1 with an environment block naming
+  an existing project folder of the owner (folders are guessable), and so get that folder's
+  project note (facts + other sessions' rules) into a model reply, or get a key that reaches the
+  folder's archive by asking the model to repeat its note. Before this change it needed a
+  conversation's session id. A local API key (`_guard_v1`) closes /v1 to other local users;
+  `memory_project_scope` / `memory_project_note` off closes this one. The goal note has the same
+  shape of exposure for a folder's goal.
+- **Limits.** The note rides one hop (the goal note's rule): a tool loop after a fresh
+  instruction no longer carries it. A conversation keyed by the content-hash fallback (no
+  session id) can flip between two folders (newest wins). Search reads 8 other sessions per call
+  (bounded on purpose). A codex AGENTS.md that literally contains `<INSTRUCTIONS>` or
+  `</INSTRUCTIONS>` names no folder (fail closed). Cost per hop not measured on the owner's
+  57 MB file: one `_cm_trusted_cwd` pass, two realpath calls and, with the scope on, one or two
+  indexed queries. UNVERIFIED: no live hub and no real CLI were run; that an opencode child
+  session and a codex sub-agent thread send the SAME folder in their environment block as their
+  parent is inferred from how those CLIs work (same working directory), not captured; whether a
+  model actually calls memory_search remains unmeasured (recall stays optional).
+
+Release-note: new: sub-agents and later sessions in the same project folder now share the hub's memory of that project, so earlier findings and standing rules are no longer forgotten between sessions.
+
+## The CLI's own to-do list on the task board (2026-10-29)
+
+Covered by `tests/test_cli_todo_sync.py` (37: unit per CLI shape, re-sync, the trust
+rules, an old-format board file, and the three real /v1 handlers end to end with a
+fake upstream). Owner: "the hub must always know what each CLI agent has done and what
+remains -- sync the CLIs' own to-do lists into the hub's task board."
+
+- **Why.** Every coding CLI keeps a to-do list by calling a tool, and that call rides in
+  the history it sends on every /v1 request. The board only knew Multi phases and what
+  the owner typed on the Build page, so a terminal session's plan and progress were
+  invisible to the goal brief, the Build top bar and heartbeats.
+- **Shapes, read on 2026-10-29 from the INSTALLED CLIs** (strings in the binaries,
+  read-only; no conversation or transcript was read):
+  - opencode 1.19 `todowrite` {todos: [{content, status: pending|in_progress|completed|
+    cancelled, priority: high|medium|low}]} (no `id` in this version).
+  - codex 0.16x `update_plan` {explanation?, plan: [{step, status: pending|in_progress|
+    completed}]} (`UpdatePlanArgs` / `PlanItemArg`).
+  - Claude Code 2.1.312 `TodoWrite` {todos: [{content, status: pending|in_progress|
+    completed, activeForm}]} -- but in that version it is OFF unless
+    `CLAUDE_CODE_ENABLE_TASKS=false`; the default is the task tools `TaskCreate`
+    {subject, description, activeForm?} (result text "Task #<id> created successfully:
+    ...") and `TaskUpdate` {taskId, status: pending|in_progress|completed|deleted,
+    subject?, activeForm?}. Claude Code rebuilds its own list from the history that way
+    (a create waits for its "Task #N created successfully" result, an update changes or,
+    with "deleted", drops the task it names); `_ctd_replay_tasks` does the same. An update
+    for a task never seen created is skipped unless it names a subject.
+- **What** (`_cli_todo_sync(messages, body)`, app.py section "THE CLI'S OWN TO-DO LIST ON
+  THE TASK BOARD", right after `_apply_goal_note`; names `_ctd_*`). Called on the line
+  after `_v1_observe(...)` in the chat, responses (not on its internal retry pass) and
+  messages handlers. Tool names match case-insensitively with any MCP / namespace prefix
+  removed (`mcp__x__TodoWrite`, `functions.update_plan`). Arguments may be a dict, a JSON
+  string or a JSON string inside a JSON string. It takes the LATEST list (the later of the
+  last list-tool call and the last task-tool call), and only when that list changed since
+  the last sync of this (conversation, folder) -- `_CTD_MEMO`, in memory, LRU 512 -- does
+  it touch the board:
+  - Folder: `_cm_project_dir` only -- the ONE folder the CLI's own environment block names
+    (`_cm_trusted_cwd`), never the hub's own repo, never a root / home / above-home folder.
+    A Multi helper session (`swarm_windows.worker_info(_build_sid())`) is skipped: its
+    phase already is a board task.
+  - Goal: the folder's open goal (`goal_for`); if none, a new one titled `[CLI] <the
+    conversation's first real instruction>` (clipped to 160), created only when there is
+    an item to add.
+  - One task per item, linked by `cli-todo:<sha256(conversation key, folder, normalized
+    item text)>` stored on the task (`ext` below), so a re-sync UPDATES and never
+    duplicates -- also after a restart (the link is in the file). Status map: pending ->
+    todo, in_progress -> doing, completed -> done, cancelled -> blocked with the history
+    note "cancelled in the CLI"; an unknown status leaves the status alone. opencode's
+    priority high/medium/low -> 2/1/0 on creation.
+  - A linked task is changed only when the CLI changed THAT item's status since the last
+    sync (`ext.status` = the status the CLI last gave it), so a status the owner set on the
+    board stands until the CLI moves the item again.
+  - Items that vanish from the list are left as they are. <= 50 items per list (first 50
+    after dedupe by normalized text), titles clipped to 200.
+  - Never raises, never changes the reply, no network; the log line carries counts only
+    (`[todo-sync] N added, M updated (K items in the CLI's list)`).
+- **taskboard.py** (backward compatible): optional task field `ext` = {"key", "status"}
+  (`add_task(..., ext=)`, `update(..., ext=)` -- a link-only change is saved without a
+  history entry, `task_by_ext(key)`); a task without a link carries NO `ext` key, so old
+  rows load and re-save exactly as before (`_clean_task` keeps a valid link, drops a bad
+  one). `Board.deferred()` holds the lock and writes the file once at the end of a batch
+  (a 50-item first sync is one write, not 50).
+- **Flag** `cli_todo_sync` (`config.get_flag`, default ON; a flag read that raises = off). Off =
+  nothing is read or written, byte-identical old behaviour. `tests/conftest.py`
+  (`_cli_todo_sync_off_unless_tested`) turns it off for every other test file.
+- **Limits, said plainly.**
+  - Only those four tools. A CLI that keeps its plan as plain text (or in a file such as
+    PROGRESS.md) is not read. Kimi / qwen / aider and the other CLIs were not checked.
+  - The live wire was not captured: the shapes come from the binaries' own schema strings
+    and Claude Code's own rebuild code, and the tests use synthetic histories. Not run
+    against a live hub or a real CLI.
+  - A CLI's compaction can drop the early to-do calls from the history: a list rebuilt
+    from what is left only adds and updates (nothing is removed), and Claude Code
+    `TaskUpdate`s for tasks whose create was compacted away are skipped.
+  - The goal a CLI conversation creates is a normal board goal: from then on it rides in
+    every opening-turn goal note, Build brief and Multi run for that folder (that is the
+    point), including in later, unrelated conversations there, until the owner closes it.
+    Cancelled items show as `[blocked]` in that brief.
+  - Claude Code sub-agents share their parent's session id, so their lists share its
+    conversation key (different item texts still make different tasks).
+  - With heartbeats switched on (default off), a heartbeat can pick the CLI's open `todo`
+    items once the hub has been idle for a minute, like any board task.
+  - The link includes the conversation key: the same item in two conversations is two
+    tasks; a conversation without a session id is keyed by its content hash.
+
+Release-note: new: the hub now copies each terminal CLI's own to-do list (opencode, Codex, Claude Code) onto the project's task board, so it always knows what the agent has done and what is left.
