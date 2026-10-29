@@ -82,13 +82,19 @@ _PUBLISH = None  # {"start", "status", "stop", "renew"} callables, or None
 _MEMORY = None  # {"enabled", "search", "get"} callables, or None
 MEMORY_TOOLS = ("memory_search", "memory_get")
 MEMORY_NOTHING = "[hub memory archive] No matching archived memory."
+# CHAIN TOOLS: the chain_* smart-contract tools (chainkit.py). A fifth family with
+# its own contract: "tools" returns their schemas, "call"(name, arguments) runs
+# one and returns a dict ({error, code} on failure) or raises ValueError for a
+# malformed argument (-> -32602). Advertised only while "enabled" says so.
+_CHAIN = None  # {"enabled", "tools", "call"} callables, or None
+CHAIN_PREFIX = "chain_"
 _JOBS = {}  # job_id -> {"status", "text", "error", "created"}
 _JOBS_LOCK = threading.Lock()
 
 PUBLISH_TOOLS = ("publish_start", "publish_status", "publish_stop", "publish_renew")
 
 
-def init(runner, version=None, swarm=None, publish=None, memory=None):
+def init(runner, version=None, swarm=None, publish=None, memory=None, chain=None):
     """Wire the crew execution contract: runner(messages, crew_name) -> str,
     blocking. Called once by app.py after crews.run/format_answer exist.
 
@@ -106,8 +112,13 @@ def init(runner, version=None, swarm=None, publish=None, memory=None):
     for the model, plus an optional enabled() -- while it is false the tools are
     neither advertised nor callable -- and an optional project() -- while it is
     true the two descriptions say the tools also reach the other sessions of
-    the same project folder."""
-    global _RUNNER, SERVER_VERSION, _SWARM, _PUBLISH, _MEMORY
+    the same project folder.
+
+    `chain` wires the chain_* smart-contract tools: tools() -> their schemas,
+    call(name, arguments) -> dict (ValueError for a malformed argument), plus an
+    optional enabled() -- while it is false they are neither advertised nor
+    callable."""
+    global _RUNNER, SERVER_VERSION, _SWARM, _PUBLISH, _MEMORY, _CHAIN
     _RUNNER = runner
     if swarm:
         _SWARM = swarm
@@ -115,6 +126,8 @@ def init(runner, version=None, swarm=None, publish=None, memory=None):
         _PUBLISH = publish
     if memory:
         _MEMORY = memory
+    if chain:
+        _CHAIN = chain
     if version:
         SERVER_VERSION = version
 
@@ -238,7 +251,7 @@ def _tools():
                 "required": ["run_id"]
             }
         }
-    ]) + _publish_tools() + _memory_tools()
+    ]) + _publish_tools() + _memory_tools() + _chain_tools()
 
 
 # The consent wording below is load-bearing (tests pin it): these tools put a
@@ -424,6 +437,45 @@ def _call_memory_tool(name, arguments):
     except Exception:                                            # noqa: BLE001
         out = MEMORY_NOTHING
     return _text_result(out if isinstance(out, str) and out else MEMORY_NOTHING)
+
+
+def _chain_enabled():
+    if _CHAIN is None:
+        return False
+    fn = _CHAIN.get("enabled")
+    if not callable(fn):
+        return True
+    try:
+        return bool(fn())
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _chain_tools():
+    if not _chain_enabled():
+        return []
+    try:
+        tools = _CHAIN["tools"]()
+    except Exception:                                            # noqa: BLE001
+        return []
+    return [t for t in (tools or []) if isinstance(t, dict)
+            and str(t.get("name", "")).startswith(CHAIN_PREFIX)]
+
+
+def _call_chain_tool(name, arguments):
+    """The chain_* tools. A malformed ARGUMENT is a JSON-RPC error (the callable
+    raised ValueError); a refusal or a failure is tool text with isError and a
+    `code`, which the model can read and act on."""
+    try:
+        out = _CHAIN["call"](name, arguments)
+    except ValueError as exc:
+        return _error(-32602, str(exc))
+    except Exception as exc:                                     # noqa: BLE001
+        return _text_result({"error": "chain tool failed: %s" % type(exc).__name__,
+                             "code": "failed"}, is_error=True)
+    if not isinstance(out, dict):
+        out = {"result": out}
+    return _text_result(out, is_error=bool(out.get("error")))
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +687,10 @@ def _call_tool(params):
         if not _memory_enabled():
             return _error(-32602, "Unknown tool: %r" % (name,))
         return _call_memory_tool(name, arguments)
+    if isinstance(name, str) and name.startswith(CHAIN_PREFIX):
+        if name not in {t.get("name") for t in _chain_tools()}:
+            return _error(-32602, "Unknown tool: %r" % (name,))
+        return _call_chain_tool(name, arguments)
     if name not in ("crew_run", "crew_start", "crew_result"):
         return _error(-32602, "Unknown tool: %r" % (name,))
     if _RUNNER is None:
