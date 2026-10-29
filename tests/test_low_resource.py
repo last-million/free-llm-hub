@@ -132,3 +132,29 @@ def test_settings_control():
         assert needle in src, needle
     js = src[src.index("function renderLowres"):src.index("function loadLowres")]
     assert "textContent" in js and "innerHTML" not in js
+
+def test_hub_own_cpu_uses_persistent_handles_not_a_fresh_zero():
+    """The governor must subtract the hub's own CPU; a fresh psutil.Process() every
+    tick reads 0.0, so `own` was stuck at 0 and the hub's workers counted as 'other
+    apps'. With persistent handles, the second tick reads a real delta."""
+    lowres._CPU_STATE.clear()
+
+    class FakeP:
+        def __init__(self, pid, series):
+            self.pid = pid
+            self._series = list(series)
+            self._i = 0
+
+        def cpu_percent(self, _):
+            v = self._series[min(self._i, len(self._series) - 1)]
+            self._i += 1
+            return v
+
+    hub = FakeP(os.getpid(), [0.0, 160.0, 160.0])
+    factory = lambda pid: hub if pid == os.getpid() else FakeP(pid, [0.0])
+    no_kids = lambda p: []
+    # first tick primes the handle -> own 0 (its first reading is meaningless)
+    assert lowres._hub_own_cpu(8, proc_factory=factory, children_of=no_kids) == 0.0
+    # second tick reads a real delta -> the hub's own 160% is subtracted, not stuck at 0
+    assert lowres._hub_own_cpu(8, proc_factory=factory, children_of=no_kids) == 160.0 / 8
+    lowres._CPU_STATE.clear()

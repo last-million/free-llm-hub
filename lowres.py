@@ -191,16 +191,60 @@ def _psutil_procs():
 _ENV_CACHE = {}
 
 
+_CPU_STATE = {}                 # pid -> psutil.Process, kept across ticks (see _hub_own_cpu)
+
+
+def _hub_own_cpu(cores, proc_factory=None, children_of=None):
+    """CPU % of the hub process AND its descendants (the agent / worker CLIs it
+    spawns), divided by `cores`, using PERSISTENT psutil handles.
+
+    psutil's cpu_percent(None) measures since the handle's LAST call, so a FRESH
+    Process() every tick always reads 0.0 -- the bug this replaces, which made
+    _psutil_cpu leave `own` at 0 and count the hub's own workers as "other apps",
+    so a CPU-heavy Multi run tripped the governor's CPU hold against itself. A
+    newly seen pid is primed this tick and counted only from the next one (its
+    first reading is meaningless). Injectable for tests; never raises."""
+    if proc_factory is None:
+        import psutil
+        proc_factory = psutil.Process
+    if children_of is None:
+        children_of = lambda p: p.children(recursive=True)
+    hub = os.getpid()
+    try:
+        pids = {hub} | {k.pid for k in children_of(proc_factory(hub))}
+    except Exception:                                            # noqa: BLE001
+        pids = {hub}
+    primed = set(_CPU_STATE)        # only pids seen BEFORE this tick have a valid delta
+    for pid in pids:
+        if pid not in _CPU_STATE:
+            try:
+                p = proc_factory(pid)
+                p.cpu_percent(None)                 # prime; this reading is discarded
+                _CPU_STATE[pid] = p
+            except Exception:                        # noqa: BLE001
+                pass
+    for pid in list(_CPU_STATE):
+        if pid not in pids:
+            _CPU_STATE.pop(pid, None)                # process gone: drop its handle
+    tot = 0.0
+    for pid in list(primed & set(_CPU_STATE)):
+        try:
+            tot += float(_CPU_STATE[pid].cpu_percent(None))
+        except Exception:                            # noqa: BLE001
+            _CPU_STATE.pop(pid, None)
+    return tot / max(1, int(cores or 1))
+
+
 def _psutil_cpu():
-    """Overall CPU % of everything that is not the hub's workers or the hub."""
+    """Overall CPU % of everything that is NOT the hub or the agent CLIs it
+    spawned, so a Multi run's own helpers never trip the CPU hold."""
     import psutil
     total = psutil.cpu_percent(None)
     cores = psutil.cpu_count() or 1
-    own = 0.0
     try:
-        own = psutil.Process().cpu_percent(None) / cores
+        own = _hub_own_cpu(cores)
     except Exception:                                            # noqa: BLE001
-        pass
+        own = 0.0
     return max(0.0, total - own)
 
 

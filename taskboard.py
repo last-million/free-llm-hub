@@ -76,6 +76,20 @@ def _as_list(value):
         return [str(value)]
 
 
+def _as_int(value):
+    """int(value) for a plain integer or a clean integer string, else 0. A
+    malformed row (priority:"--5", "3.5", None) must not raise -- load skips a
+    row it cannot clean, and this keeps the rest of a row whose priority is junk."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
 class Board:
     """A goal/task board backed by one JSON file (or memory when path is
     None). Thread-safe (one reentrant lock); every public method is total --
@@ -397,6 +411,8 @@ class Board:
                 os.makedirs(folder, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
             return True
         except Exception:                                        # noqa: BLE001
@@ -418,10 +434,16 @@ class Board:
                 if isinstance(data, dict):
                     for g in data.get("goals") or ():
                         if isinstance(g, dict) and g.get("id"):
-                            goals[g["id"]] = self._clean_goal(g)
+                            try:
+                                goals[g["id"]] = self._clean_goal(g)
+                            except Exception:                    # noqa: BLE001
+                                pass                 # skip one bad row, keep the rest
                     for t in data.get("tasks") or ():
                         if isinstance(t, dict) and t.get("id"):
-                            tasks[t["id"]] = self._clean_task(t)
+                            try:
+                                tasks[t["id"]] = self._clean_task(t)
+                            except Exception:                    # noqa: BLE001
+                                pass
                     ok = True
             except Exception:                                    # noqa: BLE001
                 goals, tasks, ok = {}, {}, False
@@ -452,14 +474,14 @@ class Board:
             "detail": str(t.get("detail") or ""),
             "needs": _as_list(t.get("needs")),
             "files": _as_list(t.get("files")),
-            "priority": int(t.get("priority") or 0) if str(t.get("priority") or 0).lstrip("-").isdigit() else 0,
+            "priority": _as_int(t.get("priority")),
             "status": status if status in STATUSES else "todo",
             "owner": t.get("owner"),
             "run_id": t.get("run_id"),
             "phase": t.get("phase") if isinstance(t.get("phase"), int) else None,
             "created_at": t.get("created_at") or 0,
             "updated_at": t.get("updated_at") or t.get("created_at") or 0,
-            "history": list(t.get("history") or []),
+            "history": list(t.get("history")) if isinstance(t.get("history"), list) else [],
         }
         link = _clean_ext(t.get("ext"))
         if link is not None:                # old rows have none: left without the key

@@ -727,3 +727,22 @@ def test_a_streamed_call_that_slipped_through_is_flagged_in_the_next_note(world,
     note = A._scope_apply_note(body["messages"])[1]["content"]
     assert len(note) <= 800
     assert "WARNING: a streamed call to payments.example.com (OUT of scope)" in note
+
+# --- scope parsing fixes (2026-10-29): a container sub-heading / a prose intro ---------------
+
+def test_a_container_subheading_under_out_of_scope_stays_out():
+    c = S.extract("## Out of scope\n### Domains\n- vpn.example.com\n")
+    assert S.in_scope("vpn.example.com", c) is False
+    assert all(e["p"] != "vpn.example.com" for e in c["in"])
+
+
+def test_a_container_subheading_under_in_scope_stays_in():
+    c = S.extract("## In scope\n### Domains\n- a.example.com\n")
+    assert S.in_scope("a.example.com", c) is True
+
+
+def test_a_prose_intro_after_out_of_scope_does_not_orphan_the_list():
+    c = S.extract("## Out of scope\n\nThe following assets must not be tested:\n"
+                  "*.internal.example.com\nvpn.example.com\n")
+    assert S.in_scope("vpn.example.com", c) is False
+    assert any(e["p"] == "vpn.example.com" for e in c["out"])

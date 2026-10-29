@@ -254,6 +254,21 @@ def _heading(line):
     return kind, rest
 
 
+_NEUTRAL_HEAD_RE = re.compile(r"(?:domains?|assets?|targets?|hosts?|items?)$", re.I)
+
+
+def _neutral_head(line):
+    """True when a heading is ONLY a neutral container word (Domains / Assets /
+    Targets / Hosts / Items). Such a word means in-scope at the top of a page,
+    but under an already-open section it is a sub-heading, not a new section --
+    so "### Domains" under "## Out of scope" must not flip the list to in-scope
+    (see extract). Cleans the line the same way _heading does."""
+    s = line.strip().lstrip("#").strip()
+    s = re.sub(r"^[>*_\s]+|[*_\s]+$", "", s).replace("**", "").replace("__", "")
+    s = s.split(":", 1)[0].strip()
+    return bool(_NEUTRAL_HEAD_RE.fullmatch(s))
+
+
 _BULLET_RE = re.compile(r"^\s*(?:[-*+•>]|\d{1,3}[.)])\s+")
 
 
@@ -564,6 +579,7 @@ def extract(text, kind=None, src="message"):
         lines = text.splitlines()
         heads = _target_heads(lines)
         section, blank, tg = None, False, None
+        section_host = False               # has the open section listed a host yet?
         for i, raw in enumerate(lines):
             line = raw.strip()
             if not line:
@@ -571,20 +587,33 @@ def extract(text, kind=None, src="message"):
                 continue
             if i in heads:
                 tg = _clean_tg(heads[i])
-                section, blank = None, False
+                section, blank, section_host = None, False, False
                 _add_target(card, tg, src)
                 _add(card, "in", _pattern(tg), kind, src, tg)
                 continue
             hk, rest = _heading(line)
             if hk:
-                section, blank = hk, False
-                if rest:
-                    _take(card, rest, hk, kind, src, tg)
+                if hk == "in" and section and _neutral_head(line):
+                    # a bare container word ("Domains" / "Assets" / "Targets")
+                    # under an already-open section is a SUB-heading, not a new
+                    # in-scope section -- keep the section, so an excluded list
+                    # under "Out of scope" is never recorded as in-scope.
+                    blank = False
+                    if rest and _take(card, rest, section, kind, src, tg):
+                        section_host = True
+                    continue
+                section, blank, section_host = hk, False, False
+                if rest and _take(card, rest, hk, kind, src, tg):
+                    section_host = True
                 continue
-            if blank and section and not _scopeish(line):
-                section = None
+            # a section ends at a blank line followed by prose -- but only once it
+            # has actually listed a host, so a descriptive intro sentence right
+            # after the heading does not orphan the list that follows it.
+            if blank and section and section_host and not _scopeish(line):
+                section, section_host = None, False
             blank = False
-            _take(card, line, section, kind, src, tg)
+            if _take(card, line, section, kind, src, tg):
+                section_host = True
     except Exception:                                            # noqa: BLE001
         return empty()
     return card
@@ -593,7 +622,7 @@ def extract(text, kind=None, src="message"):
 def _take(card, line, section, kind, src, tg=None):
     body = _clean(line)
     if not body:
-        return
+        return False
     clauses = [c for c in _SENT_SPLIT_RE.split(body) if c and c.strip()]
     found_host = False
     for clause in clauses:
@@ -612,6 +641,7 @@ def _take(card, line, section, kind, src, tg=None):
         # "Out of scope" lists issue types too (self-XSS, missing headers):
         # worth keeping as a rule line, never as a host.
         _add_rule(card, "Out of scope: " + body, kind, src, tg)
+    return found_host
 
 
 def normalize(card):

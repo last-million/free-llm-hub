@@ -174,3 +174,20 @@ def test_configure_points_default_at_file(tmp_path):
         assert data["goals"][0]["title"] == "via default"
     finally:
         taskboard.configure(None)          # back to memory for other tests
+
+def test_one_bad_row_does_not_wipe_the_whole_board(tmp_path):
+    p = tmp_path / "taskboard.json"
+    json.dump({"version": 1, "goals": [{"id": "g1", "title": "Ship"}],
+               "tasks": [
+                   {"id": "t1", "goal_id": "g1", "title": "good", "priority": 2},
+                   {"id": "bad", "goal_id": "g1", "title": "bad", "priority": "--5"},
+                   {"id": "t2", "goal_id": "g1", "title": "good2", "history": 5},
+               ]}, open(p, "w"))
+    b = taskboard.Board(path=str(p))
+    assert b.load() is True
+    ids = {t["id"] for t in b.tasks()}
+    assert {"t1", "bad", "t2"} <= ids                 # one junk field never wipes the board
+    assert "g1" in {g["id"] for g in b.goals()}
+    # the junk values were hardened, not propagated
+    by_id = {t["id"]: t for t in b.tasks()}
+    assert by_id["bad"]["priority"] == 0 and by_id["t2"]["history"] == []

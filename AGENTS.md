@@ -9145,3 +9145,48 @@ the exact gap between two turns; the authoritative stop is `_stall_cancel` on th
 plus the still-busy abort. Not run against a live hub or a real CLI -- the tests are hermetic.
 
 Release-note: improved: on the Build page, a turn that is still doing real work now keeps continuing by itself (not just twice), bounded by a retry/time budget, and tells you when and why it stops.
+
+## Bug-fix batch: scope-guard parsing, task-board load, governor CPU (2026-10-29)
+
+Found by a read-only correctness review (not a new feature). Each fix has a test in its
+module's suite; the happy path is unchanged.
+
+- **A container sub-heading under "Out of scope" no longer flips the list to in-scope**
+  (`scopecard.py` `_heading` / `extract`, new `_neutral_head`). `_HEAD_RE`'s `in` branch matches
+  bare container words (Domains / Assets / Targets / Hosts / Items), so a nested `### Domains`
+  under `## Out of scope` was read as a NEW in-scope section and an excluded host
+  (`vpn.example.com`) was recorded IN-scope -- the model was affirmatively told it was
+  authorized. Now a bare container word under an already-open section is a sub-heading (the
+  section is kept); at the top of a page it still defaults to in-scope. Covered by
+  `tests/test_scope_guard.py`.
+- **A descriptive intro sentence after "Out of scope" no longer orphans the host list**
+  (`scopecard.py` `extract`; `_take` now reports whether it found a host). The section-reset
+  (`blank` + non-scopeish prose) fired on an intro line BEFORE the list arrived, dropping the
+  out-of-scope hosts so the guard never blocked them. It now resets only once the section has
+  actually listed a host, so "## Out of scope\n\nThe following...:\nvpn.example.com" records
+  vpn as OUT. The existing "prose ends a section after its list" behaviour is unchanged
+  (that case already has a host, so the reset still fires).
+- **One malformed row no longer wipes the whole task board on load** (`taskboard.py` `load`,
+  `_clean_task`, new `_as_int`). `load()` cleaned every row inside one try/except, and
+  `_clean_task` could raise (`priority:"--5"` -> `int("--5")`; a non-list `history` ->
+  `list(5)`), so one bad row emptied goals+tasks and the next mutation `os.replace`d the empty
+  board over the file (silent data loss). Each row is now cleaned under its own guard (bad rows
+  skipped, as the docstring always promised), priority/history parse defensively, and
+  `_save_locked` fsyncs before the replace. Covered by `tests/test_taskboard.py`.
+- **The RAM governor no longer counts the hub's own workers as "other apps" CPU**
+  (`lowres.py` `_psutil_cpu`, new `_hub_own_cpu` / `_CPU_STATE`). `_psutil_cpu` built a FRESH
+  `psutil.Process()` every tick and read `cpu_percent(None)`, which is always 0.0 on a new
+  handle, so `own` was always 0 and `total - own == total`: during a CPU-heavy Multi run the
+  hub's own helper CLIs counted as external load and could trip the CPU hold (>90% for 10 s)
+  against itself, stopping new helper spawns. `own` is now the CPU of the hub PROCESS TREE
+  (hub + descendants) via PERSISTENT psutil handles, primed once and counted from the next tick.
+  The injected-cpu test path (`Governor(cpu=...)`) is unchanged. Covered by
+  `tests/test_low_resource.py`.
+
+Still open from the same review (not in this batch): convmem's "standing rules never erode"
+(a seq-distance retention + a re-assert dedup, both erode rules); the stream early-release gate
+omits the vision-capability refusal check; a bare chat-template-token reply reads as an answer;
+and the heartbeat-only items (a closed goal still feeds runs, an unsatisfiable dependency stalls
+dependents silently) -- heartbeats are off by default.
+
+Release-note: fix: authorized-testing scope parsing no longer misreads an excluded host as in-scope, the task board survives a corrupt row instead of wiping itself, and the RAM governor stops throttling its own multi-agent runs.
