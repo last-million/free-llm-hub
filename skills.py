@@ -29,6 +29,9 @@ BUILTIN = [
      "Finish the job: start the project locally in the background and hand over the URL."),
     ("security", "Security",
      "Auth, payments and user data designed safely on the first turn."),
+    ("app_testing", "App & API testing",
+     "Authorized testing (a program, a client, or your own app): scope and rules first, "
+     "evidence-only findings, a report template."),
     ("seo", "SEO",
      "Every page built to rank: titles, meta, headings, schema, sitemap."),
     ("images", "Images",
