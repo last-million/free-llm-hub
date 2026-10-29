@@ -150,7 +150,14 @@ CATEGORIES = [
         # "glm-5" rather than "glm": 5.2 and 5.3 are the steerable generation,
         # and a bare "glm" would also sweep in glm-4.6-thinking, which belongs
         # to `reasoning` and is a different claim about behaviour.
+        # 2026-10-29: "deepseek-v4.1-flash" (7 live ids: nvidia, freemodel, five g4f
+        # copies) does NOT contain the substring "deepseek-v4-flash", so the newer
+        # release of an already-listed family sat outside the category while its
+        # predecessor was in. A newer version follows its family; "-1-" is the
+        # spelling some relays use ("deepseek-v4-1-flash"). Flash only: the
+        # v4.1 pro/reasoning cuts are a different claim about behaviour.
         ("hermes-3", "cydonia", "grok-", "qwen3.8", "hy3", "deepseek-v4-flash",
+         "deepseek-v4.1-flash", "deepseek-v4-1-flash",
          "gpt-oss", "dolphin", "openhermes", "glm-5"),
     ),
     (
