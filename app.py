@@ -26194,8 +26194,140 @@ def _auto_continue_one(sid, plan, forced):
 # retries), an exhausted budget cap or an update drain is NEVER retried.
 import stallcheck                                          # noqa: E402
 
-_STALL_RETRIES = {}        # session id -> (original instruction, retries used[, auto-send pending])
+_STALL_RETRIES = {}        # session id -> chain-state dict (see _stall_fresh / _stall_state)
 _STALL_LOCK = threading.Lock()
+
+
+def _stall_recheck_on():
+    return bool(config.get_flag("stall_recheck", True))
+
+
+def _stall_progress_on():
+    """Progress-gated auto-continue: keep a WORKING Build turn going past the flat 2-retry cap,
+    bounded by a count cap + a wall-clock budget. Off -> the original flat behaviour exactly."""
+    return bool(config.get_flag("stall_recheck_progress", True))
+
+
+def _stall_max_total():
+    try:
+        n = int(config.get_setting("stall_progress_max_retries", stallcheck.MAX_TOTAL_RETRIES))
+    except Exception:                                            # noqa: BLE001
+        n = stallcheck.MAX_TOTAL_RETRIES
+    return max(stallcheck.MAX_RETRIES, min(200, n))
+
+
+def _stall_budget_seconds():
+    try:
+        n = int(config.get_setting("stall_progress_budget_seconds", 3600))
+    except Exception:                                            # noqa: BLE001
+        n = 3600
+    return max(60, min(86400, n))
+
+
+def _stall_provider_wait():
+    try:
+        n = int(config.get_setting("stall_provider_wait_seconds", 180))
+    except Exception:                                            # noqa: BLE001
+        n = 180
+    return max(0, min(1800, n))
+
+
+def _stall_fresh(instruction):
+    return {"orig": instruction or "", "total": 0, "unproductive": 0, "pending": False,
+            "started": None, "nonce": 0, "last_hash": None, "seen": set()}
+
+
+def _stall_state(session_id):
+    """The chain state as a dict, tolerant of a legacy (orig, used[, pending]) tuple some tests
+    set directly. None when there is no chain."""
+    st = _STALL_RETRIES.get(session_id)
+    if st is None:
+        return None
+    if isinstance(st, dict):
+        return st
+    try:
+        orig = st[0]
+        used = int(st[1]) if len(st) > 1 else 0
+        pend = bool(st[2]) if len(st) > 2 else False
+    except Exception:                                            # noqa: BLE001
+        return None
+    return {"orig": orig, "total": used, "unproductive": used, "pending": pend,
+            "started": None, "nonce": 0, "last_hash": None, "seen": set()}
+
+
+def _stall_cancel(session_id):
+    """Drop any auto-continue chain for this session (a user Stop, or the session ending). A
+    re-send still waiting then sees its nonce gone and aborts instead of landing on a new turn."""
+    with _STALL_LOCK:
+        _STALL_RETRIES.pop(session_id, None)
+
+
+_STALL_WS_RE = re.compile(r"\s+")
+
+
+def _stall_norm(text, cap=160):
+    return _STALL_WS_RE.sub(" ", str(text or "").strip().lower())[:cap]
+
+
+def _stall_tool_sigs(info):
+    """Normalised signatures of the tool calls THIS turn made (from the hook's tool_sigs)."""
+    out = set()
+    for t in (info.get("tool_sigs") or []):
+        s = _stall_norm(t, 120)
+        if s:
+            out.add(s)
+    return out
+
+
+def _stall_reply_hash(reply):
+    return hashlib.sha1(_stall_norm(reply, 4000).encode("utf-8", "replace")).hexdigest()
+
+
+def _stall_productive(info, prior, sigs, rhash):
+    """Did THIS turn do NEW, changing work vs the chain so far? used_tools alone is too weak (a
+    read-only `ls` sets it), so progress means a tool-call signature not seen before in the
+    chain, or a changed final reply alongside a real tool/observed result. A model repeating
+    the same action with the same message is NOT making progress and must not run to the cap."""
+    seen = prior.get("seen") or set()
+    new_sig = any(s not in seen for s in sigs)
+    reply_changed = rhash != prior.get("last_hash")
+    did_work = bool(info.get("used_tools")) or int(info.get("observed") or 0) > 0
+    return bool(new_sig or (reply_changed and did_work))
+
+
+def _stall_evaluate(session_id, info):
+    """(Decision, prior-state, made_progress, tool-sigs, reply-hash) for one ended Build turn.
+    Reads the chain state; never raises into the caller's try block."""
+    instruction = info.get("instruction") or ""
+    prior = _stall_prior(session_id, instruction)
+    if info.get("stopped") or info.get("rejected"):
+        return stallcheck.Decision(False, "stopped"), prior, False, set(), None
+    errored = bool(info.get("errored"))
+    progress_mode = _stall_progress_on()
+    if progress_mode:
+        sigs = _stall_tool_sigs(info)
+        rhash = _stall_reply_hash(info.get("final_reply"))
+        made_progress = _stall_productive(info, prior, sigs, rhash)
+    else:
+        sigs, rhash = set(), None
+        made_progress = bool(info.get("used_tools") or info.get("observed"))
+    answer_ok = (not errored) and _stall_answer_ok(info.get("final_reply"), instruction)
+    d = stallcheck.assess(made_progress, answer_ok, errored=errored,
+                          attempts_used=int(prior.get("total") or 0),
+                          unproductive_used=int(prior.get("unproductive") or 0),
+                          max_total=_stall_max_total(), progress_mode=progress_mode)
+    return d, prior, made_progress, sigs, rhash
+
+
+def _stall_exhaust_notice(reason, used=0, budget_min=0):
+    if reason == stallcheck.COUNT:
+        return ("Stopped continuing by itself after %d tries (the retry limit). Send a message "
+                "to pick it up." % int(used))
+    if reason == "time":
+        return ("Stopped continuing by itself after about %d min (the time limit). Send a "
+                "message to pick it up." % int(budget_min))
+    return ("Stopped continuing by itself: the agent stopped making new progress. Send a "
+            "message to pick it up.")
 
 
 def _stall_answer_ok(reply, instruction=""):
@@ -26223,96 +26355,153 @@ def _stall_answer_ok(reply, instruction=""):
 
 
 def _stall_prior(session_id, instruction):
-    """(original instruction, retries already used, was-it-our-own-retry) for this turn END.
-    A turn that ends because WE re-sent Continue belongs to the chain that sent it; any other
-    turn is a fresh instruction (the count restarts), unless it repeats the stored one."""
+    """The chain state to BUILD ON for this turn end, as a dict. A turn that ended because WE
+    re-sent Continue (pending) stays in its chain; any other turn is a fresh instruction unless
+    it repeats the stored one (then the chain continues)."""
     with _STALL_LOCK:
-        prev = _STALL_RETRIES.get(session_id)
-    if not prev:
-        return instruction, 0, False
-    orig, used = prev[0], int(prev[1])
-    ours = len(prev) > 2 and bool(prev[2])
-    if ours:
-        return orig, used, True
-    return (orig, used, False) if orig == instruction else (instruction, 0, False)
+        st = _stall_state(session_id)
+    if not st:
+        return _stall_fresh(instruction)
+    if st.get("pending") or st.get("orig") == (instruction or ""):
+        return st
+    return _stall_fresh(instruction)
 
 
 def _stall_decide(session_id, info):
-    """stallcheck.Decision for one ended Build turn. Pure apart from reading the retry
-    count; never raises (a surprise = do not retry)."""
+    """stallcheck.Decision for one ended Build turn (the thin wrapper the unit tests use)."""
     try:
-        if info.get("stopped") or info.get("rejected"):
-            return stallcheck.Decision(False, "stopped")
-        instruction = info.get("instruction") or ""
-        _orig, used, _ours = _stall_prior(session_id, instruction)
-        errored = bool(info.get("errored"))
-        made_progress = bool(info.get("used_tools") or info.get("observed"))
-        answer_ok = (not errored) and _stall_answer_ok(info.get("final_reply"), instruction)
-        return stallcheck.assess(made_progress, answer_ok, errored=errored, attempts_used=used)
+        return _stall_evaluate(session_id, info)[0]
     except Exception:                                            # noqa: BLE001
         return stallcheck.Decision(False, stallcheck.DONE)
 
 
-def _stall_send(session_id, text):
+def _stall_send(session_id, text, guard=None, provider_ok=None, clock=None, wait=20.0):
     """Send `text` to a live Build session and drain the turn (so its own end-of-turn hook
-    runs). Waits briefly for the ended turn to release the session first."""
-    deadline = time.monotonic() + 20
-    while agentic_chat.turn_busy(session_id) and time.monotonic() < deadline:
+    runs). Aborts (returns False) if the session is still busy after `wait` (a new turn owns it
+    now -- do not pile Continue on top of the user's own message) or if `guard` says the chain
+    was superseded. If `provider_ok` is given and the free providers are in 429 back-off, waits
+    (bounded by stall_provider_wait_seconds) for them to recover first -- the heartbeat-style
+    pause, so a long run does not burn continues against rate-limited providers."""
+    now = clock or time.monotonic
+    deadline = now() + wait
+    while agentic_chat.turn_busy(session_id) and now() < deadline:
         time.sleep(0.2)
+    if agentic_chat.turn_busy(session_id):
+        return False
+    if guard is not None and not guard():
+        return False
+    if provider_ok is not None:
+        pdeadline = now() + _stall_provider_wait()
+        while now() < pdeadline:
+            try:
+                if provider_ok():
+                    break
+            except Exception:                                    # noqa: BLE001
+                break
+            if guard is not None and not guard():
+                return False
+            time.sleep(1.0)
+    if guard is not None and not guard():
+        return False
     for _ev in agentic_chat.send_message_stream_durable(session_id, text):
         pass
+    return True
 
 
-def _stall_on_turn_end(session_id, info, send=None, sync=False):
+def _stall_on_turn_end(session_id, info, send=None, sync=False, clock=None):
     """The turn-end hook. Never raises, never blocks the turn (the re-send runs on its own
-    thread unless `sync`, which only the tests use)."""
+    thread unless `sync`, which only the tests use). With stall_recheck_progress on, a turn that
+    keeps making NEW progress is continued on the same model up to _stall_max_total() times and
+    a wall-clock budget; a turn that makes no new progress keeps the tight 2-retry cap."""
     try:
-        if not config.get_flag("stall_recheck", True):
+        if not _stall_recheck_on():
             return
         if (info.get("quality") or "") == "multi" or swarm_windows.worker_info(session_id):
             return          # a Multi conversation / helper has its own phase retries
-        d = _stall_decide(session_id, info)
-        instruction = info.get("instruction") or ""
-        orig, used, _ours = _stall_prior(session_id, instruction)
+        now = (clock or time.monotonic)()
+        d, prior, made_progress, sigs, rhash = _stall_evaluate(session_id, info)
         if not d.retry:
+            used = int(prior.get("total") or 0)
+            ended = d.reason in (stallcheck.EXHAUSTED, stallcheck.COUNT)
             with _STALL_LOCK:
-                if d.reason == stallcheck.EXHAUSTED:
+                if ended:
                     # keep the spent count so a repeat of the SAME instruction cannot restart it;
                     # a new instruction (the human's next move) resets it
-                    _STALL_RETRIES[session_id] = (orig, used, False)
+                    prior["pending"] = False
+                    _STALL_RETRIES[session_id] = prior
                 else:
                     _STALL_RETRIES.pop(session_id, None)
-            if d.reason == stallcheck.EXHAUSTED:
-                _log.info("[stall] %s still unfinished after %d automatic retries -- left to the "
-                          "user", str(session_id)[:12], used)
+            if ended:
+                _log.info("[stall] %s unfinished after %d automatic retries (%s) -- left to the "
+                          "user", str(session_id)[:12], used, d.reason)
+                try:
+                    agentic_chat.live_notice(session_id, _stall_exhaust_notice(d.reason, used))
+                except Exception:                               # noqa: BLE001
+                    pass
+            return
+        # a working chain can reach a high count; the wall-clock budget is the ultimate bound
+        started = prior.get("started")
+        budget = _stall_budget_seconds()
+        if started is not None and (now - started) > budget:
+            with _STALL_LOCK:
+                prior["pending"] = False
+                _STALL_RETRIES[session_id] = prior
+            _log.info("[stall] %s hit the %ds auto-continue time budget -- left to the user",
+                      str(session_id)[:12], budget)
+            try:
+                agentic_chat.live_notice(session_id, _stall_exhaust_notice("time", 0, budget // 60))
+            except Exception:                                   # noqa: BLE001
+                pass
             return
         # never spend tokens past the owner's cap or while the hub is about to restart
         if _conversation_budget_block(session_id) or _UPDATE_DRAIN.active():
             return
+        nonce = int(prior.get("nonce") or 0) + 1
+        seen = set(prior.get("seen") or set()) | sigs
+        if len(seen) > 400:
+            seen = set(list(seen)[-400:])
+        state = {"orig": prior.get("orig") or (info.get("instruction") or ""),
+                 "total": d.attempt,
+                 "unproductive": 0 if made_progress else int(prior.get("unproductive") or 0) + 1,
+                 "pending": True, "started": started if started is not None else now,
+                 "nonce": nonce, "last_hash": rhash, "seen": seen}
         with _STALL_LOCK:
-            _STALL_RETRIES[session_id] = (orig, d.attempt, True)
+            _STALL_RETRIES[session_id] = state
+        maxn = _stall_max_total() if (made_progress and _stall_progress_on()) else stallcheck.MAX_RETRIES
         _log.info("[stall] %s turn did not finish (%s) -- retry %d of %d on %s model",
-                  str(session_id)[:12], d.reason, d.attempt, stallcheck.MAX_RETRIES,
+                  str(session_id)[:12], d.reason, d.attempt, maxn,
                   "another" if d.switch_model else "the same")
-        sender = send or _stall_send
+
+        def _guard():
+            with _STALL_LOCK:
+                cur = _STALL_RETRIES.get(session_id)
+            return isinstance(cur, dict) and cur.get("nonce") == nonce
 
         def _go():
             try:
+                if not _guard():
+                    return                                      # a new instruction / Stop won
                 if d.switch_model:
                     _session_pin_drop(session_id)       # the router picks again next request
                 try:
                     agentic_chat.live_notice(
                         session_id,
-                        "The agent stopped without finishing (%s) -- continuing automatically, "
-                        "retry %d of %d on %s model." % (
-                            d.reason.replace("_", " "), d.attempt, stallcheck.MAX_RETRIES,
+                        "The agent stopped without finishing (%s) -- continuing automatically "
+                        "(try %d of up to %d on %s model)." % (
+                            d.reason.replace("_", " "), d.attempt, maxn,
                             "another" if d.switch_model else "the same"))
                 except Exception:                           # noqa: BLE001
                     pass
-                sender(session_id, _CONTINUE_TEXT)
+                if send is None:
+                    _stall_send(session_id, _CONTINUE_TEXT, guard=_guard,
+                                provider_ok=_hb_providers_ok, clock=clock)
+                else:
+                    send(session_id, _CONTINUE_TEXT)
             except Exception as exc:                        # noqa: BLE001
                 with _STALL_LOCK:
-                    _STALL_RETRIES.pop(session_id, None)
+                    cur = _STALL_RETRIES.get(session_id)
+                    if isinstance(cur, dict) and cur.get("nonce") == nonce:
+                        _STALL_RETRIES.pop(session_id, None)
                 _log.warning("[stall] %s retry could not be sent: %s",
                              str(session_id)[:12], _sanitize(str(exc), 160))
         if sync:
@@ -32793,6 +32982,7 @@ def api_agent_set_quality(session_id):
 
 @app.route("/api/agent/sessions/<session_id>/stop", methods=["POST"])
 def api_agent_stop_session(session_id):
+    _stall_cancel(session_id)               # a Stop ends any auto-continue chain too
     stopped = agentic_chat.stop_session(session_id)
     # A "multi" turn is a swarm_windows run, not a child of this session:
     # Stop has to reach it too, or the button does nothing for that tier.
@@ -32822,6 +33012,7 @@ def _end_live_session(session_id):
     if ended:
         _forget_session_models(session_id)
         _session_pin_drop(session_id)       # it holds no model any more
+        _stall_cancel(session_id)           # and no auto-continue chain
     # Ending a session ends the app it started. A dev server left holding :3000
     # after its session is gone is a leak the user has to clear by hand -- and
     # worse, the next project then finds that port busy or, until the ownership

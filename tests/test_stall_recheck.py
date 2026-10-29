@@ -295,3 +295,176 @@ def test_end_to_end_an_empty_turn_schedules_exactly_one_same_model_retry(monkeyp
                             sid, info, send=lambda s, t: sent.append(t), sync=True))
     list(AC.send_message_stream_durable("s-e2e", "fix the failing test in parser.py"))
     assert len(sent) == 1 and sent[0] == A._CONTINUE_TEXT
+
+
+# =============================================================================================
+# Progress-gated auto-continue: a WORKING Build turn keeps going past the flat 2-retry cap
+# (bounded by a count cap + a wall-clock budget); a STUCK one still gives up fast.
+# =============================================================================================
+
+
+def _prog(i):
+    """A turn that did NEW work (a distinct tool) but did not finish (no real answer)."""
+    return _info(used_tools=True, tool_sigs=["edit file_%d.py" % i], observed=1, final_reply="")
+
+
+def _clock(step=1.0, start=0.0):
+    t = [start]
+
+    def now():
+        v = t[0]
+        t[0] += step
+        return v
+    return now
+
+
+# --- the pure decision --------------------------------------------------------------------
+
+def test_assess_progress_keeps_the_same_model_and_uses_the_total_cap():
+    d = stallcheck.assess(True, False, attempts_used=5, unproductive_used=0, max_total=25)
+    assert d.retry and d.switch_model is False and d.reason == stallcheck.INCOMPLETE
+
+
+def test_assess_stops_a_stagnant_chain_at_the_tight_cap():
+    d = stallcheck.assess(False, False, attempts_used=9, unproductive_used=2, max_total=25)
+    assert d.retry is False and d.reason == stallcheck.EXHAUSTED
+
+
+def test_assess_stops_at_the_total_cap_even_while_progressing():
+    d = stallcheck.assess(True, False, attempts_used=25, unproductive_used=0, max_total=25)
+    assert d.retry is False and d.reason == stallcheck.COUNT
+
+
+def test_assess_flat_mode_matches_the_old_behaviour():
+    assert stallcheck.assess(True, False, attempts_used=0, progress_mode=False).switch_model is False
+    assert stallcheck.assess(True, False, attempts_used=1, progress_mode=False).switch_model is True
+    assert stallcheck.assess(True, False, attempts_used=2,
+                             progress_mode=False).reason == stallcheck.EXHAUSTED
+
+
+# --- the hook, change-based progress ------------------------------------------------------
+
+def test_a_progressing_chain_keeps_the_same_model_past_two(monkeypatch):
+    dropped = []
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: dropped.append(k) or True)
+    monkeypatch.setattr(A, "_stall_max_total", lambda: 6)
+    sent = []
+    for i in range(10):
+        A._stall_on_turn_end("s1", _prog(i), send=lambda sid, t: sent.append(t), sync=True)
+    assert len(sent) == 6                 # bounded by the total cap, well past the flat 2
+    assert dropped == []                  # same model throughout (the pin is kept)
+
+
+def test_the_same_action_repeated_stops_quickly(monkeypatch):
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: True)
+    monkeypatch.setattr(A, "_stall_max_total", lambda: 50)
+    sent = []
+    for _ in range(10):
+        A._stall_on_turn_end("s1", _info(used_tools=True, tool_sigs=["bash ls"], final_reply=""),
+                             send=lambda sid, t: sent.append(t), sync=True)
+    assert len(sent) == 3                 # 1 productive (the first ls) + 2 no-progress, then stop
+    assert "s1" in A._STALL_RETRIES       # the spent count is kept so a repeat can't restart it
+
+
+def test_the_total_cap_bounds_a_progressing_chain(monkeypatch):
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: True)
+    monkeypatch.setattr(A, "_stall_max_total", lambda: 4)
+    notices = []
+    monkeypatch.setattr(A.agentic_chat, "live_notice", lambda sid, t: notices.append(t))
+    sent = []
+    for i in range(8):
+        A._stall_on_turn_end("s1", _prog(i), send=lambda sid, t: sent.append(t), sync=True)
+    assert len(sent) == 4
+    assert any("retry limit" in n for n in notices)
+
+
+def test_the_time_budget_stops_a_long_running_chain(monkeypatch):
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: True)
+    monkeypatch.setattr(A, "_stall_budget_seconds", lambda: 100)
+    monkeypatch.setattr(A, "_stall_max_total", lambda: 50)
+    notices = []
+    monkeypatch.setattr(A.agentic_chat, "live_notice", lambda sid, t: notices.append(t))
+    sent = []
+    t = [0.0]
+    clk = lambda: t[0]
+    A._stall_on_turn_end("s1", _prog(0), send=lambda sid, x: sent.append(x), sync=True, clock=clk)
+    assert len(sent) == 1
+    t[0] = 250.0                          # past the budget
+    A._stall_on_turn_end("s1", _prog(1), send=lambda sid, x: sent.append(x), sync=True, clock=clk)
+    assert len(sent) == 1                 # no new send
+    assert any("time limit" in n for n in notices)
+
+
+def test_exhaustion_tells_the_user(monkeypatch):
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: True)
+    notices = []
+    monkeypatch.setattr(A.agentic_chat, "live_notice", lambda sid, t: notices.append(t))
+    sent = []
+    for _ in range(5):
+        A._stall_on_turn_end("s1", _info(), send=lambda sid, t: sent.append(t), sync=True)
+    assert len(sent) == stallcheck.MAX_RETRIES
+    assert any("stopped continuing by itself" in n.lower() for n in notices)
+
+
+def test_progress_flag_off_keeps_the_flat_two_cap(monkeypatch):
+    monkeypatch.setattr(A.config, "get_flag", lambda name, default=None:
+                        True if name == "stall_recheck"
+                        else (False if name == "stall_recheck_progress" else default))
+    dropped = []
+    monkeypatch.setattr(A, "_session_pin_drop", lambda k: dropped.append(k) or True)
+    sent = []
+    for i in range(6):
+        A._stall_on_turn_end("s1", _prog(i), send=lambda sid, t: sent.append(t), sync=True)
+    assert len(sent) == stallcheck.MAX_RETRIES   # the old flat cap, even though it progressed
+    assert dropped == ["s1"]                      # old INCOMPLETE: switch after the first
+
+
+# --- the send guard, preempt, provider pause, cancel --------------------------------------
+
+def test_stall_send_aborts_when_the_chain_was_cancelled(monkeypatch):
+    monkeypatch.setattr(A.agentic_chat, "turn_busy", lambda sid: False)
+    sent = []
+    monkeypatch.setattr(A.agentic_chat, "send_message_stream_durable",
+                        lambda sid, t: (sent.append(t), iter(()))[1])
+    assert A._stall_send("s1", "continue", guard=lambda: False) is False
+    assert sent == []
+
+
+def test_stall_send_aborts_when_a_new_turn_owns_the_session(monkeypatch):
+    monkeypatch.setattr(A.agentic_chat, "turn_busy", lambda sid: True)       # never idle
+    monkeypatch.setattr(A.time, "sleep", lambda s: None)
+    sent = []
+    monkeypatch.setattr(A.agentic_chat, "send_message_stream_durable",
+                        lambda sid, t: (sent.append(t), iter(()))[1])
+    assert A._stall_send("s1", "continue", clock=_clock(step=10.0), wait=20.0) is False
+    assert sent == []
+
+
+def test_stall_send_waits_for_providers_then_sends(monkeypatch):
+    monkeypatch.setattr(A.agentic_chat, "turn_busy", lambda sid: False)
+    monkeypatch.setattr(A.time, "sleep", lambda s: None)
+    monkeypatch.setattr(A, "_stall_provider_wait", lambda: 10)
+    sent = []
+    monkeypatch.setattr(A.agentic_chat, "send_message_stream_durable",
+                        lambda sid, t: (sent.append(t), iter(()))[1])
+    n = [0]
+
+    def pok():
+        n[0] += 1
+        return n[0] >= 3                  # in 429 back-off twice, then recovered
+    assert A._stall_send("s1", "continue", provider_ok=pok, clock=_clock(step=1.0)) is True
+    assert sent == ["continue"] and n[0] >= 3
+
+
+def test_cancel_drops_the_chain():
+    A._STALL_RETRIES["s1"] = A._stall_fresh("x")
+    A._stall_cancel("s1")
+    assert "s1" not in A._STALL_RETRIES
+
+
+def test_the_stop_endpoint_cancels_the_chain(monkeypatch):
+    monkeypatch.setattr(A.agentic_chat, "stop_session", lambda sid: True)
+    A._STALL_RETRIES["s1"] = A._stall_fresh("x")
+    with A.app.test_request_context():
+        A.api_agent_stop_session("s1")
+    assert "s1" not in A._STALL_RETRIES

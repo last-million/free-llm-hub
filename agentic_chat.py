@@ -4878,6 +4878,9 @@ def send_message_stream_durable(session_id, text):
                         "quality": (sess_info or {}).get("quality"),
                         "final_reply": final_reply,
                         "used_tools": bool(tools_all),
+                        # the turn's tool-call lines -- the completeness check uses them
+                        # to tell NEW work from the same action repeated (see app._stall_*)
+                        "tool_sigs": list(tools_all),
                         "observed": len(observed),
                         "interrupted": bool(interrupted),
                         "rejected": bool(rejected),

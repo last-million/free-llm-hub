@@ -9078,3 +9078,70 @@ instruction" telling it not to call functions.
   rest, not this.
 
 Release-note: fix: when a model writes a tool call as plain <invoke> markup (not a real tool call), the hub now runs it instead of showing it as text and stopping the turn.
+
+## Progress-gated auto-continue: a working Build turn keeps going (2026-10-29)
+
+Owner: "if they decide to stop, the hub should detect it and continue -- with heartbeats I
+think." Half of this already existed: the completeness check (`stall_recheck`, default on) that
+auto-re-sends Continue when a hub-owned **Build-page** turn ends without finishing. Two limits
+made it fall short of "work for hours": a flat cap of 2 retries per instruction (so a genuinely
+WORKING turn stopped early), and no way to tell a turn that is making real progress from one
+that only pokes a read-only command. (Terminal CLIs -- opencode/codex/claude in a user's own
+terminal -- are still out of reach: the hub never started that process and has no channel to
+type Continue into it; it can only refuse a stopping reply and fail over WITHIN a request. The
+heartbeat scheduler is a different feature -- scheduled task-board pickup -- not this.) Covered
+by `tests/test_stall_recheck.py` (now 50 tests).
+
+- **The split** (`stallcheck.assess`, `progress_mode=True` default): a turn that made NEW,
+  changing progress keeps the SAME model (don't fight the session pin) and is bounded only by a
+  total count cap and a wall-clock budget; a turn with no new progress, or an error, keeps the
+  tight `MAX_RETRIES` (2) cap and switches model after the first try. A real answer (with or
+  without tools) is DONE, never retried. `progress_mode=False` reproduces the 2026-10-27 flat
+  behaviour byte for byte. New reason `COUNT` (total cap hit); `MAX_TOTAL_RETRIES` = 25.
+- **Progress is change-based, not `used_tools`** (`app._stall_productive`): `used_tools` alone
+  is true for a read-only `ls`, so a model that announces -> `ls` -> announces would run to the
+  cap. A continue counts as productive only when it makes a tool-call signature not seen before
+  in the chain, OR a changed final reply alongside a real tool/observed result. The turn's
+  tool-call lines ride to the hook as a new info field `tool_sigs` (`agentic_chat`); the chain
+  remembers the signatures seen and the last reply hash.
+- **Two counters** (the chain state is now a dict, tolerant of a legacy `(orig, used[, pending])`
+  tuple some tests set): `total` (all continues -> the count cap) and `unproductive`
+  (CONSECUTIVE no-progress continues, reset to 0 on a productive one -> the tight cap of 2). So
+  a chain that works for 10 rounds and then stalls once still stops promptly, and a stuck chain
+  never reaches the high count.
+- **The wall-clock budget** is enforced in the hook (the pure module has no clock): a chain that
+  has run longer than `stall_progress_budget_seconds` since its first retry is handed back, even
+  while it is still "progressing". The clock is injectable for tests.
+- **Preempt + cancel** (the race the reviewer flagged): every scheduled re-send carries the
+  chain's `nonce` and re-checks it immediately before sending, so a new user instruction (which
+  writes fresh state with a bumped nonce) or a Stop makes a still-waiting re-send abort instead
+  of landing on top of the new turn. `_stall_send` also aborts if the session is still busy
+  after its wait (a new turn owns it). A user Stop or the session ending calls `_stall_cancel`
+  (wired into `api_agent_stop_session` and `_end_live_session`), which drops the chain.
+- **Heartbeat-style provider pause** (the owner's "with heartbeats"): before a real re-send, if
+  `_hb_providers_ok()` says the free providers are in 429 back-off, the send waits (bounded by
+  `stall_provider_wait_seconds`, default 180) for them to recover, so a long run does not burn
+  continues against rate-limited providers. (Not reached when the test injects `send`.)
+- **It says why it stopped** (the complaint was SILENT stops): each auto-continue emits a
+  `live_notice` ("continuing automatically (try N of up to M ...)"), and exhaustion emits one
+  naming the reason -- the retry limit, the time limit, or "stopped making new progress".
+- **Every old guard still stops it**: a user Stop, a Multi conversation/helper (its own phase
+  retries), the per-conversation token budget (`_conversation_budget_block`), and the
+  update-drain.
+- **Flags** (`config.get_flag`, default on): `stall_recheck` (master) and `stall_recheck_progress`
+  (the progress branch). Numeric bounds via `config.get_setting` with clamping:
+  `stall_progress_max_retries` (default 25, clamp [2, 200]), `stall_progress_budget_seconds`
+  (default 3600, clamp [60, 86400]), `stall_provider_wait_seconds` (default 180, clamp [0, 1800]).
+  With `stall_recheck_progress` off, a progressing chain caps at 2 and switches after the first,
+  exactly as before.
+
+**Limits, said plainly.** Only the Build page is auto-continued; a terminal CLI cannot be
+(no channel into its process). "Progress" is a heuristic: a model that makes a genuinely new but
+useless tool call each turn still counts as progressing and can run up to the count cap, the
+time budget, or the token budget -- those three caps are the real guards, and the token budget
+(`_conversation_budget_block`) only bites when the owner set a conversation budget, so by default
+the count + time caps are what bound a run. The nonce guard is best-effort for a Stop landing in
+the exact gap between two turns; the authoritative stop is `_stall_cancel` on the Stop endpoint
+plus the still-busy abort. Not run against a live hub or a real CLI -- the tests are hermetic.
+
+Release-note: improved: on the Build page, a turn that is still doing real work now keeps continuing by itself (not just twice), bounded by a retry/time budget, and tells you when and why it stops.
