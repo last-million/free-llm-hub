@@ -50,8 +50,11 @@ streaming half.
 Pure: no I/O, no globals.
 """
 import json
+import logging
 import re
 import uuid
+
+_log = logging.getLogger("free-llm-hub")
 
 _TOOL_CALL_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.I | re.S)
 # An UNCLOSED block still gets a chance: models truncated by max_tokens open the
@@ -639,6 +642,18 @@ def rescue_stream(items, tools, framing="lines"):
             yield chunk({}, "tool_calls", usage)
             return
         if not calls:
+            # Say WHY, with no content of the reply: which opener, how long, whether
+            # it was closed, how it finished. A turn used to end on this with no trace.
+            try:
+                opener = markup[:markup.find(">") + 1] if ">" in markup[:80] else markup[:24]
+                _log.warning("[tool-rescue] unparseable tool markup: opener=%r len=%d closed=%s "
+                             "finish=%s offered_tools=%d", opener[:40], len(markup),
+                             bool(re.search(r"</|<\s*[|｜]\s*/|_end\b|\u2581end", markup)),
+                             (fin_obj or {}).get("choices", [{}])[0].get("finish_reason")
+                             if isinstance(fin_obj, dict) and fin_obj.get("choices") else None,
+                             len(names))
+            except Exception:                                    # noqa: BLE001
+                pass
             yield emit(_STREAM_ERROR)
             return
         rest = strip_model_markup(markup)

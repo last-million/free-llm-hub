@@ -8092,3 +8092,27 @@ means a new pin.
   by a fresh session; the watch just stops the session from staying with them.
 
 Release-note: fix: when you switch the model category in any CLI and the new models stop doing the work, the hub now notices after two turns, lets go of them and carries on with the model that was actually working, without starting a new conversation.
+
+## A call the hub cannot parse hands the turn to another model (2026-10-29)
+
+Covered by `tests/test_unparseable_markup_continues.py` (12, hermetic). Owner, opencode: the turn ENDED on
+`{"message":"the model wrote a tool call as model-native markup the hub could not parse","type":"upstream_error",
+"code":"unparseable_tool_markup"}` and "he should not stop, he should continue with another model".
+
+- **Cause.** `tool_rescue.rescue_stream` turns markup it cannot read (or a tool the client never offered) into an
+  in-stream error frame. Before the stream is committed that is the peek's `error` status, so the chain walks on.
+  AFTER prose has been relayed it is too late to walk on, and the chat relay (`_proxy_sse`, opencode) passed the frame
+  through untouched: type `upstream_error` is not retried by opencode, so the turn stopped, and nothing was filed
+  against the model, so the retry could pick it again. `/v1/responses` and `/v1/messages` already treated such a frame
+  as a broken stream (retryable ending + the pair filed).
+- **Fix.** `_split_stream_error(raw)` finds an `{"error": ...}` frame (no `choices`) in a relayed chunk; `_proxy_sse`
+  relays what came before it, then ends exactly like an upstream that died: the retryable frame (`ECONNRESET`,
+  `server_error`, no `[DONE]`) and `_note_broken_stream` (the pair goes behind the others for `_RECENT_FAIL_TTL`).
+  The CLI's own retry then reaches another model. An error AFTER the finish_reason still leaves the answer standing.
+  Flag `stream_error_frame_retry` (`config.get_flag`, default on; off = the raw frame, as before).
+- **Diagnostic.** The failure now logs one `[tool-rescue] unparseable tool markup: opener=... len=... closed=...
+  finish=... offered_tools=N` line (the opener tag and sizes only, never reply content), so the dialect can be taught later.
+- **Limit, said plainly.** Prose already shown stays shown and the CLI retries the request; the hub cannot move a
+  committed stream to a second model mid-sentence.
+
+Release-note: fix: when a model writes a tool call the hub cannot read, the turn no longer stops on an error; the CLI retries and the hub steers it to another model.

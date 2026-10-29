@@ -41781,6 +41781,38 @@ _BROKEN_STREAM_TEXT = ("upstream connection lost mid-stream before the answer wa
                        "finished (%s); service unavailable, retry the request")
 
 
+def _split_stream_error(raw):
+    """Find an OpenAI `{"error": ...}` frame (an error object with no `choices`)
+    in ONE relayed chunk. Returns (bytes ahead of that frame, its parsed object),
+    or (raw, None) when the chunk carries none. Pure; never raises.
+
+    MEASURED 2026-10-29 (opencode, /v1/chat/completions): a model wrote its tool
+    call as model-native markup AFTER some prose had already been relayed;
+    tool_rescue.rescue_stream could not parse it and put its own error frame
+    (type upstream_error, code unparseable_tool_markup) into the stream. The
+    chat relay passed that frame through untouched: opencode does not retry
+    that type, so the turn simply ENDED, and nothing was filed against the
+    model, so the next request could pick it again. /v1/responses and
+    /v1/messages already treated such a frame as a broken stream."""
+    try:
+        if not _STREAM_ERROR_VALUE_RE.search(raw):
+            return raw, None
+        pos = 0
+        for line in bytes(raw).splitlines(True):
+            s = line.strip()
+            if s.startswith(b"data:"):
+                try:
+                    obj = json.loads(s[5:].strip().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    obj = None
+                if isinstance(obj, dict) and obj.get("error") and not obj.get("choices"):
+                    return bytes(raw)[:pos], obj
+            pos += len(line)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return raw, None
+
+
 def _chat_broken_frame(exc, open_frame=False):
     """The end of a /v1/chat/completions stream whose upstream died before its
     finish_reason: ONE OpenAI error frame, then the body closes -- no [DONE].
@@ -41894,6 +41926,19 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
             if chunk:
                 raw = (chunk if isinstance(chunk, (bytes, bytearray))
                        else str(chunk).encode("utf-8", "ignore"))
+                if not (saw_done or finished) and config.get_flag("stream_error_frame_retry", True):
+                    # An error object INSIDE the stream, before the answer finished
+                    # (see _split_stream_error): relay what came before it, then end
+                    # exactly like an upstream that died -- the retryable frame and
+                    # the model filed as failed -- so the CLI's own retry reaches
+                    # ANOTHER model instead of the turn ending on a raw error.
+                    ahead, err_obj = _split_stream_error(raw)
+                    if err_obj is not None and not _STREAM_FINISH_RE.search(prev + bytes(ahead)):
+                        if ahead:
+                            yield bytes(ahead)
+                            open_frame = not bytes(ahead).endswith(b"\n")
+                        reads["exc"] = _UpstreamStreamError(_stream_error_frame_text(err_obj))
+                        break
                 if not saw_done and _STREAM_TERMINAL_RE.search(raw):
                     saw_done = True
                 if not finished and _STREAM_FINISH_RE.search(prev + bytes(raw)):
