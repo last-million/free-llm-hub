@@ -8116,3 +8116,34 @@ Covered by `tests/test_unparseable_markup_continues.py` (12, hermetic). Owner, o
   committed stream to a second model mid-sentence.
 
 Release-note: fix: when a model writes a tool call the hub cannot read, the turn no longer stops on an error; the CLI retries and the hub steers it to another model.
+
+## A model that never answers is blocked for a day (2026-10-29)
+
+Covered by `tests/test_auto_block_no_answer.py` (19, hermetic). Owner: "auto blacklist the ones that never
+answer ... if a model doesn't answer more than 3 times in 24 hours, blacklist it for 24 hours".
+
+- **Why.** MEASURED (perf-stats.json): every g4f copy of Claude Opus (17 pairs; opus-5.5 0 ok / 29 failed,
+  opus-4.7 0 / 13), gpt-6.1-sol 0 / 22, every Kimi K3 / K3.1 relay copy and nvidia kimi-k2.6 0 / 32 had never
+  answered, but `_chain_reliability_band` only REORDERS, so a degraded walk still spent hops and requests on them.
+- **Rule** (`_auto_block_due`, called from `_record_outcome` through `_note_auto_block`): per provider + model
+  PAIR, never the model's name -- a working copy elsewhere stays usable. More than 3 failures (`rfail >= 4`) in
+  the current 24 h bucket, no answer in it (`rok == 0`) and none in the last 24 h (`lok`, the last-answer time,
+  new, persisted by perfstats and the dead-state blob) -> the pair goes into `_dead_models` for 24 h, which every
+  routing filter already reads (`_is_model_dead`), which survives a restart and which expires on its own. A real
+  answer lifts it at once (`_auto_unblock`; a 402/403/404/410 dead mark is never lifted by it), so does a
+  passing provider Test. `_mark_model_dead` no longer shortens a longer block.
+- **What counts** is what `_record_outcome(False)` counts: not a client that left, not this computer's network,
+  not a "model is full" capacity 429. A junk answer weighs 2 there, so two junk answers reach the limit.
+- **First sweep** (`_auto_block_sweep`, once per install, setting `auto_block_sweep_v1`): at boot, pairs with 0
+  answers and more than 3 failures in the 7-day record are blocked for 24 h -- 37 on the owner's hub (relay Opus,
+  Fable, GPT-6.1, Kimi, nvidia Kimi K2.6, all three freemodel models, uncloseai Hermes ...). `_seed_last_answer`
+  gives a record from before `lok` its latest possible answer time (its last outcome) so the first deploy never
+  blocks a pair that answered an hour ago.
+- **Visible**: `/api/dead-models` rows carry `reason` ("no answer in the last 24 h (N failures, 0 answers)",
+  "never answered ...", or "the provider refused this model"); hub.log `[auto-block]` lines.
+- **Flag** `auto_block_no_answer` (default on; gate `_auto_block_on`): off = no new blocks, an existing one runs
+  out within 24 h (or press Test on the provider). `tests/conftest.py` turns it off for every other test file.
+- **Limit, said plainly**: a pair that is normally good but had no answer for a whole day and then failed 4 times
+  (e.g. a long provider outage) is also blocked for the day; its first real answer through a Test lifts it.
+
+Release-note: new: a model that keeps failing without ever answering is now set aside for 24 hours automatically, so requests stop being wasted on it.

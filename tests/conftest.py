@@ -430,6 +430,23 @@ def _stall_recheck_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _auto_block_off_unless_tested(request, monkeypatch):
+    """A MODEL THAT NEVER ANSWERS IS BLOCKED FOR A DAY (app, flag
+    `auto_block_no_answer`) is default ON (2026-10-29): four failures with no answer
+    put the pair in _dead_models. Many test files record several failures for a pair
+    and then expect it to stay in the chain as its tail; off here keeps them byte for
+    byte, and no test can leave a block behind. The feature's own file turns it on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_auto_block_no_answer":
+        try:
+            import app
+            monkeypatch.setattr(app, "_auto_block_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
     """STAY IN THE CLI UNTIL THE RUN ENDS (app, flag `cli_multi_stay_live`) is
     default ON for opencode (2026-10-11), but the CLI-Multi test files pin the

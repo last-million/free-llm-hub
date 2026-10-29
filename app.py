@@ -4458,9 +4458,13 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
             if rec["rok"] + rec["rfail"] > _OUTCOME_CAP:
                 rec["rok"] //= 2
                 rec["rfail"] //= 2
+            if ok:
+                rec["lok"] = now        # last real answer (A MODEL THAT NEVER ANSWERS ...)
             _outcomes[(pid, model)] = rec
+            snap = dict(rec)
     except Exception:                                            # noqa: BLE001
-        pass
+        snap = None
+    _note_auto_block(pid, model, ok, snap)
     if junk and not ok:
         _junk_bench_note(pid, model, junk_source)
     if ok:
@@ -5172,7 +5176,8 @@ def _mark_model_dead(pid, model, status):
     if not model or status not in _DEAD_STATUSES:
         return
     with _dead_lock:
-        _dead_models[(pid, str(model))] = time.time() + _DEAD_MODEL_TTL
+        key = (pid, str(model))
+        _dead_models[key] = max(_dead_models.get(key, 0), time.time() + _DEAD_MODEL_TTL)
 
 
 def _is_model_dead(pid, model):
@@ -5253,6 +5258,175 @@ def _is_model_skipped(pid, model):
     Kept apart from _is_model_dead so the dashboard and the model lists never
     show a 60-second skip as a dead model."""
     return _is_model_dead(pid, model) or _is_not_offered(pid, model)
+
+
+# --------------------------------------------------------------------------- #
+# A MODEL THAT NEVER ANSWERS IS BLOCKED FOR A DAY (2026-10-29).
+#
+# Owner: "auto blacklist the ones that never answer ... if a model doesn't answer
+# more than 3 times in 24 hours, blacklist it for 24 hours". MEASURED the same day
+# (perf-stats.json): every g4f copy of Claude Opus (17 pairs, e.g. opus-5.5 0 ok /
+# 29 failed, opus-4.7 0 / 13), gpt-6.1-sol 0 / 22, every Kimi K3 / K3.1 relay copy
+# and nvidia kimi-k2.6 0 / 32 had NEVER answered, yet they stayed in the chain as
+# its tail (`_chain_reliability_band` reorders, never removes), so a degraded walk
+# still spent a hop and a request on them.
+#
+# The rule (per provider + model PAIR, never the model's name, so a working copy
+# of the same model on another provider is untouched): more than 3 failures
+# (`_AUTO_BLOCK_FAILS`) in the current 24 h bucket, no real answer in that bucket
+# AND none in the last 24 h (`lok`, the last-answer time, persisted) -> the pair
+# goes into `_dead_models` for `_AUTO_BLOCK_TTL` (24 h), which every routing
+# filter already reads (_is_model_dead), which survives a restart
+# (_dead_state_dump) and which expires on its own, after which the pair gets a
+# fresh chance. A real answer lifts the block at once (_auto_unblock), and so
+# does a passing provider Test (_unpark_after_verified_generation).
+#
+# What counts as a failure is what `_record_outcome(False)` already counts: a
+# client that left, this computer's own network, and a "model is full, retry in
+# N s" capacity 429 are NOT failures. A junk answer weighs 2 there
+# (_JUNK_FAIL_WEIGHT), so two junk answers alone reach the limit.
+#
+# Once per install (`auto_block_sweep_v1`) the pairs that had NEVER answered on
+# record (lifetime ok 0, more than 3 failures in the last 7 days) are blocked at
+# boot, so the ones already known get no further try today.
+#
+# Flag `auto_block_no_answer` (default on): off = no new blocks. A block already
+# made runs out within 24 h (or press Test on the provider).
+# --------------------------------------------------------------------------- #
+_AUTO_BLOCK_TTL = 24 * 3600
+_AUTO_BLOCK_FAILS = 4             # "more than 3 times"
+_AUTO_BLOCK_QUIET = 24 * 3600     # and no real answer for this long
+_auto_blocked = {}                # (pid, model) -> {"until": epoch, "fails": int, "why": str}
+
+
+def _auto_block_on():
+    """The kill switch, read only when a block is about to be made (rare)."""
+    try:
+        return config.get_flag("auto_block_no_answer", True)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _auto_block_due(rec, now=None):
+    """True when this outcome record shows more than 3 failures and no real answer
+    in the last 24 h. Pure; never raises."""
+    try:
+        if not isinstance(rec, dict):
+            return False
+        now = time.time() if now is None else now
+        if int(rec.get("rok") or 0) > 0:
+            return False                                    # it answered in this bucket
+        if now - float(rec.get("rstart") or 0) > _RECENT_WINDOW:
+            return False                                    # no current bucket
+        if int(rec.get("rfail") or 0) < _AUTO_BLOCK_FAILS:
+            return False
+        lok = float(rec.get("lok") or 0)
+        return not (lok and now - lok < _AUTO_BLOCK_QUIET)
+    except (TypeError, ValueError):
+        return False
+
+
+def _auto_block(pid, model, fails, why, now=None):
+    """Block this pair for _AUTO_BLOCK_TTL. False when it was already blocked at
+    least that long. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        until = now + _AUTO_BLOCK_TTL
+        key = (pid, str(model))
+        with _dead_lock:
+            if _dead_models.get(key, 0) >= until - 60:
+                return False
+            _dead_models[key] = until
+            _auto_blocked[key] = {"until": until, "fails": int(fails), "why": str(why)}
+        _log.warning("[auto-block] %s/%s: %s; blocked for 24 h", pid, model, why)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _auto_unblock(pid, model):
+    """A real answer from an auto-blocked pair: it is back. Only lifts a block this
+    section made (a 403/404 dead mark is not ours to lift). Never raises."""
+    key = (pid, str(model))
+    if key not in _auto_blocked:
+        return
+    try:
+        with _dead_lock:
+            if _auto_blocked.pop(key, None) is not None:
+                _dead_models.pop(key, None)
+        _log.info("[auto-block] %s/%s answered again: unblocked", pid, model)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _auto_block_why(pid, model):
+    """The reason of a live auto-block, else None (for /api/dead-models)."""
+    rec = _auto_blocked.get((pid, str(model)))
+    if rec and rec.get("until", 0) > time.time() and (pid, str(model)) in _dead_models:
+        return rec.get("why")
+    return None
+
+
+def _note_auto_block(pid, model, ok, rec):
+    """Called by _record_outcome after every outcome. Never raises."""
+    try:
+        if ok:
+            _auto_unblock(pid, model)
+        elif rec and _auto_block_due(rec) and _auto_block_on():
+            _auto_block(pid, model, rec.get("rfail") or 0,
+                        "no answer in the last 24 h (%d failures, 0 answers)"
+                        % int(rec.get("rfail") or 0))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _seed_last_answer():
+    """A record from before `lok` existed that answered at some point has no
+    last-answer time. Assume its LATEST possible one (its last outcome), so the
+    first deploy never blocks a pair that may have answered an hour ago. Boot
+    only, after both loaders. Never raises."""
+    try:
+        with _outcome_lock:
+            for rec in _outcomes.values():
+                if not rec.get("lok") and int(rec.get("ok") or 0) > 0:
+                    rec["lok"] = float(rec.get("last") or 0)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _auto_block_sweep(now=None):
+    """Once per install: block the pairs that never answered on record. Returns
+    how many were blocked. Never raises."""
+    try:
+        if config.get_setting("auto_block_sweep_v1"):
+            return 0
+        if not _auto_block_on():
+            return 0
+        now = time.time() if now is None else now
+        with _outcome_lock:
+            recs = {k: dict(v) for k, v in _outcomes.items()}
+        n = 0
+        for (pid, model), rec in sorted(recs.items()):
+            if now - float(rec.get("last") or 0) > _OUTCOME_TTL:
+                continue
+            if _is_model_blocked_by_user(pid, model):
+                continue                                   # already off
+            ok, fail = int(rec.get("ok") or 0), int(rec.get("fail") or 0)
+            if ok == 0 and fail >= _AUTO_BLOCK_FAILS:
+                why = "never answered (%d failures on record, 0 answers)" % fail
+            elif _auto_block_due(rec, now):
+                why = ("no answer in the last 24 h (%d failures, 0 answers)"
+                       % int(rec.get("rfail") or 0))
+            else:
+                continue
+            if _auto_block(pid, model, fail, why, now=now):
+                n += 1
+        config.set_setting("auto_block_sweep_v1", int(now))
+        _log.info("[auto-block] first sweep: %d pair(s) that never answer blocked for 24 h", n)
+        return n
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[auto-block] first sweep skipped: %s", _sanitize(str(exc), 200))
+        return 0
 
 
 # PROVIDER-level sideline. When a provider fails AUTH/credit (401/402/403) across
@@ -6116,12 +6290,16 @@ def _dead_state_dump():
     with _dead_lock:
         dead_models = {"%s|%s" % (p, m): exp
                        for (p, m), exp in _dead_models.items() if exp > now}
+        auto_blocked = {"%s|%s" % (p, m): [r.get("until", 0), r.get("fails", 0), r.get("why", "")]
+                        for (p, m), r in _auto_blocked.items()
+                        if r.get("until", 0) > now and (p, m) in _dead_models}
     with _provider_dead_lock:
         for p in list(_provider_authfail) + list(_provider_keyfail):
             _prune_provider_authfail_locked(p, now)
         out = {
             "dead_models": dead_models,
             "dead_providers": {p: exp for p, exp in _dead_providers.items() if exp > now},
+            "auto_blocked": auto_blocked,
             "dead_provider_why": {p: w for p, w in _dead_provider_why.items()
                                   if _dead_providers.get(p, 0) > now},
             # Legacy shape (pid -> [models], [pids]) kept so an older build
@@ -6246,6 +6424,16 @@ def _dead_state_load(blob):
             if isinstance(key, str) and "|" in key and exp > now:
                 p, m = key.split("|", 1)
                 _dead_models[(p, m)] = exp
+        for key, row in (blob.get("auto_blocked") or {}).items():
+            try:
+                until, fails, why = row
+                if isinstance(key, str) and "|" in key and float(until) > now:
+                    p, m = key.split("|", 1)
+                    if (p, m) in _dead_models:
+                        _auto_blocked[(p, m)] = {"until": float(until), "fails": int(fails),
+                                                 "why": str(why)}
+            except (TypeError, ValueError):
+                continue
     with _provider_dead_lock:
         for p, exp in (blob.get("dead_providers") or {}).items():
             if isinstance(p, str) and exp > now:
@@ -6331,7 +6519,7 @@ def _dead_state_load(blob):
             p, m = key.split("|", 1)
             prev = _outcomes.get((p, m)) or {}
             _outcomes[(p, m)] = {"ok": int(ok), "fail": int(fail), "last": float(last)}
-            for k in ("rok", "rfail", "rstart"):      # keep perfstats' recent bucket
+            for k in ("rok", "rfail", "rstart", "lok"):   # keep perfstats' recent bucket
                 if k in prev:
                     _outcomes[(p, m)][k] = prev[k]
         for key, row in (blob.get("outcomes_recent") or {}).items():
@@ -20162,7 +20350,9 @@ def _watch_client_after(response):
 def api_dead_models():
     """Models sidelined at runtime because this key provably can't use them
     (403 no-access / 404 gone). Self-healing: each entry expires and is re-probed."""
-    rows = [{"provider": p, "model": m, "expires_in": s} for p, m, s in _dead_model_rows()]
+    rows = [{"provider": p, "model": m, "expires_in": s,
+             "reason": _auto_block_why(p, m) or "the provider refused this model (402/403/404/410)"}
+            for p, m, s in _dead_model_rows()]
     rows.sort(key=lambda r: (r["provider"], r["model"]))
     # Whole providers sidelined by repeated key-level failures. These silently
     # remove EVERY model of a provider from routing, so they must be visible —
@@ -53800,6 +53990,8 @@ if __name__ == "__main__":
     workspace.start_reaper()   # stop previews nobody is watching
     _load_perf_stats()         # measured reliability/latency from previous runs
     _load_learned_state()      # slow / resting / failing pairs the last run had learned
+    _seed_last_answer()        # last-answer time for records older than it
+    _auto_block_sweep()        # once: block the pairs that never answered (24 h)
     try:
         # Swarm runs outlive the process that started them. The hub restarts
         # itself every five hours to git pull, and before this a swarm that

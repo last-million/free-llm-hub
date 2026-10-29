@@ -90,6 +90,10 @@ def load():
                     outcomes[key].update(rok=int(row.get("rok") or 0),
                                          rfail=int(row.get("rfail") or 0),
                                          rstart=rstart)
+                # When this pair last gave a real answer (app's auto-block reads it).
+                lok = float(row.get("lok") or 0)
+                if lok > 0:
+                    outcomes[key]["lok"] = lok
             ms, n = float(row.get("ms") or 0), int(row.get("n") or 0)
             if ms > 0 and n > 0:
                 latency[key] = {"ms": ms, "n": n, "last": last}
@@ -127,6 +131,8 @@ def save(outcomes, latency, force=False):
                     row["rok"] = int(o.get("rok") or 0)
                     row["rfail"] = int(o.get("rfail") or 0)
                     row["rstart"] = round(float(o.get("rstart") or 0), 3)
+                if o.get("lok"):
+                    row["lok"] = round(float(o.get("lok") or 0), 3)
             if lat.get("n"):
                 row["ms"] = round(float(lat.get("ms") or 0), 1)
                 row["n"] = int(lat.get("n") or 0)
