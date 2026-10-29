@@ -393,6 +393,24 @@ def _team_notes_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _findings_check_off_unless_tested(request, monkeypatch):
+    """THE FINDINGS CHECK (app, flag `findings_check`) is default ON (2026-10-29): a
+    reply that claims a security finding is filed in a ledger under the state dir, may
+    queue a background second-model verdict, and the next hops of that conversation get
+    a system note. Other test files drive replies that may read as a claim; off here keeps
+    them byte for byte and no test files a finding or starts a verifier thread. The
+    feature's own file turns it on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_findings_check":
+        try:
+            import app
+            monkeypatch.setattr(app, "_fc_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _multi_auto_retry_off_unless_tested(request, monkeypatch):
     """AUTO-CONTINUE FAILED MULTI PHASES (swarm_windows, flag
     `multi_auto_retry_failed`) is default ON (2026-10-11), but every other test

@@ -18305,6 +18305,9 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # sessions' standing rules on an opening turn; also notes this hop's
             # trusted folder for the archive's project scope (_pmem_bind_folder).
             msgs = _pmem_apply_note(msgs)
+            # Open security findings of this conversation that no observed output proves
+            # (see _findings_note).
+            msgs = _findings_note(msgs)
         # An earlier hop's "your message contains only a tool setup" reply must not be
         # what this model reads as the conversation so far (see _scrub_empty_claims).
         msgs = _scrub_empty_claims(msgs)
@@ -46077,6 +46080,365 @@ def _mfx_v1_pass(messages, key, cwd):
         return False
 
 
+# FINDINGS CHECK (2026-10-29): a security finding an agent reports is checked
+# against what the hub OBSERVED, filed per project folder, and fed back.
+#
+# Free models often "find" vulnerabilities that are not real (input reflected but
+# never executed called XSS, a bare 200 called IDOR, a version banner called a
+# vulnerability). Whether the user is testing an asset they are allowed to test or
+# their own app, a false report costs them time. On the turn after a reply that
+# claims a finding, findings.detect reads the claim, findings.evidence looks for an
+# OBSERVED tool result that names the target and shows the proving response (the
+# hub runs nothing itself), the result is filed in state_dir()/findings/<folder
+# sha16>.json, and claims without proof get ONE background verdict from a free
+# model of another family (_free_verdict, never on the request thread, rate
+# limited). The next hops of that conversation carry a "HUB FINDINGS CHECK" note
+# (_findings_note) listing what is not confirmed and the proof that is missing.
+# Flag `findings_check` (default on); off = byte-identical. Logs carry counts and
+# ids only, never a finding's text.
+# --------------------------------------------------------------------------- #
+
+_FC_COOLDOWN = 120.0          # s between two verifier spends of one conversation
+_FC_HOURLY_CAP = 20           # verifier calls per rolling hour, all conversations together
+_FC_MAX_PER_CHECK = 2         # verifier calls one finished reply may cause
+_FC_EXCERPT_CHARS = 3000      # observed output a verifier reads, per finding
+_FC_SEEN_MAX = 2000           # finished replies remembered as already checked
+_FC_LOCK = threading.Lock()
+_FC_LAST = collections.OrderedDict()    # conversation -> monotonic time of its last spend
+_FC_SPENT = collections.deque()          # monotonic times of verifier calls (last hour)
+_FC_SEEN = collections.OrderedDict()     # digests of replies already checked
+_FC_BG_SEM = threading.BoundedSemaphore(2)
+_FC_LEDGERS = {}
+
+_FC_VERIFIER_SYSTEM = (
+    "You review ONE security finding that an AI agent reported during an authorized test of a "
+    "web application (the user's own application or an asset they are allowed to test). Many "
+    "such reports are false positives. You see the finding as the agent stated it, the hub's "
+    "check of the tool output it observed, and an excerpt of that output.\n"
+    "Decide whether the finding, as stated, is a REAL, reportable vulnerability that the "
+    "observed output proves. Accept it only when the excerpt shows the request and the response "
+    "that demonstrate the issue. Common false positives: input reflected without executing is "
+    "not XSS; a 200 response alone is not access to another account's data; a version banner "
+    "alone is not a vulnerability; a 500 error alone is not SQL injection; a CNAME alone is not "
+    "a subdomain takeover; a redirect within the same site is not an open redirect.\n\n"
+    "Reply in EXACTLY this format, starting with the VERDICT line:\n"
+    "VERDICT: ACCEPT\n"
+    "or\n"
+    "VERDICT: REVISE\n"
+    "PROBLEMS:\n"
+    "- the proof that is missing, or why it is not a vulnerability (at most 3 lines)\n"
+    "SEVERITY: high\n\n"
+    "SEVERITY is high when it is NOT a real vulnerability at all, low when it may be real but "
+    "the proof is missing. When the excerpt is not enough to tell, answer REVISE with SEVERITY: "
+    "low and name the missing proof.")
+
+
+def _fc_on():
+    """Flag `findings_check` (default on); an unreadable config counts as off."""
+    try:
+        return bool(config.get_flag("findings_check", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _fc_mod():
+    """The findings module, or None."""
+    return _optional_module("findings", ("detect", "evidence", "Ledger", "note_text",
+                                         "tool_results", "last_finished_reply"))
+
+
+def _fc_root():
+    return os.path.join(config.state_dir(), "findings")
+
+
+def _fc_ledger():
+    """The findings ledger under this hub's state dir (never in a project folder), or None."""
+    fm = _fc_mod()
+    if fm is None:
+        return None
+    try:
+        root = _fc_root()
+        with _FC_LOCK:
+            led = _FC_LEDGERS.get(root)
+            if led is None:
+                if len(_FC_LEDGERS) > 8:
+                    _FC_LEDGERS.clear()
+                led = _FC_LEDGERS[root] = fm.Ledger(root)
+            return led
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _fc_reserve(conv, want):
+    """How many verifier calls a check may spend now (0..want): one conversation spends at
+    most once per _FC_COOLDOWN, all of them together at most _FC_HOURLY_CAP per hour, and
+    one check at most _FC_MAX_PER_CHECK. Never raises."""
+    try:
+        now = time.monotonic()
+        key = conv or ""
+        with _FC_LOCK:
+            while _FC_SPENT and now - _FC_SPENT[0] > 3600.0:
+                _FC_SPENT.popleft()
+            last = _FC_LAST.get(key)
+            if last is not None and now - last < _FC_COOLDOWN:
+                return 0
+            grant = max(0, min(int(want or 0), _FC_MAX_PER_CHECK, _FC_HOURLY_CAP - len(_FC_SPENT)))
+            if grant:
+                _FC_LAST[key] = now
+                _FC_LAST.move_to_end(key)
+                while len(_FC_LAST) > 2000:
+                    _FC_LAST.popitem(last=False)
+                _FC_SPENT.extend([now] * grant)
+            return grant
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def _fc_refund(n):
+    with _FC_LOCK:
+        for _ in range(max(0, int(n or 0))):
+            if _FC_SPENT:
+                _FC_SPENT.pop()
+
+
+def _fc_producer(body, messages):
+    """(pid, model) this conversation's model pin holds -- the model that most likely wrote
+    the reply -- or None. Read-only; never raises."""
+    try:
+        keys = []
+        sid = _build_sid()
+        if sid:
+            keys.append(sid)
+        try:
+            conv = ctxwin.conversation_key(request.headers, body, sid, messages)
+            pk = ctxwin.pin_key(conv, request.headers, messages)
+            if pk:
+                keys.append(pk)
+        except Exception:                                        # noqa: BLE001
+            pass
+        keys.append(_session_key(messages))
+        for k in keys:
+            pair = _session_pin_get(k)
+            if pair:
+                return pair
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _fc_redact(text):
+    """Credentials out, twice: findings.redact (headers, tokens, keys) then the memory
+    archive's line-level rule. A failure of the second returns "" (fail closed)."""
+    fm = _fc_mod()
+    s = fm.redact(text) if fm is not None else ""
+    try:
+        s, _n = convmem.redact_lines(s)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return s
+
+
+def _fc_verifier_messages(fm, claim, ev, results):
+    """The message list one verdict reads: the findings verifier contract, then the claim,
+    the hub's own check and a bounded, redacted excerpt of the observed output."""
+    excerpt = _fc_redact(fm.relevant_excerpt(claim, results, _FC_EXCERPT_CHARS))
+    meta = "class: %s, target: %s%s" % (claim.get("label") or claim.get("class"),
+                                        claim.get("target") or "(none named)",
+                                        (", stated severity: " + claim["severity"])
+                                        if claim.get("severity") else "")
+    reason = (ev.get("reasons") or [""])[0]
+    user = ("FINDING (as the agent reported it): %s [%s]\n"
+            "The agent's words: \"%s\"\n\n"
+            "HUB CHECK of the observed tool output: %s%s\n\n"
+            "OBSERVED TOOL OUTPUT (excerpt, credentials removed):\n%s"
+            % (claim.get("title") or "", meta, _fc_redact(claim.get("quote") or ""),
+               (ev.get("status") or "unverified").replace("_", " "),
+               (" -- " + reason) if reason else "",
+               excerpt or "(no observed tool call names this target)"))
+    return [{"role": "system", "content": _FC_VERIFIER_SYSTEM},
+            {"role": "user", "content": user}]
+
+
+def _fc_verdict_call(messages, producer):
+    """ONE free cross-family verdict -> (verdict dict or None, verifier family or "")."""
+    report = {}
+    verdict = _free_verdict(messages, producer, report=report)
+    fam = ""
+    try:
+        v = _verify()
+        if v is not None and report.get("model"):
+            fam = str(v.family(report["model"]) or "")
+    except Exception:                                            # noqa: BLE001
+        fam = ""
+    return verdict, fam
+
+
+def _fc_spawn(target, *args):
+    t = threading.Thread(target=target, args=args, name="findings-verify", daemon=True)
+    t.start()
+    return t
+
+
+def _fc_verify_jobs(project_dir, jobs, producer):
+    """BACKGROUND: one second-model verdict per job, folded into the ledger. Any failure
+    files the finding as needs_review (fail-open). Releases _FC_BG_SEM. Never raises."""
+    done = set()
+    try:
+        _usage_src_tls.name = "findings-check"
+        with app.app_context():
+            for job in jobs:
+                try:
+                    verdict, fam = _fc_verdict_call(job["messages"], producer)
+                except Exception:                                # noqa: BLE001
+                    verdict, fam = None, ""
+                led = _fc_ledger()
+                st = led.apply_verdict(project_dir, job["id"], verdict, fam) if led else None
+                done.add(job["id"])
+                _log.info("[findings] %s: second-model check -> %s", job["id"], st)
+    except Exception:                                            # noqa: BLE001
+        led = _fc_ledger()
+        for job in jobs:
+            if job.get("id") not in done and led is not None:
+                try:
+                    led.apply_verdict(project_dir, job["id"], None, "")
+                except Exception:                                # noqa: BLE001
+                    pass
+    finally:
+        _usage_src_tls.name = None
+        try:
+            _FC_BG_SEM.release()
+        except ValueError:
+            pass
+
+
+def _findings_check(messages, body=None):
+    """Called by the three /v1 handlers with the request's OpenAI-shaped messages. Looks at
+    the LAST finished assistant reply only (the history ends on a fresh user instruction
+    after it), detects the finding claims in it, files each with the deterministic evidence
+    pass, and queues ONE background second-model verdict per unproven claim within the rate
+    limits. The reply to the user is never affected. Returns [(id, status, wants_verdict)]
+    or None. Never raises."""
+    try:
+        if not _fc_on():
+            return None
+        fm = _fc_mod()
+        if fm is None or not isinstance(messages, list) or not messages:
+            return None
+        if not _awaiting_new_instruction(messages):
+            return None
+        idx, reply = fm.last_finished_reply(messages)
+        if idx is None:
+            return None
+        conv = _orch_key(body, messages) or ""
+        digest = hashlib.sha256((conv + "\x00" + reply).encode("utf-8", "replace")).hexdigest()[:24]
+        with _FC_LOCK:
+            if digest in _FC_SEEN:
+                _FC_SEEN.move_to_end(digest)
+                return None
+            _FC_SEEN[digest] = True
+            while len(_FC_SEEN) > _FC_SEEN_MAX:
+                _FC_SEEN.popitem(last=False)
+        claims = fm.detect(reply)
+        if not claims:
+            return None
+        folder = _cm_trusted_cwd(messages)
+        if not folder:
+            _log.info("[findings] %d claim(s) in a reply with no known project folder; not filed",
+                      len(claims))
+            return None
+        led = _fc_ledger()
+        if led is None:
+            return None
+        results = fm.tool_results(messages, upto=idx)
+        producer = _fc_producer(body, messages)
+        pfam = ""
+        v = _verify()
+        if producer and v is not None:
+            try:
+                pfam = str(v.family(producer[1]) or "")
+            except Exception:                                    # noqa: BLE001
+                pfam = ""
+        items = []
+        for c in claims:
+            ev = fm.evidence(c, results)
+            items.append((c, ev, pfam))
+        filed = led.upsert(folder, items, conv)
+        want = [f for f in filed if f[2]]
+        grant = _fc_reserve(conv, len(want)) if want else 0
+        jobs = []
+        if grant:
+            by_id = {fm.finding_id(c["key"]): (c, ev) for c, ev, _p in items}
+            for fid, _st, _w in want[:grant]:
+                c, ev = by_id[fid]
+                jobs.append({"id": fid, "messages": _fc_verifier_messages(fm, c, ev, results)})
+            if not _FC_BG_SEM.acquire(blocking=False):
+                _fc_refund(len(jobs))
+                jobs = []
+            else:
+                try:
+                    _fc_spawn(_fc_verify_jobs, folder, jobs, producer)
+                except Exception:                                # noqa: BLE001
+                    _FC_BG_SEM.release()
+                    for job in jobs:
+                        led.apply_verdict(folder, job["id"], None, "")
+        counts = collections.Counter(st for _fid, st, _w in filed)
+        _log.info("[findings] %s: %d claim(s) -> %d proven, %d unverified, %d false positive, "
+                  "%d needs review; second-model check for %d (%s)",
+                  fm.folder_key(folder)[:8], len(filed), counts.get("proven", 0),
+                  counts.get("unverified", 0), counts.get("false_positive", 0),
+                  counts.get("needs_review", 0), len(jobs),
+                  ",".join(j["id"] for j in jobs) or "-")
+        return filed
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _findings_note(messages):
+    """Per hop: when this conversation has findings filed in this project folder that are
+    not proven, ONE system note (findings.note_text, <= 900 chars) after the leading system
+    messages. Never on a CLI's own compaction request (the caller skips _no_craft stages).
+    Deterministic, so the provider's prefix cache only moves when the ledger does. Returns
+    `messages` itself when nothing applies. Never raises."""
+    try:
+        if not _fc_on() or not isinstance(messages, list) or not messages:
+            return messages
+        conv = _cmem_conv()
+        if not conv:
+            return messages
+        led = _fc_ledger()
+        if led is None or not led.has_conversation(conv):
+            return messages
+        if ctxwin.is_compaction_request(messages):
+            return messages
+        folder = _cm_trusted_cwd(messages)
+        if not folder:
+            return messages
+        text = led.note_for(folder, conv)
+        if not text:
+            return messages
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict) \
+                and messages[i].get("role") == "system":
+            i += 1
+        return messages[:i] + [{"role": "system", "content": text}] + messages[i:]
+    except Exception:                                            # noqa: BLE001
+        return messages
+
+
+@app.route("/api/findings", methods=["GET"])
+def api_findings():
+    """The findings ledger of one project folder (token-gated like every /api route)."""
+    pd = (request.args.get("project_dir") or "").strip()
+    if not pd:
+        return jsonify({"error": "project_dir is required"}), 400
+    led = _fc_ledger()
+    rows = led.rows(pd) if led is not None else []
+    rows.sort(key=lambda r: -float(r.get("last_seen") or 0))
+    resp = jsonify({"project_dir": pd, "enabled": _fc_on(), "findings": rows})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 def _role_log_http_body(pid, model, resp):
     """LOG ONLY: the provider's own explanation of a 4xx/5xx a roles hop got, so a bare
     "HTTP 400" in the activity chip can be read as what it was. MEASURED 2026-10-24:
@@ -48697,7 +49059,7 @@ def _brief_producer(value):
     return None
 
 
-def _free_verdict(brief, producer=None):
+def _free_verdict(brief, producer=None, report=None):
     """A FREE cross-family verdict on one pipeline phase, for the pipelines'
     own review (swarm.run / crews.run / swarm_windows.start).
 
@@ -48709,7 +49071,8 @@ def _free_verdict(brief, producer=None):
     or None on ANY failure, timeout or unreadable verdict -- the pipeline then
     proceeds exactly as without it. A reply that could not be READ gets ONE
     retry on the next-best verifier with the strict one-line contract
-    (verify.STRICT_VERIFIER_SYSTEM). Never raises."""
+    (verify.STRICT_VERIFIER_SYSTEM). `report`, a dict, receives the "pid" and "model"
+    that gave a readable verdict. Never raises."""
     v = _verify()
     if v is None or not brief or _client_gone():
         return None
@@ -48790,6 +49153,8 @@ def _free_verdict(brief, producer=None):
             if not _client_gone():
                 _verifier_stats_note(pick[0], pick[1], readable)
             if readable:
+                if isinstance(report, dict):
+                    report["pid"], report["model"] = pick[0], pick[1]
                 return {"ok": bool(verdict.get("ok")),
                         "problems": list(verdict.get("problems") or []),
                         "severity": str(verdict.get("severity") or "low")}
@@ -49967,6 +50332,7 @@ def v1_chat_completions():
     # (the hub runs nothing). See _v1_observe.
     _v1_observe(body.get("messages"), body)
     _cli_todo_sync(body.get("messages"), body)    # the CLI's to-do list -> task board
+    _findings_check(body.get("messages"), body)    # finding claims vs observed proof
     return _chat_completions(body)
 
 
@@ -51473,6 +51839,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
         _bandit_credit(messages)       # see _bandit_credit
         _v1_observe(messages, body)    # observed evidence: receipts + facts
         _cli_todo_sync(messages, body)    # the CLI's to-do list -> task board
+        _findings_check(messages, body)    # finding claims vs observed proof
     # Codex picks a MODE on one screen and a REASONING LEVEL on the next; the
     # pair is the hub's (mode, effort). Must happen before the swarm dispatch
     # below, which keys off the model id. /v1/chat/completions has always read
@@ -52564,6 +52931,7 @@ def v1_messages():
     _bandit_credit(oai_messages)       # see _bandit_credit
     _v1_observe(oai_messages, body)    # observed evidence: receipts + facts
     _cli_todo_sync(oai_messages, body)    # the CLI's to-do list -> task board
+    _findings_check(oai_messages, body)    # finding claims vs observed proof
     has_images = image_count > 0
     # A "<category>-<effort>" compound (e.g. from ANTHROPIC_MODEL=coding-swarm)
     # sets the mode and becomes a plain effort tier, before the swarm dispatch
