@@ -8436,3 +8436,243 @@ remains -- sync the CLIs' own to-do lists into the hub's task board."
     tasks; a conversation without a session id is keyed by its content hash.
 
 Release-note: new: the hub now copies each terminal CLI's own to-do list (opencode, Codex, Claude Code) onto the project's task board, so it always knows what the agent has done and what is left.
+
+## Findings check: a claimed vulnerability is checked against what was observed (2026-10-29)
+
+Covered by `tests/test_findings_check.py` (87 tests: detection both ways, observed proof vs none, the
+false-positive rules, dedupe/update, the note on the next turns only, rate limits, flag off, the route,
+the real background thread, and the real `/v1/chat/completions` (json + stream) and `/v1/messages`
+handlers with a fake upstream).
+
+**Why.** Free models often "find" vulnerabilities that are not real: input reflected but never executed
+called XSS, a bare 200 called IDOR, a version banner called a vulnerability. Whether the owner is testing
+an asset they are allowed to test or their own app (a SaaS, their own sites), a false report or a "fix"
+for a non-issue costs time and credibility. Nothing here depends on any program's wording; a
+self-testing conversation (e.g. `http://localhost:3000`) gets exactly the same checks.
+
+**What.**
+- `findings.py` (pure, stdlib only, never raises, no import from the app):
+  - `detect(text)` -> the finding CLAIMS in one assistant reply: a vulnerability class (XSS, SQLi, SSRF,
+    IDOR, CSRF, RCE / command injection, path traversal / LFI, XXE, SSTI, open redirect, auth / access
+    control bypass, CORS, JWT, clickjacking, information disclosure, subdomain takeover, request
+    smuggling, cache poisoning, race condition) stated with a claim word (found / confirmed / vulnerable /
+    exploitable / reproduced / "able to exploit" ...), a report-style heading (`Finding 1:`, a heading
+    whose section has Severity / Impact / Steps to reproduce), or an item / table row under a "Findings"
+    heading. NOT claims: hedges before the claim ("might", "could", "to test", "check whether", "if",
+    "possible XSS"), negations ("not vulnerable", "no SQLi found", "properly escaped", "false positive"),
+    sections such as Next steps / Test plan / Remediation / False positives, fenced code, "CSRF token",
+    "X-XSS-Protection". Each claim: class, label, target (URL > host + path > bare endpoint path; ids and
+    UUIDs in a path become `{id}`; query and fragment dropped), stated severity, short title, quote.
+  - `tool_results(messages, upto)` pairs each `role: tool` result with the call that produced it.
+  - `evidence(claim, results)` (deterministic first pass): proof needs an OBSERVED result that names the
+    target (host and path) AND shows a response (status line / headers / status field / body / a tool's
+    own output; a connection error is not one) AND the class's proof signal. Rules as data (`_RULES`):
+    XSS = an alert/dialog actually fired (reflection alone = false positive); SQLi = a database error,
+    sqlmap's injection point or a measured delay (a 500 alone = false positive); SSRF / RCE / XXE = an
+    out-of-band interaction or internal content / command output / file contents; open redirect = a 3xx
+    Location to an EXTERNAL site (same site = false positive); CORS = a foreign origin WITH
+    `Access-Control-Allow-Credentials: true` (`*`, or no credentials = false positive); takeover = the
+    service's unclaimed-resource page (a CNAME alone = false positive); info disclosure = the secret /
+    trace / .git / listing itself (a version banner alone = false positive); SSTI = an evaluated
+    expression; IDOR / auth bypass are NEVER proven deterministically (data in a 2xx = needs_review, a
+    200 without data or a 401/403/3xx = false positive); a scanner template match = needs_review;
+    clickjacking with only a header = false positive. Returns status proven | unverified |
+    false_positive | needs_review, a pointer (tool + call id + the matching line, redacted) and reasons.
+  - `Ledger(root)`: `state_dir()/findings/<sha256(normcase realpath)[:16]>.json` per project folder (never
+    inside the project), atomic temp + `os.replace`, at most 200 rows (least recently seen dropped). Row:
+    id (`f_` + hash of class + normalised target), title, class, target, severity, status,
+    status_source, reasons (<= 3), evidence pointer, conversation key, first_seen / last_seen, seen,
+    verifier family, producer family. Re-detection updates the row: proven stays proven; an observed
+    proven / false_positive / needs_review replaces the status; a verifier's verdict stands until the
+    observed state changes; a row is sent to the verifier only while it is not proven and has no verdict
+    since its status last changed.
+  - `note_text(rows)`: the deterministic note, <= 900 chars.
+- `app._findings_check(messages, body)` -- one added line in each /v1 handler, right after
+  `_v1_observe(...)` (`/v1/responses` inside its `if not _retry_pass:` block). Runs only when the history
+  ends on a fresh user instruction after an assistant reply (a finished exchange; never mid tool loop),
+  reads THAT reply only, once per reply (digest LRU of 2000). No project folder from the CLI's own
+  environment block (`_cm_trusted_cwd`) = nothing filed. Files every claim with its deterministic
+  status, then queues ONE background second-model verdict per unproven claim.
+- **The verdict** (`_fc_verify_jobs` on a daemon thread named `findings-verify`, under `app.app_context()`,
+  usage labelled `findings-check`; never on the request thread): `_free_verdict` with its own system
+  prompt (`_FC_VERIFIER_SYSTEM`: is this a real, reportable vulnerability that the observed output
+  proves; the common false positives; VERDICT / PROBLEMS / SEVERITY contract, high = not a
+  vulnerability, low = proof missing), producer = the conversation's model pin (another family is
+  preferred by `verify.pick_verifier`; free pairs only, `_role_candidates` drops subscriptions). Input:
+  the claim, its quote, the hub's own check, and <= 3000 chars of the observed calls that name the
+  target, redacted twice (`findings.redact` for headers / tokens / keys / cookies incl. inline `-H`
+  values, then `convmem.redact_lines`; a failure of the second sends no excerpt). Mapping: ACCEPT ->
+  needs_review (plausible, not proven); REVISE + high -> false_positive; REVISE + low -> unverified
+  (a deterministic false positive stays one); no / unreadable / failed verdict -> needs_review
+  (fail-open). A verdict never makes a finding proven: only observed output does.
+- **Cost / limits of the calls**: one non-streamed free call per unproven claim, `VERIFY_MAX_TOKENS`
+  (300) out, ~1.2K tokens in (prompt ~1.1K chars + claim + <= 3000 chars of excerpt), plus at most one
+  strict retry inside `_free_verdict` for an unreadable reply. At most `_FC_MAX_PER_CHECK` (2) per
+  checked reply, one spend per conversation per `_FC_COOLDOWN` (120 s), `_FC_HOURLY_CAP` (20) per rolling
+  hour for all conversations together, at most 2 verifier threads at once (`_FC_BG_SEM`; when busy the
+  claim keeps its deterministic status and is verified on a later re-detection). A proven claim costs
+  no call.
+- **The note** (`_findings_note`, its own line after `_apply_goal_note` in `_upstream_chat`, so never on
+  `_no_craft` pipeline stages): every hop of that conversation (key = `_cmem_conv()`, the same
+  `ctxwin.conversation_key` the check filed under) in that folder, while it has an open finding seen in
+  the last 7 days, gets ONE system message after the leading system messages: "HUB FINDINGS CHECK -- ..."
+  listing LIKELY FALSE POSITIVE / NEEDS REVIEW / NOT CONFIRMED findings with the first reason (the
+  missing proof), proven ones briefly, ending "Do not present the unconfirmed ones as confirmed. Before
+  you report or fix any of them as confirmed, show the observed request and the response that proves
+  it." Never on a CLI's own compaction request; no note when every finding is proven. Deterministic, so
+  the provider's prefix cache only moves when the ledger does.
+- **Route**: `GET /api/findings?project_dir=` -> `{project_dir, enabled, findings: [rows, newest
+  first]}`, `Cache-Control: no-store`, token-gated by the existing `/api` guard; 400 without
+  `project_dir`. README route count 200 -> 201.
+- **Logs** carry counts and ids only (`[findings] <folder8>: N claim(s) -> P proven, U unverified, F
+  false positive, R needs review; second-model check for K (ids)`), never a title, target or quote.
+
+**Flag** `findings_check` (`config.get_flag`, default on; an unreadable config counts as off). Off = the
+handlers and every hop are byte-identical (no ledger file, no thread, no note). `tests/conftest.py`
+`_findings_check_off_unless_tested` turns it off for every other test file.
+
+**Changed outside the new section**: `_free_verdict(brief, producer=None, report=None)` -- the new
+optional dict receives the `pid` / `model` that gave a readable verdict (existing callers unchanged);
+the three handler lines; the note line in `_upstream_chat`; the conftest fixture; README's route count.
+`_cli_todo_sync` (another change) did not exist on this branch: when both land, keep both lines, the
+findings line after the todo sync.
+
+**Limits, said plainly.**
+- Detection is English regex. A claim worded otherwise, or in another language, is missed: no check, no
+  note (never a false block). A hedge word anywhere before the claim drops the sentence ("Confirmed: the
+  endpoint, which may be cached, is vulnerable to XSS" is missed); a targeted negation anywhere in the
+  sentence drops it.
+- "Proven" means the observed output shows the class's signal next to the target. It does not prove
+  impact or scope, and the hub cannot tell output a real tool produced from output the agent's own script
+  printed. CSRF, request smuggling, cache poisoning, race conditions and JWT have no deterministic proof
+  rule: they stay unverified / needs_review at best.
+- The producer is the conversation's model pin, most likely but not certainly the model that wrote the
+  reply; unknown = no family preference. `_free_verdict`'s strict retry uses the generic "accept when
+  unsure" contract, which maps to needs_review.
+- Rate limiter, reply-seen set and verifier slots are in memory: a restart resets them (the last reply may
+  be checked once more; re-detection updates the same row and a row with a verdict is not re-verified).
+- A conversation whose key changes (no session id and a different first instruction) no longer sees its
+  earlier findings in the note; they stay in the ledger and the route.
+- Not verified against a live model: the verifier prompt's effect on real free models is unmeasured.
+
+Release-note: new: when an agent reports a security finding, the hub now checks it against the tool output it actually saw and tells the agent which findings are not proven yet.
+
+## Authorized testing: the testing brief, the scope card and the scope guard (2026-10-29)
+
+Covered by `tests/test_testing_brief.py` and `tests/test_scope_guard.py` (hermetic: synthetic
+programs on example.com / .org / .net hosts, a temp project folder and a temp scopes.json per
+test, fake upstreams, no network, no CLI). Owner: the hub should make free models better and
+SAFER at authorized testing -- bug bounty programs, client engagements AND the owner's own apps
+(a personal SaaS, his own sites). Discipline, scope and evidence only: nothing here is exploit
+code, a payload list or an attack recipe. Owner naming rule: no file, flag, skill id or constant
+carries "bounty" or "security".
+
+**1. The testing brief** (`craft.TARGET_TESTING`, 1666 chars; Settings -> Skills id
+`app_testing`, "App & API testing", default on).
+- A DOMAIN brief, first in `craft._BRIEFS`. Order inside: scope first (only assets a program
+  lists, a client authorized in writing, or the user owns; nothing stated = ask), the program /
+  client rules of engagement (rate limits, required headers, no DoS / brute force / social
+  engineering / spam, own test accounts, never other users' data beyond the minimum proof, stop
+  at proof), the own-app rules (staging and test accounts, never real users' data, no load or DoS
+  against production, back up before anything destructive), the method at checklist level
+  (passive recon first, map the surface, rank by impact, the classes that fit the stack), the
+  evidence bar (an observed, reproducible request + response showing impact, else "unverified"),
+  the common false positives (reflected input that never executes, a 200 with no protected data,
+  self-XSS, missing headers alone; check duplicates / known issues / exclusions), the report
+  template, and ANTI (never a finding, scan run, response or result that was not observed).
+- Trigger (`craft._TARGET_TESTING_RE`, word-bounded): program words (bug bounty, hackerone,
+  bugcrowd, intigriti, yeswehack, pentest / penetration test, recon, attack surface, in-scope /
+  out-of-scope ASSETS, responsible / coordinated disclosure, security / vulnerability assessment
+  or audit, a few tool names), self-testing wording ("security test my app", "check my site for
+  vulnerabilities", "audit our API's security", "is my server vulnerable"), and a testing verb
+  aimed at a vulnerability class ("find XSS", "hunt for IDORs", "test for SSRF"). NOT on ordinary
+  coding security work: "add security headers", "fix the XSS in comments.js", "upgrade lodash to
+  fix CVE-...", "run npm audit and fix", "write a unit test for the XSS escaper", "that is out of
+  scope for this PR" keep exactly the briefs they had (tested both ways).
+- When it fires it REPLACES the build briefs (`craft._TESTING_REPLACES`: web_design, landing,
+  ecommerce, ship, seo, images, and with them DESIGN_FIRST / WEB_MOTION / the publish question):
+  "check my website for vulnerabilities" is not a request to design a website. The engineering
+  brief and the builder's security brief stay (the fix that follows, and a defect checklist).
+- Cost: a testing request with programming + security pays ~7.8K chars (~6% of the 32K floor); the
+  heaviest request is still the saas landing page (20,610 chars, 15.7%), the ceiling did NOT move.
+  `tests/test_craft_briefs.py::test_briefs_stay_small` gained `"app_testing": 1800`.
+- Switched off in Settings (`skills_disabled`), `craft.match` is byte-identical to before (no
+  brief, no replacement). There is no config flag for it: the skill toggle is the switch.
+
+**2. The scope card** (`scopecard.py`, pure stdlib, never raises; app.py section "PROGRAM SCOPE
+CARD + SCOPE GUARD", names `_scope_*`; flag `scope_card`, default on).
+- One card per project folder (normcase realpath), persisted in `state_dir()/scopes.json` (atomic
+  replace, at most 64 folders, least recently updated dropped first), never in the project.
+  Entries: in / out patterns (exact host, `*.wildcard` = sub-hosts only never the apex, IP, CIDR),
+  each with `kind` "program" or "owner-declared" and its `src` ("message" or the file), plus up to
+  40 rule lines.
+- Sources: (a) the USER's own words in a /v1 conversation whose folder the CLI's environment block
+  names (`_cm_project_dir`: `_cm_trusted_cwd`, never the hub's repo, never a root / home / above it)
+  -- real instructions only, wrapper blocks removed, so a tool result, a fetched page or an
+  assistant turn can never write the scope; (b) read-only, scope files in that folder and its direct
+  sub-folders (`scope*.md|txt`, `SCOPE`, `*scope*.md|txt` incl. security-scope.md, `program*.md`),
+  never through a link (`deploy_perfect.is_link` / `safe_read_text`), <= 64 KB, <= 8 files, hidden /
+  node_modules / venv / build folders skipped, looked at every 30 s; a changed or removed file
+  replaces its own part of the card, message entries are a union.
+- Reading (`scopecard.extract`): headings ("In scope", "Out of scope", "Targets", "Assets",
+  "Exclusions", "Not eligible", "Rules"...), markdown lists and tables, inline markers ("out of
+  scope: X, Y", "X is out of scope", "except / excluding X", "do not test X", "my app is X"). A host
+  merely mentioned in prose is never scope. "Do not test X with brute force" is a RULE, not an
+  exclusion of X. Owner-declared vs program is read from the text (first-person app words and no
+  program words = owner-declared; a `program*.md` file is always program).
+- `scopecard.in_scope(host, card)`: True (listed in), False (listed OUT; an exact host beats a
+  wildcard, an out entry wins a tie, a CIDR target touching an out host is out), None (not listed).
+- The note: ONE system message, "PROGRAM SCOPE for this project folder (...)", OUT list first, then
+  in scope, rules, and "a host not listed is NOT in the listed scope: confirm before testing it",
+  <= 800 chars, sorted (deterministic, provider-cache friendly). Added by `_scope_apply_note` in
+  `_upstream_chat` on EVERY hop (next to `_apply_goal_note`, never for `_no_craft` pipeline
+  stages); rebuilt from the stored card each hop, so it survives the CLI's own compaction and a
+  restart.
+- `GET /api/scope?project_dir=` (token-gated by the /api guard) returns the stored card and its
+  note. README route count 200 -> 201.
+
+**3. The scope guard** (flag `scope_guard`, default on; needs `scope_card`). A tool call whose
+arguments aim at a host the card lists EXPLICITLY out of scope never reaches the CLI as an
+executable call; it becomes the assistant text "The hub blocked a call to <host>: it is out of
+scope for this program (<kind>: <source>). Nothing was sent. Pick an in-scope target, or ask the
+user." (finish_reason "stop"). One log line per block: `[scope] blocked a <path> call to <host>
+(out of scope) in <folder name>` -- host and folder NAME only. A host that is merely not listed
+(package registries, docs, the CLI's tooling) is NEVER blocked.
+- What counts as a target (`scopecard.targets_in_call`): URL-like argument keys (url, uri, host,
+  endpoint, target...), all string args of a fetch-like tool (webfetch, http, navigate...), and in
+  a command (`command` / `cmd` / argv list / `code`) the hosts after a network tool (curl, wget,
+  httpx, nmap, ffuf, nuclei, sqlmap, gobuster, dirsearch, dig, nc, ...), the URLs inside code a
+  runner executes (python -c, node -e, powershell), and quoted commands handed to a shell (bash -c,
+  wsl ... -e bash -lic). NOT counted: file contents (write / edit / patch tools), a URL that is only
+  echoed, cloned (git) or installed (npm), a host in a URL's query string.
+- Enforced on: the non-stream success sites of `/v1/chat/completions`, `/v1/responses`,
+  `/v1/messages` (`_scope_guard_data`, after the never-chains ledger so the model is judged on what
+  it did), the roles path (`_tool_turn_roles_run`, after `_note_continuation_outcome`), and the
+  three streamed paths (`_scope_guard_stream` = `scopecard.guard_stream`, after `_dedupe_tool_stream`
+  on tool turns). Streamed: frames pass untouched until the first tool-call delta; from there to the
+  end of the stream they are HELD (a host is only known once the arguments are complete), then
+  released byte for byte or replaced by the block message. Only for a folder whose card has an OUT
+  entry; every other stream is the very same iterator.
+- NOT enforced, said plainly: (a) a streamed hold past 256 KB or 30 s (a huge file written through
+  a tool call, a very slow upstream) is released UNCHECKED -- logged, and when the call turns out to
+  have been out of scope the next scope note says so for 30 min ("WARNING: a streamed call to <host>
+  ... went out before the hub could check it"); (b) a host the agent reaches indirectly (a script it
+  wrote and then runs, `cat urls.txt | httpx`, a variable, a redirect the server sends) is invisible
+  to the guard; (c) the race fan-out (`tool_turn_race`, default off), pipeline replays,
+  `/v1/completions` and the Ollama / Gemini surfaces are not guarded (Build-page and Multi helper
+  CLIs reach the hub through the same /v1 handlers, so they are); (d) the guard is a safety net against a model's MISTAKE, not against an adversary: an
+  agent that can edit a scope file can change the card (it can also run the command without the hub).
+- A blocked tool call still counts as a tool call for the never-chains / quiet-session ledgers on
+  the non-stream and roles paths; on the streamed responses / messages paths the translator sees the
+  block text instead (a rare, mild text-only mark against that pair).
+
+Flags: `scope_card`, `scope_guard` (config.get_flag, default True; an error reading the flag counts
+as off). Off = every request byte-identical (no note, no store written, every stream the same object).
+`tests/conftest.py::_scope_card_off_unless_tested` turns both off for every other test file.
+
+Limits: the scope reader is a heuristic over text (headings, lists, tables, a few inline markers):
+an unusual program page can be under-read (missing an OUT host = no block, never a false block on
+an unlisted host); IPv6 scope is supported but lightly; the card is per folder, so two programs in
+one folder share one card; nothing here was run against a live hub, a real CLI or a real program.
+
+Release-note: new: authorized security testing (bug bounty programs and your own apps) gets a scope-first, evidence-only brief, and the hub keeps each project's scope in front of the model and blocks tool calls aimed at hosts listed out of scope.
