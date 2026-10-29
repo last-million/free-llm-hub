@@ -9020,3 +9020,61 @@ helper could mix scopes and nothing remembered per target what was done.
   run against a live hub or a real CLI.
 
 Release-note: new: when you test several programs or apps at once, Multi now gives each one its own helper that knows only that target's scope, findings and notes, and a later run picks each target up where it stopped.
+
+## A tool call typed as plain <invoke> markup is rescued, not leaked (2026-10-29)
+
+Covered by `tests/test_xml_tool_markup_rescue.py` (19, hermetic; every tag built from pieces so
+no literal tool-use tag sits in the test's own text). Owner, opencode (`uncensored + max`): the
+model announced an action, the turn ended, nothing ran; it also kept quoting an "injected
+instruction" telling it not to call functions.
+
+- **Two findings.** (1) The quoted sentence ("The declared function has now been executed by the
+  caller ... do not claim or request another function call") is NOT in the hub's source (grepped).
+  I did not open the owner's private recon session to trace a relay / opencode origin (the safety
+  classifier had already stopped two replies on that content), so its origin is UNDETERMINED. The
+  fix below makes the turn continue whatever the origin. (2) The real, reproduced hub bug: the
+  model wrote its call as plain Anthropic markup --
+  `<invoke name="bash"><parameter name="command">...</parameter></invoke>`, sometimes wrapped in
+  `<function_calls>...`, sometimes `antml:`-namespaced. `tool_rescue` knew the fullwidth-bar
+  DeepSeek (DSML) spelling of the SAME shape but not this plain one, and `_TEXT_TOOL_CALL_RES`
+  (the typed-call junk detector) knew `<tool_call>` / `<arg_key>` / JSON but not `<invoke>`. So the
+  call slipped through BOTH: opencode got prose and ran nothing -- the turn "stopped". MEASURED:
+  before the fix `tool_rescue.parse` returned nothing for all four shapes; after, each becomes a
+  real `tool_calls` with `timeout` kept a number and `command` a string.
+- **The parser** (`tool_rescue`, the ONE choke point so `rescue`, `rescue_stream` and app's
+  `has_model_markup` check all get it): `_MARKUP_START_RE` gains `<[ns:]invoke ... name=` and
+  `<[ns:]function_calls>` (an optional `antml:`/`anthropic:` namespace; `name=` required so bare
+  `<invoke>` prose is not an opener), routed through the existing `_markup_start` so its
+  backtick-parity guard already protects a fenced or inline mention. `_MARKUP_TAG_RE` gains the
+  plain tags (so `strip_model_markup` leaves no tail), `_MARKERS` gains `<invoke` / `<function_calls`
+  for the streaming prefix-hold, and `model_markup_calls` tries `_dsml_calls or _xml_calls or
+  _special_calls`. `_xml_calls` reuses `_attrs` + `_dsml_value`, so a value's type comes from the
+  tool schema exactly as a DSML parameter's would. `_may_open_marker` also holds while a plain
+  opener is still being typed byte by byte (`<invoke n`, `<invoke name=`), which a fixed-marker
+  prefix test alone missed. A COMPLETE call to an OFFERED tool is promoted into real `tool_calls`;
+  an unparseable one is `has_model_markup` -> a non-answer that hands the turn to another model
+  (and on the streamed path `rescue_stream` emits the retryable error frame the CLI retries).
+- **Shape-agnostic fail-over** (`app._looks_like_text_tool_call`, via two entries added to
+  `_TEXT_TOOL_CALL_RES`): a closing `</invoke>` or a `<parameter name="...">` with no parseable
+  opening invoke (a truncated / reordered call the parser cannot read) is a non-answer on a tools
+  turn, so the turn fails over instead of ending. Advisor's point: a TUI paste is not the bytes the
+  hub saw, so the fail-over is shape-agnostic rather than a headless-shape parser. Cost of a false
+  positive: one retry (the same trade accepted for announcements), never a wrong execution.
+- **No flag, on purpose.** `tool_rescue` is pure stdlib with no config import, and every dialect it
+  already recognises (JSON, `<tool_call>`, `<function=>`, DSML, special tokens) ships unflagged; the
+  two app.py entries sit in the existing unflagged `_TEXT_TOOL_CALL_RES` next to `<tool_call>` /
+  `<arg_key>`, which have the same false-positive profile. The new dialect only ever turns typed
+  markup into a real call or marks unparseable markup a non-answer, like DSML already does.
+- **Guards, tested both ways**: a fenced ``` block and an inline `` `<invoke ...>` `` mention and the
+  bare word "invoke" are NOT calls (backtick parity); a name not in the offered tools is dropped; a
+  token-by-token split and prose-then-markup streams are held and rescued; DSML still parses and is
+  not double-counted. Negative control: with the two source files reverted, 13 of 19 fail.
+- **Limits, plainly.** A namespaced opener (`antml:invoke`) streamed ONE byte at a time may not be
+  held before `name=` arrives (the realistic whole-delta and plain cases are held); it is then
+  caught at the end of the stream or as a non-answer. The orphan fail-over fires on a tools turn for
+  any `</invoke>` / `<parameter name=` in the reply, so a reply that legitimately quotes those tags
+  on a tools turn costs one retry. The "do not request another function call" sentence's origin
+  stays undetermined; if it is a relay, the right fix is a `tool_deadend`-style signature + relay
+  rest, not this.
+
+Release-note: fix: when a model writes a tool call as plain <invoke> markup (not a real tool call), the hub now runs it instead of showing it as text and stopping the turn.

@@ -240,17 +240,29 @@ _SPECIAL_CALL_RE = re.compile(
     + r"|\Z)", re.I | re.S)
 # Where model-native markup STARTS. Deliberately only the openers a model uses
 # for a call: a stray "<|im_end|>" is a template leak (answer_check's job).
+_NS = r"(?:[a-z][\w.-]*:)?"           # optional "antml:" / "anthropic:" namespace
 _MARKUP_START_RE = re.compile(
     r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR
     + "|" + _special("tool", "calls", "begin") + "|" + _TC_BEGIN
-    + "|" + _special("tool", "calls", "section", "begin"), re.I)
+    + "|" + _special("tool", "calls", "section", "begin")
+    # Plain Anthropic / Claude tool-use markup, NO DeepSeek bars. MEASURED
+    # 2026-10-29 (opencode, an uncensored relay): the model wrote its call as
+    # text -- <invoke name="bash"><parameter name="command">...</parameter>
+    # </invoke>, sometimes wrapped in <function_calls>...</function_calls>,
+    # sometimes "antml:"-namespaced. The bar-form DSML spelling of the SAME
+    # shape was known; this plain one was not, so the call reached the CLI as
+    # prose and nothing ran. `name=` is required so bare <invoke> prose is not
+    # an opener.
+    + r"|<\s*" + _NS + r"invoke\b[^>]*\bname\s*="
+    + r"|<\s*" + _NS + r"function_calls\s*>", re.I)
 # Every tag of that markup, to find where it ENDS.
 _MARKUP_TAG_RE = re.compile(
     r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR + r"[^>]*>"
-    r"|<\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>", re.I)
+    r"|<\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>"
+    r"|<\s*/?\s*" + _NS + r"(?:invoke|parameter|function_calls)\b[^>]*>", re.I)
 # The openers, normalised (see _norm_marker), for the streaming prefix hold.
 _MARKERS = ("<|dsml|", "<|tool_calls_begin|>", "<|tool_call_begin|>",
-            "<|tool_calls_section_begin|>")
+            "<|tool_calls_section_begin|>", "<invoke", "<function_calls>")
 
 
 def _markup_start(text, ticks=0):
@@ -349,11 +361,38 @@ def _special_calls(text):
 _FENCE_MARKS = re.compile(r"```(?:json)?", re.I)
 
 
+# Plain <invoke name="X"><parameter name="Y">...</parameter></invoke> (see
+# _MARKUP_START_RE). Values carry no string="true|false" hint, so the schema
+# decides their type via _dsml_value, exactly like a DSML parameter would.
+_XML_INVOKE_RE = re.compile(
+    r"<\s*" + _NS + r"invoke\b([^>]*)>(.*?)(?:<\s*/\s*" + _NS + r"invoke\s*>|(?=<\s*"
+    + _NS + r"invoke\b[^>]*\bname\s*=)|(?=<\s*/\s*" + _NS + r"function_calls\s*>)|\Z)",
+    re.I | re.S)
+_XML_PARAM_RE = re.compile(
+    r"<\s*" + _NS + r"parameter\b([^>]*)>(.*?)(?:<\s*/\s*" + _NS + r"parameter\s*>|(?=<\s*"
+    + _NS + r"parameter\b)|\Z)", re.I | re.S)
+
+
+def _xml_calls(text, schemas=None):
+    out = []
+    for attr_blob, body in _XML_INVOKE_RE.findall(text):
+        name = (_attrs(attr_blob).get("name") or "").strip()
+        if not name:
+            continue
+        args = {}
+        for p_blob, raw in _XML_PARAM_RE.findall(body):
+            key = (_attrs(p_blob).get("name") or "").strip()
+            if key:
+                args[key] = _dsml_value(raw, {}, _schema_type(schemas, name, key))
+        out.append(_call(name, args))
+    return out
+
+
 def model_markup_calls(text, schemas=None):
     """Calls in model-native markup (see the module docstring), unfiltered."""
     if not has_model_markup(text):
         return []
-    return _dsml_calls(text, schemas) or _special_calls(text)
+    return _dsml_calls(text, schemas) or _xml_calls(text, schemas) or _special_calls(text)
 
 
 def strip_model_markup(text):
@@ -545,11 +584,22 @@ def _norm_marker(s):
 
 def _may_open_marker(text):
     """True when `text` ENDS with what could still become an opener."""
-    i = text.rfind("<", max(0, len(text) - 48))
+    i = text.rfind("<", max(0, len(text) - 64))
     if i < 0:
         return False
     tail = _norm_marker(text[i:])
-    return any(m.startswith(tail) for m in _MARKERS)
+    if any(m.startswith(tail) for m in _MARKERS):
+        return True
+    # A plain <invoke name=...> / <function_calls> opener typed byte by byte has
+    # a VARIABLE middle ("<invoke n", "<invoke name="), so it is not a prefix of
+    # a fixed marker. Keep holding while the tail is still growing INTO the
+    # invoke / function_calls stem (either way: tail a prefix of the stem, or the
+    # stem a prefix of the tail), a namespace dropped first.
+    stem = re.sub(r"^<[a-z][\w.-]*:", "<", tail)
+    for opener in ("<invoke", "<function_calls"):
+        if stem.startswith(opener) or opener.startswith(stem):
+            return True
+    return False
 
 
 def _units(items, framing):

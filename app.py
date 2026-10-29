@@ -41646,6 +41646,14 @@ _TEXT_TOOL_CALL_RES = (
     re.compile(r'"tool_calls"\s*:\s*\[', re.I),
     re.compile(r'"function_call"\s*:\s*\{', re.I),
     re.compile(r'```(?:json|tool_code|python)?\s*\{\s*"(?:name|tool|command)"\s*:', re.I),
+    # Plain Anthropic tool-use markup typed as text (see tool_rescue's plain
+    # invoke/parameter dialect). A COMPLETE call is rescued into real tool_calls
+    # before this is consulted; these catch the shape-agnostic leftovers -- a
+    # closing </invoke> or a <parameter name="..."> with no parseable opening
+    # invoke (a truncated / reordered call) -- so a tools turn that only TYPED a
+    # call still reads as a non-answer and hands the turn to another model.
+    re.compile(r"</\s*(?:[a-z][\w.-]*:)?invoke\s*>", re.I),
+    re.compile(r"<\s*(?:[a-z][\w.-]*:)?parameter\b[^>]*\bname\s*=", re.I),
 )
 
 
