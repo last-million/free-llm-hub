@@ -208,6 +208,28 @@ _SECURITY_RE = re.compile(
     r"\bonline store\b|\bstorefront\b|\be-?commerce\b|\bsaas\b|\bmulti-?tenant\b",
     re.I)
 
+# SMART CONTRACTS / WEB3 (2026-10-29, owner: free models maximally useful on any
+# web3 / smart-contract project -- build, test, audit, and authorised testing).
+# Checklist level only: what a careful Solidity reviewer checks first, plus the
+# safety lines a model must never get wrong (no mainnet transaction unasked, no
+# key in code). The REAL capability is the chain_* MCP tools (chainkit.py); this
+# brief only names them, conditionally, because a client may not have them.
+CHAIN_DEV = """SMART CONTRACTS / WEB3 BRIEF (apply unless the user says otherwise)
+- Toolchain: Foundry first (forge build/test, cast, anvil; test/*.t.sol with forge-std); Hardhat if the project uses it (npx hardhat test). Pin solc + optimizer in config; OpenZeppelin for standard tokens/access control.
+- Test, then claim: unit tests per external function (success + each revert), fuzz tests (bounded inputs, math), invariants (supply, solvency). Run them, paste the real result; gas (forge test --gas-report) after correctness.
+- Review: reentrancy (CEI, guards); access control on every state change; oracle/price manipulation (spot price, flash loans); rounding (multiply before divide, who it favours); signature replay (nonce, chainId, deadline, EIP-712); upgradeability (initializers, storage layout); unchecked external calls/returns; unbounded loops.
+- Safety: local fork or testnet first; no mainnet transaction unless the user explicitly asks. Exploit proofs only on a local fork, for code the user owns or may test. No private key or seed phrase in code, commits, logs or prompts (.env + .gitignore).
+- Hub tools if offered: chain_tools_status, chain_source, chain_read (read-only), chain_fork_start, chain_analyze.
+ANTI: a finding with no proof test; "audited/production-ready" claims; tx.origin auth; block.timestamp/blockhash randomness; unlimited approvals by default."""
+
+_CHAIN_RE = re.compile(
+    r"\bsolidity\b|\bvyper\b|(?<!ai )(?<!azure )\bfoundry\b(?!\s+(?:vtt|local)\b)|"
+    r"\bforge (?:test|build|script|create|coverage|init|install|snapshot|fmt)\b|"
+    r"\bhardhat\b|\banvil\b(?!\.works)|\bsmart[- ]contracts?\b|\bevm\b|"
+    r"\berc[- ]?(?:20|721|1155|4626|2612|4337)\b|\bdefi\b|\bweb3\b|\bd-?apps?\b|"
+    r"\bviem\b|\bwagmi\b|\bethers\.?js\b|\buniswap\b|\bslither\b|\baderyn\b|\bsepolia\b|"
+    r"\b(?:token|nft|staking|vault|lending|governance|multisig) contracts?\b", re.I)
+
 _SHIP_RE = re.compile(
     r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
     r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b|"
@@ -215,6 +237,9 @@ _SHIP_RE = re.compile(
     r"\bpreview\b|\blocalhost\b|\bstart the (?:app|server|site)\b", re.I)
 
 _BRIEFS = [
+    # First: a contract request is the most specific domain there is, and the
+    # generic ones (ship/landing/web_design) must not take both slots from it.
+    ("chain_dev", _CHAIN_RE, CHAIN_DEV),
     ("ship", _SHIP_RE, SHIP),
     ("landing", re.compile(
         r"\blanding page\b|\bsales page\b|\bfunnel\b|\bconversion rate\b|\bcta\b|\bopt[- ]?in page\b", re.I),

@@ -33,6 +33,9 @@ BUILTIN = [
      "Every page built to rank: titles, meta, headings, schema, sitemap."),
     ("images", "Images",
      "Use the hub's local image generator (WebP) instead of stock-photo links."),
+    ("chain_dev", "Smart contracts / web3",
+     "Solidity with Foundry or Hardhat: tests (unit, fuzz, invariant), a review checklist, "
+     "fork-first safety and the hub's chain_* tools."),
     ("last30days", "last30days web research",
      "Agent skill for research on the last 30 days (web, YouTube, public Reddit)."),
 ]

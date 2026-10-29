@@ -221,7 +221,8 @@ _PY_RE = re.compile(r"^(?:python|pythonw|py)(?:\d+(?:\.\d+)?)?$")
 _TEST_SCRIPT_RE = re.compile(r"^(?:test|tests|t|tst)(?:[:._-][\w:.-]+)?$", re.I)
 _BUILD_SCRIPT_RE = re.compile(r"^(?:build|typecheck|type-check|check-types|tsc)(?:[:._-][\w:.-]+)?$",
                               re.I)
-_DIRECT_TOOLS = {"jest", "vitest", "mocha", "tsc", "pytest", "vite", "next", "webpack"}
+_DIRECT_TOOLS = {"jest", "vitest", "mocha", "tsc", "pytest", "vite", "next", "webpack",
+                 "hardhat"}
 _TSC_NOT_A_CHECK = {"-v", "--version", "-h", "--help", "--init", "-w", "--watch",
                     "--showconfig", "--all", "--listfilesonly"}
 
@@ -329,6 +330,23 @@ def _segment_tool(segment):
     if b == "go":
         if args[:1] == ["test"]:
             return {"tool": "go test", "kind": "test", "wrapper": None, "args": args[1:]}
+        return None
+    if b in ("forge", "hardhat"):
+        # Smart-contract toolchains (2026-10-29): `forge test` / `forge t`,
+        # `forge build`; `hardhat test` (Hardhat 2 runs mocha, Hardhat 3 its
+        # own Solidity + node runners), `hardhat compile`. `npx hardhat test`
+        # arrives here once the launcher is stripped.
+        subs = [a for a in args if not a.startswith("-")][:1]
+        sub = subs[0].lower() if subs else ""
+        rest = args[args.index(subs[0]) + 1:] if subs else []
+        if b == "forge" and sub in ("test", "t"):
+            return {"tool": "forge test", "kind": "test", "wrapper": None, "args": rest}
+        if b == "forge" and sub in ("build", "b", "compile"):
+            return {"tool": "forge build", "kind": "build", "wrapper": None, "args": rest}
+        if b == "hardhat" and sub == "test":
+            return {"tool": "hardhat test", "kind": "test", "wrapper": None, "args": rest}
+        if b == "hardhat" and sub == "compile":
+            return {"tool": "hardhat compile", "kind": "build", "wrapper": None, "args": rest}
         return None
     if b == "node" and "--test" in args:
         return {"tool": "node --test", "kind": "test", "wrapper": None, "args": args}
@@ -699,6 +717,104 @@ def _buntest(out, zero, nonzero):
     return _result("bun test", UNDETERMINED, passed, failed, skipped, line)
 
 
+# forge test (Foundry, read from foundry crates/forge/src/result.rs 2026-10-29):
+#   "[PASS] test_Increment() (gas: 31303)" / "[FAIL: reason] test_X() (gas: ..)"
+#   "Suite result: ok. 2 passed; 0 failed; 0 skipped; finished in 7.86ms (...)"
+#   ("Test result: ..." in older builds), and the run total
+#   "Ran 1 test suite in 8.48ms (7.86ms CPU time): 2 tests passed, 0 failed, 0
+#   skipped (2 total tests)". A compile error is "Compiler run failed" /
+#   "Error (2314): ...". No tests: "No tests found in project!" / "No tests
+#   match the provided pattern".
+_FORGE_SUITE_RE = re.compile(r"^(?:Suite|Test) result: (ok|FAILED)\. (\d+) passed; (\d+) failed; "
+                             r"(\d+) skipped", re.M)
+_FORGE_TOTAL_RE = re.compile(r"(\d+) tests? passed, (\d+) failed, (\d+) skipped "
+                             r"\((\d+) total tests?\)", re.M)
+_FORGE_NONE_RE = re.compile(r"^No tests (?:found|match|to run)", re.M | re.I)
+_FORGE_COMPILE_FAIL_RE = re.compile(r"Compiler run failed|^Error \(\d+\):|^Error: Compil", re.M)
+_FORGE_BUILD_OK_RE = re.compile(r"Compiler run successful|No files changed, compilation skipped|"
+                                r"^Nothing to compile", re.M)
+
+
+def _forge(out, zero, nonzero):
+    total = _FORGE_TOTAL_RE.findall(out)
+    suites = _FORGE_SUITE_RE.findall(out)
+    if total:
+        passed, failed, skipped = (int(x) for x in total[-1][:3])
+        bad = failed > 0 or any(s[0] == "FAILED" for s in suites)
+    elif suites:
+        passed = sum(int(s[1]) for s in suites)
+        failed = sum(int(s[2]) for s in suites)
+        skipped = sum(int(s[3]) for s in suites)
+        bad = failed > 0 or any(s[0] == "FAILED" for s in suites)
+    else:
+        if nonzero and _FORGE_COMPILE_FAIL_RE.search(out):
+            return _result("forge test", FAIL, 0, 1, 0, "forge test: compilation failed")
+        if _FORGE_NONE_RE.search(out):
+            return _result("forge test", NO_TESTS, line="no tests found")
+        return _result("forge test", UNDETERMINED)
+    line = "%d passed; %d failed; %d skipped" % (passed, failed, skipped)
+    if nonzero and bad:
+        return _result("forge test", FAIL, passed, failed or 1, skipped, line)
+    if zero and not bad:
+        if passed:
+            return _result("forge test", PASS, passed, 0, skipped, line)
+        return _result("forge test", NO_TESTS, 0, 0, skipped, line)
+    return _result("forge test", UNDETERMINED, passed, failed, skipped, line)
+
+
+def _forge_build(out, zero, nonzero):
+    errs = len(_FORGE_COMPILE_FAIL_RE.findall(out))
+    if nonzero and errs:
+        return _result("forge build", FAIL, 0, errs, 0, "forge build: compilation failed",
+                       kind="build")
+    if zero and not errs and _FORGE_BUILD_OK_RE.search(out):
+        return _result("forge build", PASS, 0, 0, 0, "forge build: compiled", kind="build")
+    return _result("forge build", UNDETERMINED, kind="build")
+
+
+# hardhat test: Hardhat 2 runs mocha ("  5 passing (2s)", "  1 failing",
+# "  2 pending"); Hardhat 3 prints one summary per runner (Solidity tests:
+# "N passing" / "N failing" / "N skipped", read from its reporter.ts), so every
+# summary line of the run is added up. A compile error before the tests:
+# "Compilation failed" / "Error HH600" / "HHE...".
+_HH_PASS_RE = re.compile(r"^\s*(\d+) passing\b", re.M)
+_HH_FAIL_RE = re.compile(r"^\s*(\d+) failing\b", re.M)
+_HH_SKIP_RE = re.compile(r"^\s*(\d+) (?:pending|skipped|todo)\b", re.M)
+_HH_COMPILE_FAIL_RE = re.compile(r"Compilation failed|\bError HH\d+\b|\bHHE\d+\b", re.M)
+_HH_COMPILE_OK_RE = re.compile(r"^Compiled \d+ Solidity files?\b|^Nothing to compile\b|"
+                               r"^No Solidity source files? (?:to compile|found)", re.M | re.I)
+
+
+def _hardhat(out, zero, nonzero):
+    p = [int(x) for x in _HH_PASS_RE.findall(out)]
+    f = [int(x) for x in _HH_FAIL_RE.findall(out)]
+    s = [int(x) for x in _HH_SKIP_RE.findall(out)]
+    if not p and not f:
+        if nonzero and _HH_COMPILE_FAIL_RE.search(out):
+            return _result("hardhat test", FAIL, 0, 1, 0, "hardhat test: compilation failed")
+        return _result("hardhat test", UNDETERMINED)
+    passed, failed, skipped = sum(p), sum(f), sum(s)
+    line = "%d passing" % passed + (", %d failing" % failed if failed else "") + \
+        (", %d skipped" % skipped if skipped else "")
+    if nonzero and failed:
+        return _result("hardhat test", FAIL, passed, failed, skipped, line)
+    if zero and passed and not failed:
+        return _result("hardhat test", PASS, passed, 0, skipped, line)
+    if zero and not passed and not failed:
+        return _result("hardhat test", NO_TESTS, 0, 0, skipped, line)
+    return _result("hardhat test", UNDETERMINED, passed, failed, skipped, line)
+
+
+def _hardhat_compile(out, zero, nonzero):
+    errs = len(_HH_COMPILE_FAIL_RE.findall(out))
+    if nonzero and errs:
+        return _result("hardhat compile", FAIL, 0, errs, 0, "hardhat compile: compilation failed",
+                       kind="build")
+    if zero and not errs and _HH_COMPILE_OK_RE.search(out):
+        return _result("hardhat compile", PASS, 0, 0, 0, "hardhat compile: compiled", kind="build")
+    return _result("hardhat compile", UNDETERMINED, kind="build")
+
+
 # tsc: "src/a.ts(3,7): error TS2322: ..." (plain) / "src/a.ts:3:7 - error
 # TS2322: ..." (pretty) / "error TS5058: ..." (global), "Found 2 errors in 1 file."
 _TSC_ERR_RE = re.compile(r"^(?:.+\(\d+,\d+\): |.+:\d+:\d+ - )?error TS\d+:", re.M)
@@ -754,10 +870,12 @@ _ADAPTERS = {
     "pytest": _pytest, "unittest": _unittest, "jest": _jest, "vitest": _vitest,
     "mocha": _mocha, "cargo test": _cargo, "go test": _gotest,
     "node --test": _nodetest, "bun test": _buntest, "tsc": _tsc,
+    "forge test": _forge, "forge build": _forge_build, "hardhat test": _hardhat,
+    "hardhat compile": _hardhat_compile,
 }
 # The order a wrapper's output is sniffed in when its script is not echoed.
 _TEST_SNIFF = ("vitest", "jest", "mocha", "pytest", "node --test", "bun test",
-               "unittest", "go test", "cargo test")
+               "unittest", "go test", "cargo test", "forge test")
 
 
 def _adapt(tool, out, zero, nonzero):
@@ -767,7 +885,8 @@ def _adapt(tool, out, zero, nonzero):
     else:
         r = _bundler(tool, out, zero, nonzero)
     r["kind"] = r.get("kind") or ("build" if tool in ("tsc", "vite build", "next build",
-                                                       "webpack") else "test")
+                                                       "webpack", "forge build",
+                                                       "hardhat compile") else "test")
     return r
 
 

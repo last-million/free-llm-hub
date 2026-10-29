@@ -46,7 +46,12 @@ _CANDIDATES = {
     "bun": ("bun",), "python": ("python3", "python", "py"), "pip": ("pip3", "pip"),
     "docker": ("docker",), "psql": ("psql",), "mysql": ("mysql",),
     "redis": ("redis-server", "redis-cli"),
+    # Smart-contract tools (2026-10-29): named in the block only when present.
+    "forge": ("forge",), "anvil": ("anvil",), "slither": ("slither",),
 }
+# Foundry 1.x prints "forge Version: 1.3.5-stable"; older builds
+# "forge 0.2.0 (abc1234 2024-...)"; slither prints its bare version.
+_FOUNDRY_VER = r"^\s*%s(?:\s+Version:)?\s+v?(\d+\.\d+\.\d+)"
 
 _BARE = re.compile(r"^\s*v?(\d+\.\d+(?:\.\d+)?)(?:[-+][\w.]+)?\s*$", re.M)
 _VERSION_RES = {
@@ -61,6 +66,9 @@ _VERSION_RES = {
     "mysql": (re.compile(r"Distrib (\d+\.\d+(?:\.\d+)?)-MariaDB", re.I),
               re.compile(r"\bVer (\d+\.\d+(?:\.\d+)?)", re.I)),
     "redis": re.compile(r"(?:\bv=|redis-cli )(\d+\.\d+(?:\.\d+)?)", re.I),
+    "forge": re.compile(_FOUNDRY_VER % "forge", re.M | re.I),
+    "anvil": re.compile(_FOUNDRY_VER % "anvil", re.M | re.I),
+    "slither": re.compile(r"^\s*(\d+\.\d+\.\d+)\s*$", re.M),
 }
 
 
@@ -283,6 +291,11 @@ def _block(snap, who):
             missing.append(name)
     if missing:
         facts.append("%s: not installed" % ", ".join(missing))
+    # Contract tooling only when it is THERE (no "not installed" noise on every
+    # app build): "forge 1.3, anvil 1.3, slither 0.10".
+    for key in ("forge", "anvil", "slither"):
+        if t.get(key):
+            facts.append("%s %s" % (key, ".".join(str(t[key]).split(".")[:2])))
     busy = [str(p) for p in snap.get("busy_ports") or ()]
     line = "THIS MACHINE: " + ", ".join(facts) + (
         "; busy ports: " + ", ".join(busy) if busy else "") + "."
@@ -316,7 +329,7 @@ _APP_NOUN_RE = re.compile(
     r"back-end|server|platform|plateforme|marketplace|store|shop|e-?commerce|"
     r"boutique|dashboard|tableau de bord|crm|erp|booking|bookings|r[ée]servations?|"
     r"portal|portail|full[- ]?stack|database|base de donn[ée]es|aplicaci[oó]n|"
-    r"plataforma|anwendung)\b", re.I)
+    r"plataforma|anwendung|d-?apps?|smart[- ]contracts?)\b", re.I)
 _SIZEABLE_CHARS = 280
 
 

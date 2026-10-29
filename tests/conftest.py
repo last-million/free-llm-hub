@@ -447,6 +447,49 @@ def _auto_block_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _chain_tools_off_unless_tested(request, monkeypatch):
+    """THE CHAIN TOOLS (app `_chain_on`, chainkit.py, flag `chain_tools`) are default ON
+    (2026-10-29): seven chain_* MCP tools join tools/list. Other test files pin the hub's
+    MCP tool set (test_hub_mcp's superset check); off here keeps them byte for byte. The
+    feature's own file turns it on.
+
+    And, for EVERY test: no real anvil, analyzer, version probe, network call or thread
+    -- chainkit's module defaults fail loudly (its tests inject fakes into chainkit.Kit),
+    and a fork left in chainkit.default is stopped afterwards."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_chainkit":
+        try:
+            import app
+            monkeypatch.setattr(app, "_chain_on", lambda: False)
+        except Exception:
+            pass
+    try:
+        import chainkit
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+
+    def _refuse(what):
+        def _no(*_a, **_k):
+            raise AssertionError("a test tried to %s for real; inject a fake into "
+                                 "chainkit.Kit" % what)
+        return _no
+
+    monkeypatch.setattr(chainkit, "_default_http", _refuse("call the network"))
+    monkeypatch.setattr(chainkit, "_default_run", _refuse("run a chain tool"))
+    monkeypatch.setattr(chainkit, "_default_spawn", _refuse("start anvil"))
+    monkeypatch.setattr(chainkit, "_default_start_thread", _refuse("start a chainkit thread"))
+    monkeypatch.setattr(chainkit, "_default_which", lambda _name: None)
+    monkeypatch.setattr(chainkit, "_default_wsl_available", lambda: False)
+    monkeypatch.setattr(chainkit, "_default_port_free", lambda _port: False)
+    yield
+    try:
+        chainkit.default.shutdown()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
     """STAY IN THE CLI UNTIL THE RUN ENDS (app, flag `cli_multi_stay_live`) is
     default ON for opencode (2026-10-11), but the CLI-Multi test files pin the

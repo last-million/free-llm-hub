@@ -133,6 +133,7 @@ import publish
 import ghpush
 import memory
 import taskboard
+import chainkit
 
 # Both tool families are wired here, and for the same reason: every name below
 # is resolved at CALL time, not at import time, so they can live far lower in
@@ -170,6 +171,13 @@ hub_mcp.init(
         "enabled": lambda: _cmem_on(),
         "search": lambda **kw: _cmem_mcp_search(**kw),
         "get": lambda **kw: _cmem_mcp_get(**kw),
+    },
+    # CHAIN TOOLS: the chain_* smart-contract tools (chainkit.py; glue in the
+    # CHAIN TOOLS section below). Advertised only while flag `chain_tools` is on.
+    chain={
+        "enabled": lambda: _chain_on(),
+        "tools": lambda: chainkit.tool_schemas(),
+        "call": lambda name, arguments: chainkit.default.call(name, arguments),
     })
 
 import logging
@@ -27994,6 +28002,103 @@ def _publish_cli_renew(tunnel_id, ttl_minutes=None):
     _log.info("[publish] agent renewed a tunnel for %s",
               _publish_project_name(t.get("project_dir")))
     return _publish_result(t)
+
+
+# ---------------------------------------------------------------------------
+# CHAIN TOOLS: the chain_* MCP tools for smart-contract work (chainkit.py) --
+# tools status, verified source from Sourcify, read-only JSON-RPC, managed local
+# anvil forks, slither/aderyn analysis. Flag `chain_tools` (default on; off = the
+# tools are neither listed nor callable). POST /mcp is unauthenticated on
+# localhost, so every folder an agent names passes _chain_folder_guard: an
+# existing absolute folder, not a link, not the hub's own repo or state folder,
+# not a drive root / the home folder / above it, and INSIDE the user's home, a
+# WSL distro, or a folder the owner listed in setting `chain_project_roots`.
+# The last rule is what keeps another OS user's process from making the hub run
+# an analyzer (which may run the project's own build config) in a folder that
+# other user controls.
+# ---------------------------------------------------------------------------
+
+def _chain_on():
+    try:
+        return bool(config.get_flag(chainkit.FLAG, True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _chain_extra_roots():
+    try:
+        raw = config.get_setting("chain_project_roots")
+    except Exception:                                            # noqa: BLE001
+        return []
+    out = []
+    for r in raw if isinstance(raw, list) else []:
+        if isinstance(r, str) and os.path.isabs(r.strip()) and os.path.isdir(r.strip()) \
+                and not _publish_folder_too_broad(r.strip()):
+            out.append(r.strip())
+    return out
+
+
+def _chain_wsl_ok(folder):
+    """A folder inside a WSL distro that is a real project folder: never the
+    distro root, /home, a home folder, /mnt or a drive under it."""
+    import wslpath
+    p = wslpath.parse(folder)
+    if not p:
+        return False
+    comps = [c for c in p[1].split("/") if c]
+    if not comps:
+        return False
+    if comps[0] in ("home", "mnt") and len(comps) < 3:
+        return False
+    return len(comps) >= 2
+
+
+def _chain_folder_guard(folder):
+    """None when the chain tools may write into / run in `folder`, else the
+    reason in plain words. Fails closed."""
+    try:
+        folder = (folder or "").strip()
+        if not folder or not os.path.isabs(folder):
+            return "Pass project_dir: the absolute path of the project folder."
+        if not os.path.isdir(folder):
+            return "project_dir is not an existing folder."
+        if chainkit._is_link(folder):
+            return "project_dir is a link; pass the real folder."
+        import wslpath
+        if wslpath.is_wsl(folder):
+            return None if _chain_wsl_ok(folder) else \
+                "project_dir is too broad (a WSL root or home folder); pass the project folder."
+        if _publish_folder_too_broad(folder):
+            return ("project_dir is too broad (a drive root, your home folder or above); pass "
+                    "the project folder.")
+        if _cm_is_hub_repo(folder):
+            return "project_dir is the hub's own folder."
+        state = config.state_dir()
+        if state and (_publish_inside(state, folder) or _publish_inside(folder, state)):
+            return "project_dir is the hub's private state folder."
+        home = os.path.expanduser("~")
+        if home not in ("", "~") and _publish_inside(home, folder):
+            return None
+        if any(_publish_inside(r, folder) for r in _chain_extra_roots()):
+            return None
+        return ("project_dir is outside your home folder. Move the project under it, or list "
+                "its parent folder in the hub setting chain_project_roots.")
+    except Exception:                                            # noqa: BLE001
+        return "Could not check that folder."
+
+
+def _chain_hub_ports():
+    try:
+        return {agentic_chat._port()}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
+chainkit.default.configure(
+    guard=_chain_folder_guard,
+    settings=lambda key: config.get_setting(key),
+    hub_ports=_chain_hub_ports,
+    log=_log.info)
 
 
 # ---------------------------------------------------------------------------
