@@ -470,6 +470,27 @@ def _auto_block_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _project_memory_off_unless_tested(request, monkeypatch):
+    """SHARED PROJECT MEMORY (app `_pmem_*`, convmem's folder scope, flags
+    `memory_project_scope` / `memory_project_note`) is default ON (2026-10-29): it
+    adds a system note on opening turns of a conversation whose CLI names its
+    folder, and lets a memory key reach the folder's other sessions. Off here keeps
+    every other file byte for byte; the feature's own file turns it on, and
+    CMEM_TEST_ON=1 leaves it on like conversation memory (the real defaults)."""
+    import os as _os
+    mod = getattr(request.node, "module", None)
+    name = mod.__name__.rsplit(".", 1)[-1] if mod is not None else ""
+    if not _os.environ.get("CMEM_TEST_ON") and name != "test_project_memory_shared":
+        try:
+            import app
+            monkeypatch.setattr(app, "_pmem_scope_on", lambda: False)
+            monkeypatch.setattr(app, "_pmem_note_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
     """STAY IN THE CLI UNTIL THE RUN ENDS (app, flag `cli_multi_stay_live`) is
     default ON for opencode (2026-10-11), but the CLI-Multi test files pin the
