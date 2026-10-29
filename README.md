@@ -388,7 +388,7 @@ with the `github_push` flag (default on). Needs git 2.32 or newer.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-200 routes in total; the dashboard is the documentation for the rest.
+203 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

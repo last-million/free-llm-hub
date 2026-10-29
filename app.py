@@ -17617,6 +17617,9 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # goal (opening-turn-only, never on compaction). Pipeline-internal
             # stage calls (_no_craft) are skipped with the brief.
             msgs = _apply_goal_note(msgs)
+            # CLI TOOLS HERE: the developer CLIs installed here (opening turn of a
+            # tool-carrying conversation only; skipped when the brief has it).
+            msgs = _ts_apply_note(msgs, payload.get("tools"))
         # An earlier hop's "your message contains only a tool setup" reply must not be
         # what this model reads as the conversation so far (see _scrub_empty_claims).
         msgs = _scrub_empty_claims(msgs)
@@ -30644,6 +30647,169 @@ def _dp_env_block(text, who="session"):
 
 craft.set_env_source(lambda text: _dp_env_block(text, "session"))
 swarm_windows.set_env_source(_dp_env_block)
+
+
+# --------------------------------------------------------------------------- #
+# CLI TOOLS HERE + THE MCP GATEWAY (2026-10-29). toolscan.py: the developer
+# CLIs installed here (natively and inside a RUNNING WSL distro) and, where the
+# vendor documents a status command, whether the user is logged in -- one short
+# block for a Build brief (craft tools source), the Multi planner and workers
+# (next to the machine block, inside swarm_windows.ENV_BLOCK_CHARS) and the
+# opening turn of a /v1 conversation (_ts_apply_note). mcpgateway.py: MCP
+# servers the owner registers ONCE in the hub, re-exposed through the hub's own
+# /mcp to every CLI that has the hub's entry. Flags `tool_scan` and
+# `mcp_gateway` (default on).
+# --------------------------------------------------------------------------- #
+
+import toolscan
+import mcpgateway
+
+
+def _ts_on():
+    try:
+        return bool(config.get_flag("tool_scan", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _gw_on():
+    # A gateway runs programs: an unreadable config counts as OFF.
+    try:
+        return bool(config.get_flag("mcp_gateway", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ts_block_text(max_chars=None, wait=0.0):
+    """The CLI TOOLS HERE block, or "" (flag off, nothing scanned yet, no CLI
+    found). A request path passes wait=0 and never waits. Never raises."""
+    if not _ts_on():
+        return ""
+    try:
+        snap = toolscan.snapshot(wait=wait)
+        return toolscan.block(snap, toolscan.BLOCK_MAX if max_chars is None else max_chars)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _ts_env_block(goal, who="worker"):
+    """The machine block plus the tools block for a Multi planner / worker,
+    sized so the pair stays inside swarm_windows.ENV_BLOCK_CHARS (the machine
+    block keeps its place; the tools block takes what is left)."""
+    machine = _dp_env_block(goal, who)
+    try:
+        room = min(toolscan.BLOCK_MAX,
+                   int(swarm_windows.ENV_BLOCK_CHARS) - len(machine) - 1)
+    except Exception:                                            # noqa: BLE001
+        room = 0
+    tools = (_ts_block_text(room, wait=5.0 if who == "planner" else 0.0)
+             if room >= 80 else "")
+    return "\n".join(part for part in (machine, tools) if part)
+
+
+craft.set_tools_source(lambda text: _ts_block_text())
+swarm_windows.set_env_source(_ts_env_block)
+
+
+def _ts_apply_note(messages, tools):
+    """On the OPENING turn of a tool-carrying /v1 conversation, one short
+    system note naming the developer CLIs installed here. Never on a
+    continuation, a compaction request or when the conversation already
+    carries the block (the craft brief, a Build brief, a Multi worker prompt).
+    Returns the original list when nothing applies. Never raises."""
+    try:
+        if not tools or not isinstance(messages, list) or not messages:
+            return messages
+        if not _ts_on() or not _awaiting_new_instruction(messages):
+            return messages
+        if ctxwin.is_compaction_request(messages):
+            return messages
+        text = _ts_block_text()
+        if not text:
+            return messages
+        for m in messages:
+            if isinstance(m, dict) and toolscan.MARKER in (_message_text(m) or ""):
+                return messages
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict) \
+                and messages[i].get("role") == "system":
+            i += 1
+        return messages[:i] + [{"role": "system", "content": text}] + messages[i:]
+    except Exception:                                            # noqa: BLE001
+        return messages
+
+
+mcpgateway.default.configure(
+    enabled=lambda: _gw_on(),
+    env_filter=lambda env: agentic_chat.strip_hub_port_vars(env))
+hub_mcp.add_tool_provider(lambda: mcpgateway.default.list_tools(),
+                          lambda name, arguments: mcpgateway.default.call_tool(name, arguments))
+import atexit as _gw_atexit
+_gw_atexit.register(lambda: mcpgateway.default.shutdown())
+
+
+def _gw_scan_view():
+    snap = toolscan.snapshot(wait=0.0) if _ts_on() else None
+    return {"enabled": _ts_on(), "at": (snap or {}).get("at"),
+            "tools": toolscan.rows(snap), "block": toolscan.block(snap)}
+
+
+@app.route("/api/mcp-gateway", methods=["GET"])
+def api_mcp_gateway():
+    """Servers registered in the gateway (never a secret: env KEY names and
+    has_token only), their tool counts, the one-click catalog and the CLI scan.
+    ?rescan=1 asks for a fresh CLI scan in the background."""
+    if request.args.get("rescan") in ("1", "true") and _ts_on():
+        toolscan.refresh()
+    try:
+        servers = mcpgateway.default.servers_view()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[mcp-gateway] list failed", exc_info=True)
+        servers = []
+    return jsonify({"enabled": _gw_on(), "servers": servers,
+                    "running": mcpgateway.default.running(),
+                    "catalog": mcpgateway.catalog_view(),
+                    "hub_mcp": {"url": _hub_mcp_url(), "name": "free-llm-hub"},
+                    "tool_scan": _gw_scan_view()})
+
+
+@app.route("/api/mcp-gateway", methods=["POST"])
+def api_mcp_gateway_save():
+    """Add or update a server: {name, command, args, env} or {name, url,
+    token}. Needs {"confirm": true}: a stdio server is a program the hub runs
+    as you. Its tools are read in the background right after."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body", "code": "bad_request"}), 400
+    if not _gw_on():
+        return jsonify({"error": "the MCP gateway is switched off",
+                        "code": "disabled"}), 403
+    if body.get("confirm") is not True:
+        return jsonify({"error": "confirm: true is required (the hub will run or "
+                                 "contact this server)", "code": "confirm_required"}), 400
+    try:
+        view = mcpgateway.default.register(
+            body.get("name"), command=body.get("command"), args=body.get("args"),
+            env=body.get("env"), url=body.get("url"), token=body.get("token"),
+            clear_token=body.get("clear_token") is True)
+    except mcpgateway.GatewayError as exc:
+        return jsonify({"error": exc.message, "code": exc.code}), 400
+    _log.info("[mcp-gateway] the owner saved %s (%s)", view.get("name"), view.get("transport"))
+    mcpgateway.default.refresh_async(view["name"])
+    return jsonify({"ok": True, "server": view})
+
+
+@app.route("/api/mcp-gateway/delete", methods=["POST"])
+def api_mcp_gateway_delete():
+    """Remove a server: its process is stopped, its tools leave every CLI."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body", "code": "bad_request"}), 400
+    name = body.get("name")
+    if not mcpgateway.default.remove(name if isinstance(name, str) else ""):
+        return jsonify({"error": "no such server", "code": "not_found"}), 404
+    _log.info("[mcp-gateway] the owner removed %s", name)
+    return jsonify({"ok": True})
 
 
 # --------------------------------------------------------------------------- #

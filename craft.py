@@ -503,6 +503,42 @@ def env_block(text):
     return out if isinstance(out, str) else ""
 
 
+# CLI TOOLS HERE (2026-10-29): the developer CLIs installed here and whether
+# the user is logged in (toolscan.py via app.py). Registered like the machine
+# block: fn(text) -> the block or "". It is the FIRST extra dropped when a
+# brief would cross BRIEF_CEILING_CHARS (then the machine block), so it can
+# never cost the machine block its place.
+_TOOLS_SOURCE = None
+
+
+def set_tools_source(fn):
+    global _TOOLS_SOURCE
+    _TOOLS_SOURCE = fn if callable(fn) else None
+
+
+def tools_block(text):
+    """The CLI TOOLS HERE block for `text`, or "". Never raises."""
+    if _TOOLS_SOURCE is None:
+        return ""
+    try:
+        out = _TOOLS_SOURCE(text)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return out if isinstance(out, str) else ""
+
+
+def _fit_extras(head, env, tools_extra, tail):
+    """head + env + tools + tail, dropping the tools block and then the machine
+    block while the brief crosses BRIEF_CEILING_CHARS. Without either extra the
+    body is the plain join, exactly as before."""
+    body = ""
+    for extra in (env + tools_extra, env, []):
+        body = "\n\n".join(head + extra + tail)
+        if not extra or len(body) <= BRIEF_CEILING_CHARS:
+            return body
+    return body
+
+
 # Is this web / UI work? The web_design trigger plus the site nouns that mean a
 # page will be built, and a few non-English forms (the owner writes French).
 # Used by plan_check to decide whether a plan's design gets the slop check;
@@ -587,12 +623,12 @@ def system_message(text, tools=True, session_id=None):
     # THIS MACHINE (app builds, tool-carrying turns): with the briefs, before
     # the loop -- and dropped whenever it would cross BRIEF_CEILING_CHARS.
     env = [e for e in [env_block(text)] if e] if tools else []
+    # CLI TOOLS HERE: next to the machine block, dropped first.
+    tl = [e for e in [tools_block(text)] if e] if tools else []
     if not hits:
         if not tools:
             return None
-        body = "\n\n".join(pub + env + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])
-        if env and len(body) > BRIEF_CEILING_CHARS:
-            body = "\n\n".join(pub + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])
+        body = _fit_extras(pub, env, tl, [PLAN_PHASES, ACT_RUN, VERIFY_RUN])
         return {"role": "system", "content": body}
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
@@ -606,9 +642,7 @@ def system_message(text, tools=True, session_id=None):
     design = [DESIGN_FIRST, WEB_MOTION] if any(n == "web_design" for n, _b in hits) else []
     tail = ([PLAN_PHASES] + design + [ACT_RUN, VERIFY_RUN] if tools
             else design + [VERIFY_READ] if builtin else [])
-    body = "\n\n".join([b for _n, b in hits] + pub + env + tail)
-    if env and len(body) > BRIEF_CEILING_CHARS:
-        body = "\n\n".join([b for _n, b in hits] + pub + tail)
+    body = _fit_extras([b for _n, b in hits] + pub, env, tl, tail)
     return {"role": "system", "content": body}
 
 
