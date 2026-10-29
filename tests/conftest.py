@@ -139,6 +139,57 @@ def _clear_quiet_tables():
 
 
 @pytest.fixture(autouse=True)
+def _tool_scan_and_gateway_off_unless_tested(request, monkeypatch):
+    """CLI TOOLS HERE (toolscan.py via app `_ts_*`, flag `tool_scan`) and THE MCP
+    GATEWAY (mcpgateway.py via app `_gw_*`, flag `mcp_gateway`) are default ON
+    (2026-10-29). Every other test file pins briefs, prompts and tools/list
+    without them, byte for byte: off here, on in their own two files.
+
+    FENCE, for every file: no test may run a real CLI (toolscan's default
+    runner) or start / reach a real MCP server (mcpgateway's default spawn and
+    HTTP). Such a call is refused AND recorded, and the test fails at teardown
+    -- a scan runs on worker threads, where a raised error alone would be
+    swallowed. Their own tests inject fakes. No gateway process outlives a test."""
+    calls = []
+
+    def _refuse(what):
+        def _f(*_a, **_k):
+            calls.append(what)
+            raise AssertionError("a test tried to %s; inject a fake" % what)
+        return _f
+
+    import toolscan
+    import mcpgateway
+    monkeypatch.setattr(toolscan, "_default_run", _refuse("run a real CLI (toolscan)"))
+    monkeypatch.setattr(toolscan, "_default_which", lambda _exe: None)
+    monkeypatch.setattr(mcpgateway, "_default_spawn",
+                        _refuse("start a real MCP server (mcpgateway)"))
+    monkeypatch.setattr(mcpgateway, "_default_http_post",
+                        _refuse("reach a real MCP server over HTTP (mcpgateway)"))
+    toolscan.reset()
+    mod = getattr(request.node, "module", None)
+    own = mod is not None and mod.__name__.rsplit(".", 1)[-1] in (
+        "test_toolscan", "test_mcp_gateway")
+    if not own:
+        monkeypatch.setattr(toolscan, "ENABLED", False)
+        try:
+            import app
+            monkeypatch.setattr(app, "_ts_on", lambda: False)
+            monkeypatch.setattr(app, "_gw_on", lambda: False)
+        except Exception:                                        # noqa: BLE001
+            pass
+    yield
+    try:
+        mcpgateway.default.shutdown()
+        mcpgateway.default._cache = None
+        mcpgateway.default._status.clear()
+    except Exception:                                            # noqa: BLE001
+        pass
+    toolscan.reset()
+    assert not calls, "fence: " + "; ".join(sorted(set(calls)))
+
+
+@pytest.fixture(autouse=True)
 def _reset_quiet_tables():
     _clear_quiet_tables()
     yield

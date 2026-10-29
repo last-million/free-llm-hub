@@ -736,6 +736,61 @@ def _call_tool(params):
 
 
 # ---------------------------------------------------------------------------
+# EXTRA TOOL PROVIDERS (2026-10-29): another module adds tools to this server
+# without this module knowing them -- the MCP gateway (mcpgateway.py) re-exposes
+# the MCP servers the owner registered in the hub. A provider is two callables:
+# list() -> [tool dicts] and call(name, arguments) -> a tools/call result dict,
+# or None when the name is not its own. The hub's own tools always win: an
+# extra tool whose name collides with one is never listed nor called.
+# ---------------------------------------------------------------------------
+
+_EXTRA_PROVIDERS = []
+
+
+def add_tool_provider(list_tools, call_tool):
+    """Register an extra tool provider (see above). Idempotent per pair."""
+    pair = (list_tools, call_tool)
+    if callable(list_tools) and callable(call_tool) and pair not in _EXTRA_PROVIDERS:
+        _EXTRA_PROVIDERS.append(pair)
+
+
+def _with_extra_tools(tools):
+    if not _EXTRA_PROVIDERS:
+        return tools
+    seen = {t.get("name") for t in tools if isinstance(t, dict)}
+    out = list(tools)
+    for list_tools, _call in list(_EXTRA_PROVIDERS):
+        try:
+            extra = list_tools() or []
+        except Exception:                                        # noqa: BLE001
+            continue
+        for t in extra:
+            if isinstance(t, dict) and isinstance(t.get("name"), str) \
+                    and t["name"] not in seen:
+                seen.add(t["name"])
+                out.append(t)
+    return out
+
+
+def _dispatch_call(params):
+    """tools/call: the hub's own tools first, then the extra providers."""
+    if _EXTRA_PROVIDERS and isinstance(params, dict):
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if isinstance(name, str) and isinstance(arguments, dict) \
+                and name not in {t.get("name") for t in _tools()}:
+            for _list, call in list(_EXTRA_PROVIDERS):
+                try:
+                    out = call(name, arguments)
+                except Exception as exc:                         # noqa: BLE001
+                    return _text_result("tool failed: %s" % type(exc).__name__,
+                                        is_error=True)
+                if isinstance(out, dict):
+                    return out
+    return _call_tool(params)
+
+
+# ---------------------------------------------------------------------------
 # JSON-RPC plumbing
 # ---------------------------------------------------------------------------
 
@@ -780,9 +835,9 @@ def handle_rpc(payload):
         if method == "ping":
             return _respond(rpc_id, result={})
         if method == "tools/list":
-            return _respond(rpc_id, result={"tools": _tools()})
+            return _respond(rpc_id, result={"tools": _with_extra_tools(_tools())})
         if method == "tools/call":
-            out = _call_tool(payload.get("params"))
+            out = _dispatch_call(payload.get("params"))
             if "code" in out:  # JSON-RPC error, not a tool result
                 return _respond(rpc_id, error=out)
             return _respond(rpc_id, result=out)

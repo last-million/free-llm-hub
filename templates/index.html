@@ -877,6 +877,20 @@
   @media (max-width:520px){
     .mcp-add input{flex:1 1 100%}
   }
+  /* mcp-gateway-css:start -- shared MCP servers (every CLI) + the CLI scan */
+  .mcp-gw-catalog{display:flex;flex-wrap:wrap;gap:6px}
+  .mcp-gw-confirm{display:flex;align-items:center;gap:8px;flex:1 1 100%;
+    font-size:12px;color:var(--text-dim);line-height:1.4}
+  .mcp-gw-bad{color:var(--danger-text)}
+  .mcp-gw-scan-row{font-size:12.5px;color:var(--text-dim);padding:6px 0;
+    border-top:1px dashed var(--border-soft);overflow-wrap:anywhere}
+  .mcp-gw-scan-row b{color:var(--text)}
+  .mcp-gw-ok{color:var(--ok-text)}
+  .mcp-gw-warn{color:var(--warn-text)}
+  @media (pointer:coarse), (max-width:640px){
+    .mcp-gw-catalog .btn, #mcp-gw-save{min-height:44px}
+  }
+  /* mcp-gateway-css:end */
 
   /* "Prompt enhanced by X — Use my original": the rewrite is never silent. */
   .enhanced-note{
@@ -3641,6 +3655,36 @@
         <div id="mcp-list" aria-live="polite">
         <div class="skel skel-row"></div>
         <div class="skel skel-row"></div>
+        </div>
+        <!-- MCP GATEWAY (2026-10-29): MCP servers added ONCE in the hub; the hub
+             runs them and passes their tools to every CLI that has the hub's
+             own MCP entry, as <server>__<tool>. Plus the developer CLIs found
+             on this computer. -->
+        <div class="mcp-cli" id="mcp-gateway">
+          <div class="mcp-cli-h">
+            <span class="mcp-cli-name">Shared MCP servers (every CLI)</span>
+            <span class="lc-tools-count" id="mcp-gw-state"></span>
+          </div>
+          <div class="mcp-cli-hint">Add a server once here: the hub starts it when a tool is used and gives its tools to every CLI and Build session that has the hub&rsquo;s own MCP entry (<b>Enable hub crews</b> above), named <code>server__tool</code>. Tokens and environment values are stored encrypted and never shown again.</div>
+          <div id="mcp-gw-list" class="mcp-servers" aria-live="polite"></div>
+          <div class="mcp-cli-hint">Official servers &mdash; a click fills the form; nothing runs until you confirm:</div>
+          <div id="mcp-gw-catalog" class="mcp-gw-catalog"></div>
+          <div class="mcp-cli-hint" id="mcp-gw-note"></div>
+          <form id="mcp-gw-form" class="mcp-add" autocomplete="off" novalidate>
+            <input type="text" id="mcp-gw-name" placeholder="name (a-z, 0-9, -)" aria-label="Shared MCP server name" autocomplete="off" spellcheck="false">
+            <input type="text" id="mcp-gw-cmd" placeholder="command, e.g. npx -y @shopify/dev-mcp@latest" aria-label="Command that starts the server" autocomplete="off" spellcheck="false">
+            <input type="text" id="mcp-gw-url" placeholder="or URL, https://&hellip;/mcp" aria-label="Server URL" autocomplete="off" spellcheck="false">
+            <input type="password" id="mcp-gw-token" placeholder="bearer token (URL servers)" aria-label="Bearer token for a URL server" autocomplete="off">
+            <input type="password" id="mcp-gw-env" placeholder="environment: NAME=value; NAME2=value" aria-label="Environment variables for a command server" autocomplete="off">
+            <label class="mcp-gw-confirm"><input type="checkbox" id="mcp-gw-confirm"> I trust this server: the hub will run it (or connect to it) as me.</label>
+            <button type="submit" class="btn sm primary" id="mcp-gw-save">Add server</button>
+          </form>
+          <div class="cli-setup-note" id="mcp-gw-err" role="alert" hidden></div>
+          <details>
+            <summary class="mcp-cli-hint">Developer CLIs on this computer (what the models are told)</summary>
+            <div id="mcp-gw-scan"></div>
+            <button type="button" class="btn sm" id="mcp-gw-rescan">Scan again</button>
+          </details>
         </div>
       </div>
     </div>
@@ -9453,6 +9497,7 @@
   ];
 
   function loadMcp(){
+    loadMcpGateway();
     var host = $('#mcp-list'); if (!host) return;
     return api('/api/mcp').then(function(j){
       renderMcp(j || {});
@@ -9571,6 +9616,181 @@
       });
     });
   }
+
+  /* mcp-gateway-js:start -- MCP servers the owner adds ONCE in the hub (their
+     tools reach every CLI through the hub's own /mcp) and the CLI scan. Every
+     backend string goes in through textContent; a token or env value is never
+     sent back by the hub, so the form only ever SETS them. */
+  var gwWired = false;
+  function gwEl(tag, cls, text){
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function loadMcpGateway(){
+    var host = $('#mcp-gw-list'); if (!host) return;
+    if (!gwWired) wireMcpGateway();
+    return api('/api/mcp-gateway').then(renderMcpGateway).catch(function(e){
+      host.textContent = '';
+      host.appendChild(gwEl('div', 'mcp-cli-hint', 'Could not load the shared MCP servers: ' + e.message));
+    });
+  }
+  function gwSpec(s){
+    if (s.transport === 'http') return String(s.url || '') + (s.has_token ? '  (token saved)' : '');
+    var cmd = String(s.command || '');
+    if (Array.isArray(s.args) && s.args.length) cmd += ' ' + s.args.join(' ');
+    if (Array.isArray(s.env_keys) && s.env_keys.length) cmd += '  (env: ' + s.env_keys.join(', ') + ')';
+    return cmd;
+  }
+  function gwState(s){
+    if (s.state === 'error') return 'error: ' + (s.error || 'failed');
+    if (s.state === 'starting') return 'starting…';
+    if (s.tool_count) return s.tool_count + (s.tool_count === 1 ? ' tool' : ' tools') + (s.running ? ' · running' : '');
+    return s.state === 'ok' ? 'no tools' : 'tools not read yet';
+  }
+  function gwRemove(btn, name){
+    if (!window.confirm('Remove "' + name + '"? Its tools leave every CLI.')) return;
+    busyBtn(btn, 'Removing…');
+    api('/api/mcp-gateway/delete', { method: 'POST', body: { name: name } }).then(function(){
+      toast(name + ' removed');
+      return loadMcpGateway();
+    }).catch(function(e){
+      resetBtn(btn, 'Remove');
+      toast('Remove ' + name + ': ' + e.message, true);
+    });
+  }
+  function renderMcpGateway(j){
+    j = j || {};
+    var host = $('#mcp-gw-list'); if (!host) return;
+    host.textContent = '';
+    var state = $('#mcp-gw-state');
+    if (state) state.textContent = j.enabled === false ? 'switched off' : '';
+    var form = $('#mcp-gw-form');
+    if (form) form.hidden = j.enabled === false;
+    var servers = Array.isArray(j.servers) ? j.servers : [];
+    if (!servers.length) host.appendChild(gwEl('div', 'mcp-cli-hint', 'No shared MCP servers yet.'));
+    servers.forEach(function(s){
+      var row = gwEl('div', 'mcp-server');
+      row.appendChild(gwEl('b', '', s.name));
+      row.appendChild(gwEl('span', 't', s.transport || 'stdio'));
+      row.appendChild(gwEl('span', 'spec', gwSpec(s)));
+      row.appendChild(gwEl('span', s.state === 'error' ? 't mcp-gw-bad' : 't', gwState(s)));
+      var del = gwEl('button', 'btn sm danger', 'Remove');
+      del.type = 'button';
+      del.addEventListener('click', function(){ gwRemove(del, s.name); });
+      row.appendChild(del);
+      host.appendChild(row);
+    });
+    var cat = $('#mcp-gw-catalog');
+    if (cat){
+      cat.textContent = '';
+      (Array.isArray(j.catalog) ? j.catalog : []).forEach(function(c){
+        var b = gwEl('button', 'btn sm', c.title || c.id);
+        b.type = 'button';
+        b.title = String(c.note || '');
+        b.addEventListener('click', function(){ gwFill(c); });
+        cat.appendChild(b);
+      });
+    }
+    renderToolScan(j.tool_scan || {});
+  }
+  function renderToolScan(scan){
+    var host = $('#mcp-gw-scan'); if (!host) return;
+    host.textContent = '';
+    var tools = Array.isArray(scan.tools) ? scan.tools : [];
+    if (scan.enabled === false){ host.appendChild(gwEl('div', 'mcp-cli-hint', 'The CLI scan is switched off.')); return; }
+    if (!tools.length){ host.appendChild(gwEl('div', 'mcp-cli-hint', scan.at ? 'No developer CLI found.' : 'Scanning…')); return; }
+    tools.forEach(function(t){
+      var row = gwEl('div', 'mcp-gw-scan-row');
+      row.appendChild(gwEl('b', '', t.name));
+      var bits = [t.version ? 'v' + t.version : '', t.where || ''].filter(Boolean);
+      row.appendChild(gwEl('span', '', ' ' + bits.join(' · ')));
+      if (t.login === true) row.appendChild(gwEl('span', 'mcp-gw-ok', ' · logged in'));
+      else if (t.login === false) row.appendChild(gwEl('span', 'mcp-gw-warn', ' · not logged in' + (t.login_cmd ? ' (run: ' + t.login_cmd + ')' : '')));
+      if (t.hint) row.appendChild(gwEl('div', 'mcp-cli-hint', t.hint));
+      host.appendChild(row);
+    });
+  }
+  function gwFill(c){
+    $('#mcp-gw-name').value = c.id || '';
+    if (c.transport === 'http'){
+      $('#mcp-gw-url').value = c.url || '';
+      $('#mcp-gw-cmd').value = '';
+    } else {
+      $('#mcp-gw-url').value = '';
+      $('#mcp-gw-cmd').value = [c.command || ''].concat(Array.isArray(c.args) ? c.args : []).join(' ');
+    }
+    $('#mcp-gw-token').value = '';
+    $('#mcp-gw-env').value = (Array.isArray(c.env_keys) ? c.env_keys : []).map(function(k){ return k + '='; }).join('; ');
+    $('#mcp-gw-confirm').checked = false;
+    var note = $('#mcp-gw-note');
+    if (note) note.textContent = String(c.note || '') + (c.source ? ' Source: ' + c.source : '');
+    var target = (c.auth === 'token' || c.auth === 'token_optional') ? '#mcp-gw-token'
+      : ((Array.isArray(c.env_keys) && c.env_keys.length) ? '#mcp-gw-env' : '#mcp-gw-confirm');
+    var el = $(target); if (el) el.focus();
+  }
+  /* "NAME=value; NAME2=value" -> {NAME: value}; null when a pair is malformed. */
+  function gwParseEnv(text){
+    var out = {}, ok = true;
+    String(text || '').split(/[;\n]/).forEach(function(part){
+      part = part.trim(); if (!part) return;
+      var i = part.indexOf('=');
+      if (i < 1){ ok = false; return; }
+      out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+    });
+    return ok ? out : null;
+  }
+  function wireMcpGateway(){
+    gwWired = true;
+    var form = $('#mcp-gw-form'); if (!form) return;
+    form.addEventListener('submit', function(ev){
+      ev.preventDefault();
+      var err = $('#mcp-gw-err');
+      err.hidden = true; err.textContent = '';
+      function fail(msg){ err.textContent = msg; err.hidden = false; }
+      var name = $('#mcp-gw-name').value.trim();
+      var cmd = $('#mcp-gw-cmd').value.trim();
+      var url = $('#mcp-gw-url').value.trim();
+      var token = $('#mcp-gw-token').value.trim();
+      var env = gwParseEnv($('#mcp-gw-env').value);
+      if (!name) return fail('Give the server a name.');
+      if (!cmd === !url) return fail('Give a command OR a URL.');
+      if (env === null) return fail('Environment: use NAME=value pairs separated by ";".');
+      if (!$('#mcp-gw-confirm').checked) return fail('Tick the box to confirm you trust this server.');
+      var body = { name: name, confirm: true };
+      if (url){
+        body.url = url;
+        if (token) body.token = token;
+      } else {
+        var parts = cmd.split(/\s+/).filter(Boolean);
+        body.command = parts[0];
+        body.args = parts.slice(1);
+        if (Object.keys(env).length) body.env = env;
+      }
+      var btn = $('#mcp-gw-save');
+      busyBtn(btn, 'Saving…');
+      api('/api/mcp-gateway', { method: 'POST', body: body }).then(function(){
+        resetBtn(btn, 'Add server');
+        $('#mcp-gw-token').value = '';
+        $('#mcp-gw-env').value = '';
+        $('#mcp-gw-confirm').checked = false;
+        toast(name + ' saved; reading its tools…');
+        loadMcpGateway();
+        setTimeout(loadMcpGateway, 5000);
+      }).catch(function(e){
+        resetBtn(btn, 'Add server');
+        fail(e.message);
+      });
+    });
+    var rescan = $('#mcp-gw-rescan');
+    if (rescan) rescan.addEventListener('click', function(){
+      api('/api/mcp-gateway?rescan=1').then(renderMcpGateway).then(function(){
+        setTimeout(loadMcpGateway, 10000);
+      }).catch(function(e){ toast('Scan: ' + e.message, true); });
+    });
+  }
+  /* mcp-gateway-js:end */
 
   /* TERM_, not CHECK_SVG: a second `var CHECK_SVG` here (same function scope,
      so it silently REPLACED the 12x12 one above) had no width/height, and every
