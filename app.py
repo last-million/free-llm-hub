@@ -16267,6 +16267,372 @@ def _apply_goal_note(messages):
         return messages
 
 
+# --------------------------------------------------------------------------- #
+# THE CLI'S OWN TO-DO LIST ON THE TASK BOARD (2026-10-29)
+#
+# Owner: "the hub must always know what each CLI agent has done and what
+# remains". Every coding CLI keeps its own to-do list by calling a tool, and
+# that call rides in the conversation history the CLI sends on every /v1
+# request. _cli_todo_sync reads the LATEST list and mirrors it onto the board
+# of the CLI's project folder: one task per item, linked by (conversation,
+# folder, item text) so a later sync updates the task instead of adding it
+# again. The hub runs nothing and calls nothing; the reply is never touched.
+#
+# Shapes read on 2026-10-29 from the INSTALLED CLIs (strings in the binaries,
+# read-only):
+#   opencode 1.19  `todowrite` {todos: [{content, status: pending|in_progress|
+#                  completed|cancelled, priority: high|medium|low}]}
+#   codex 0.16x    `update_plan` {explanation?, plan: [{step, status: pending|
+#                  in_progress|completed}]}  (UpdatePlanArgs / PlanItemArg)
+#   Claude Code 2.1.312 `TodoWrite` {todos: [{content, status: pending|
+#                  in_progress|completed, activeForm}]} -- but in that version it
+#                  is OFF unless CLAUDE_CODE_ENABLE_TASKS=false; the default is
+#                  the task tools `TaskCreate` {subject, description, activeForm?}
+#                  (its result reads "Task #<id> created successfully: ...") and
+#                  `TaskUpdate` {taskId, status: pending|in_progress|completed|
+#                  deleted, subject?, activeForm?}. Claude Code rebuilds its own
+#                  list from the history exactly that way; _ctd_replay_tasks
+#                  does the same.
+# Flag `cli_todo_sync` (default on); off = nothing is read or written.
+# --------------------------------------------------------------------------- #
+
+_CTD_LIST_TOOLS = ("todowrite", "update_plan")
+_CTD_TASK_TOOLS = ("taskcreate", "taskupdate")
+_CTD_MAX_ITEMS = 50          # items per list mirrored onto the board
+_CTD_SCAN_ITEMS = 500        # raw entries looked at per list (bounds the work)
+_CTD_TEXT_CHARS = 200        # a task title
+_CTD_GOAL_CHARS = 160        # a goal title made from the first instruction
+_CTD_MEMO_MAX = 512          # conversations whose last synced list is remembered
+_CTD_MEMO = collections.OrderedDict()     # conversation|folder -> list signature
+_CTD_LOCK = threading.Lock()
+_CTD_CREATED_RE = re.compile(r"^\s*Task #(\S+) created successfully")
+_CTD_STATUS = {
+    "pending": "todo", "todo": "todo", "not_started": "todo",
+    "in_progress": "doing", "inprogress": "doing", "active": "doing",
+    "doing": "doing",
+    "completed": "done", "complete": "done", "done": "done",
+    "cancelled": "blocked", "canceled": "blocked",
+}
+_CTD_PRIORITY = {"high": 2, "medium": 1, "low": 0}
+_CTD_CANCELLED_NOTE = "cancelled in the CLI"
+
+
+def _ctd_on():
+    try:
+        return bool(config.get_flag("cli_todo_sync", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ctd_tool_name(name):
+    """A tool name with any MCP / namespace prefix removed, lower-cased:
+    "mcp__x__TodoWrite" -> "todowrite", "functions.update_plan" -> "update_plan"."""
+    n = str(name or "").strip().lower()
+    for sep in ("__", ".", "/", ":"):
+        if sep in n:
+            n = n.rsplit(sep, 1)[-1]
+    return n
+
+
+def _ctd_calls(m):
+    """[(normalized name, function dict, call id)] of an assistant message."""
+    out = []
+    if not isinstance(m, dict) or m.get("role") != "assistant":
+        return out
+    for tc in m.get("tool_calls") or ():
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        out.append((_ctd_tool_name(fn.get("name")), fn, str(tc.get("id") or "")))
+    return out
+
+
+def _ctd_args(fn):
+    """A tool call's arguments as a dict (a dict, a JSON string, or a JSON
+    string inside a JSON string), else None. Never raises."""
+    try:
+        raw = fn.get("arguments") if isinstance(fn, dict) else None
+        if raw is None and isinstance(fn, dict):
+            raw = fn.get("input")
+        for _ in range(2):
+            if isinstance(raw, dict):
+                return raw
+            if not isinstance(raw, str) or not raw.strip():
+                return None
+            try:
+                raw = json.loads(raw)
+            except Exception:                                    # noqa: BLE001
+                try:
+                    raw = json.loads(_repair_tool_arguments(raw) or "")
+                except Exception:                                # noqa: BLE001
+                    return None
+        return raw if isinstance(raw, dict) else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ctd_status(value):
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return s[:20] or None
+
+
+def _ctd_items(args):
+    """The items of a todowrite / TodoWrite / update_plan argument dict ->
+    [{"text", "status", "priority"}], or None when it holds no list."""
+    rows = args.get("todos")
+    if rows is None:
+        rows = args.get("plan")
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except Exception:                                        # noqa: BLE001
+            return None
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows[:_CTD_SCAN_ITEMS]:
+        if isinstance(r, str):
+            out.append({"text": r, "status": "pending", "priority": None})
+            continue
+        if not isinstance(r, dict):
+            continue
+        text = ""
+        for k in ("content", "step", "subject", "title", "text", "task"):
+            v = r.get(k)
+            if isinstance(v, str) and v.strip():
+                text = v
+                break
+        if not text:
+            continue
+        prio = r.get("priority")
+        out.append({"text": text, "status": _ctd_status(r.get("status")),
+                    "priority": _CTD_PRIORITY.get(str(prio).strip().lower())
+                    if isinstance(prio, str) else None})
+    return out
+
+
+def _ctd_latest_list(messages):
+    """(index, items) of the LAST todowrite / TodoWrite / update_plan call
+    whose arguments hold a list, else (-1, None)."""
+    for i in range(len(messages) - 1, -1, -1):
+        calls = [c for c in _ctd_calls(messages[i]) if c[0] in _CTD_LIST_TOOLS]
+        for _name, fn, _cid in reversed(calls):
+            args = _ctd_args(fn)
+            items = _ctd_items(args) if args is not None else None
+            if items is not None:
+                return i, items
+    return -1, None
+
+
+def _ctd_replay_tasks(messages):
+    """Claude Code's TaskCreate / TaskUpdate list, rebuilt from the history the
+    way Claude Code rebuilds it: a create waits for its result's "Task #<id>
+    created successfully", an update changes (or with status "deleted" drops)
+    the task it names. -> (index of the last task call, items), else (-1, None).
+    An update for a task never seen created is skipped unless it names a
+    subject (the id alone is not a title)."""
+    pending = collections.OrderedDict()      # tool call id -> item
+    tasks = collections.OrderedDict()        # task id -> item
+    last = -1
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            for name, fn, cid in _ctd_calls(m):
+                if name not in _CTD_TASK_TOOLS:
+                    continue
+                args = _ctd_args(fn) or {}
+                last = i
+                if name == "taskcreate":
+                    subj = args.get("subject")
+                    if isinstance(subj, str) and subj.strip():
+                        pending[cid] = {"text": subj, "status": "pending",
+                                        "priority": None}
+                    continue
+                tid = args.get("taskId")
+                if isinstance(tid, (int, float)) and not isinstance(tid, bool):
+                    tid = str(int(tid))
+                if not isinstance(tid, str) or not tid.strip():
+                    continue
+                tid = tid.strip()
+                status = _ctd_status(args.get("status"))
+                if status == "deleted":
+                    tasks.pop(tid, None)
+                    continue
+                subj = args.get("subject")
+                subj = subj if isinstance(subj, str) and subj.strip() else None
+                cur = tasks.get(tid)
+                if cur is None:
+                    if not subj:
+                        continue
+                    cur = {"text": subj, "status": "pending", "priority": None}
+                cur = dict(cur)
+                if subj:
+                    cur["text"] = subj
+                if status:
+                    cur["status"] = status
+                tasks[tid] = cur
+        elif role == "tool":
+            item = pending.get(str(m.get("tool_call_id") or ""))
+            if item is None:
+                continue
+            mt = _CTD_CREATED_RE.match(ctxwin.message_text(m) or "")
+            if not mt:
+                continue
+            pending.pop(str(m.get("tool_call_id") or ""), None)
+            tasks.setdefault(mt.group(1), item)
+    if last < 0:
+        return -1, None
+    return last, list(tasks.values()) + list(pending.values())
+
+
+def _ctd_latest_todos(messages):
+    """The CLI's current to-do list (the latest of the list tools and the task
+    tools), or None when the history holds no to-do call at all."""
+    li, items = _ctd_latest_list(messages)
+    has_task_call = any(c[0] in _CTD_TASK_TOOLS for m in messages for c in _ctd_calls(m))
+    if has_task_call:
+        ti, titems = _ctd_replay_tasks(messages)
+        if ti > li:
+            return titems
+    return items
+
+
+def _ctd_norm(text):
+    return " ".join(str(text or "")[:2000].split()).casefold().rstrip(" .")
+
+
+def _ctd_clean(items):
+    """Dedupe by normalized text, keep the first _CTD_MAX_ITEMS, clip titles."""
+    out, seen = [], set()
+    for it in items or ():
+        text = " ".join(str(it.get("text") or "")[:2000].split())
+        norm = _ctd_norm(text)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if len(text) > _CTD_TEXT_CHARS:
+            text = text[:_CTD_TEXT_CHARS - 1].rstrip() + "…"
+        out.append({"text": text, "norm": norm, "status": it.get("status"),
+                    "priority": it.get("priority")})
+        if len(out) >= _CTD_MAX_ITEMS:
+            break
+    return out
+
+
+def _ctd_link(conv, folder_key, norm):
+    h = hashlib.sha256("\x00".join((conv, folder_key or "", norm))
+                      .encode("utf-8", "replace")).hexdigest()[:32]
+    return "cli-todo:" + h
+
+
+def _ctd_first_instruction(messages):
+    for m in messages:
+        if ctxwin.is_real_instruction(m):
+            return " ".join(ctxwin.instruction_text(ctxwin.message_text(m)).split())
+    return ""
+
+
+def _ctd_goal_id(board, folder, messages):
+    """The folder's open goal, else a new one titled from the conversation's
+    first real instruction, marked as coming from a CLI."""
+    g = board.goal_for(folder)
+    if g:
+        return g.get("id")
+    first = _ctd_first_instruction(messages)
+    if len(first) > _CTD_GOAL_CHARS:
+        first = first[:_CTD_GOAL_CHARS - 1].rstrip() + "…"
+    if not first:
+        first = "Work in " + (os.path.basename(os.path.normpath(folder)) or "this folder")
+    return board.add_goal("[CLI] " + first, project_dir=folder)
+
+
+def _ctd_apply(folder, conv, items, messages):
+    """Upsert the items onto the board -> (added, updated), or None when no
+    goal could be had. A task already linked is only changed when the CLI
+    changed THAT item's status since the last sync (a board edit stands)."""
+    board = taskboard.default
+    fkey = _cm_folder_key(folder) or folder
+    added = updated = 0
+    with board.deferred():
+        gid = None
+        for it in items:
+            key = _ctd_link(conv, fkey, it["norm"])
+            raw = it.get("status")
+            mapped = _CTD_STATUS.get(raw or "")
+            note = _CTD_CANCELLED_NOTE if raw in ("cancelled", "canceled") else None
+            link = {"key": key, "status": raw}
+            t = board.task_by_ext(key)
+            if t is None:
+                if gid is None:
+                    gid = _ctd_goal_id(board, folder, messages)
+                    if not gid:
+                        return None
+                tid = board.add_task(gid, it["text"], priority=it.get("priority") or 0,
+                                     ext=link)
+                if mapped and mapped != "todo":
+                    board.update(tid, status=mapped, note=note)
+                added += 1
+                continue
+            if (t.get("ext") or {}).get("status") == raw:
+                continue
+            board.update(t["id"], status=mapped, note=note if mapped else None, ext=link)
+            updated += 1
+    return added, updated
+
+
+def _cli_todo_sync(messages, body=None):
+    """Mirror the CLI's latest to-do list onto the task board of its project
+    folder (see the section comment). Only when the list changed since the last
+    sync of this conversation; only for the ONE folder the CLI's own environment
+    block names, never the hub's repo nor a root / home folder; never for a
+    Multi helper session (its phase already is a board task). Items that vanish
+    from the list are left as they are. Never raises; the reply is untouched;
+    the log carries counts only."""
+    try:
+        if not isinstance(messages, list) or not messages or not _ctd_on():
+            return
+        todos = _ctd_latest_todos(messages)
+        if todos is None:
+            return
+        sid = _build_sid()
+        if sid:
+            try:
+                if swarm_windows.worker_info(sid):
+                    return
+            except Exception:                                    # noqa: BLE001
+                pass
+        folder = _cm_project_dir(messages)
+        if not folder:
+            return
+        conv = _orch_key(body, messages)
+        if not conv:
+            return
+        items = _ctd_clean(todos)
+        sig = hashlib.sha256(json.dumps([[i["norm"], i["status"]] for i in items])
+                             .encode("utf-8", "replace")).hexdigest()
+        memo_key = conv + "|" + (_cm_folder_key(folder) or folder)
+        with _CTD_LOCK:
+            if _CTD_MEMO.get(memo_key) == sig:
+                _CTD_MEMO.move_to_end(memo_key)
+                return
+            counts = _ctd_apply(folder, conv, items, messages)
+            if counts is None:
+                return
+            _CTD_MEMO[memo_key] = sig
+            _CTD_MEMO.move_to_end(memo_key)
+            while len(_CTD_MEMO) > _CTD_MEMO_MAX:
+                _CTD_MEMO.popitem(last=False)
+        if counts[0] or counts[1]:
+            _log.info("[todo-sync] %d added, %d updated (%d items in the CLI's list)",
+                      counts[0], counts[1], len(items))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 _EMPTY_CLAIM_SCAN_MAX = 6000     # chars; the claim itself is <= 1200 (plus a leading <think> block)
 _EMPTY_CLAIM_TURN_NOTE = ("[Withheld by the hub: the model that wrote this reply had not "
                           "received the user's message. Ignore it and answer the user's "
@@ -49312,6 +49678,7 @@ def v1_chat_completions():
     # ...and the same results are OBSERVED evidence: receipts + project facts
     # (the hub runs nothing). See _v1_observe.
     _v1_observe(body.get("messages"), body)
+    _cli_todo_sync(body.get("messages"), body)    # the CLI's to-do list -> task board
     return _chat_completions(body)
 
 
@@ -50817,6 +51184,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     if not _retry_pass:
         _bandit_credit(messages)       # see _bandit_credit
         _v1_observe(messages, body)    # observed evidence: receipts + facts
+        _cli_todo_sync(messages, body)    # the CLI's to-do list -> task board
     # Codex picks a MODE on one screen and a REASONING LEVEL on the next; the
     # pair is the hub's (mode, effort). Must happen before the swarm dispatch
     # below, which keys off the model id. /v1/chat/completions has always read
@@ -51907,6 +52275,7 @@ def v1_messages():
         return _anthropic_error("invalid_request_error", "No messages to send.", 400)
     _bandit_credit(oai_messages)       # see _bandit_credit
     _v1_observe(oai_messages, body)    # observed evidence: receipts + facts
+    _cli_todo_sync(oai_messages, body)    # the CLI's to-do list -> task board
     has_images = image_count > 0
     # A "<category>-<effort>" compound (e.g. from ANTHROPIC_MODEL=coding-swarm)
     # sets the mode and becomes a plain effort tier, before the swarm dispatch

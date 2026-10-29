@@ -48,6 +48,23 @@ def _clip(text, limit):
     return text
 
 
+def _clean_ext(value):
+    """An optional external link on a task: {"key": str, "status": str|None}
+    (e.g. a CLI to-do item the task mirrors, and the status the CLI last gave
+    it). Anything else -> None. Never raises."""
+    try:
+        if not isinstance(value, dict):
+            return None
+        key = value.get("key")
+        if not isinstance(key, str) or not key.strip():
+            return None
+        status = value.get("status")
+        status = str(status)[:20] if isinstance(status, str) and status else None
+        return {"key": key.strip()[:200], "status": status}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _as_list(value):
     if value is None:
         return []
@@ -70,8 +87,37 @@ class Board:
         self._lock = threading.RLock()
         self._goals = {}        # goal_id -> dict
         self._tasks = {}        # task_id -> dict
+        self._defer = 0         # > 0 inside deferred(): one save at the end
+        self._dirty = False
         if self.path:
             self.load()
+
+    # ------------------------------------------------------------------ #
+    # batching
+    # ------------------------------------------------------------------ #
+
+    def deferred(self):
+        """Context manager: hold the board's lock and write the file ONCE at
+        the end instead of after every change (a batch of upserts). Nests."""
+        board = self
+
+        class _Deferred:
+            def __enter__(self_inner):
+                board._lock.acquire()
+                board._defer += 1
+                return board
+
+            def __exit__(self_inner, *exc):
+                try:
+                    board._defer = max(0, board._defer - 1)
+                    if board._defer == 0 and board._dirty:
+                        board._dirty = False
+                        board._save_locked()
+                finally:
+                    board._lock.release()
+                return False
+
+        return _Deferred()
 
     # ------------------------------------------------------------------ #
     # goals
@@ -130,13 +176,16 @@ class Board:
     # ------------------------------------------------------------------ #
 
     def add_task(self, goal_id, title, detail="", needs=(), files=(),
-                 priority=0, run_id=None, phase=None) -> str:
+                 priority=0, run_id=None, phase=None, ext=None) -> str:
         """Create a task under a goal and return its id. A task under an
         unknown goal is still created (goal_id kept as given) so a caller is
         never left without an id; callers that care check goals() first.
 
         `run_id` / `phase` (optional) record which Multi run phase the task
-        was made for, so a resumed run finds the SAME task again."""
+        was made for, so a resumed run finds the SAME task again. `ext`
+        (optional, {"key", "status"}) links the task to an outside item -- a
+        CLI's to-do entry -- so a later sync finds it (task_by_ext) instead of
+        adding it twice. A task without one carries no "ext" key at all."""
         tid = "t-" + uuid.uuid4().hex[:12]
         now = self._now()
         try:
@@ -164,20 +213,42 @@ class Board:
                 "updated_at": now,
                 "history": [],
             }
+            link = _clean_ext(ext)
+            if link is not None:
+                self._tasks[tid]["ext"] = link
             self._save_locked()
         return tid
 
+    def task_by_ext(self, key):
+        """The task linked to an outside item by add_task(ext={"key": key}),
+        a copy, or None. Never raises."""
+        if not isinstance(key, str) or not key:
+            return None
+        with self._lock:
+            for t in self._tasks.values():
+                link = t.get("ext")
+                if isinstance(link, dict) and link.get("key") == key:
+                    return dict(t)
+        return None
+
     def update(self, task_id, status=None, note=None, owner=None,
-               run_id=None):
+               run_id=None, ext=None):
         """Change a task's status/owner/run_id and append a note to its
         history. Returns the updated task (a copy) or None for an unknown id.
-        An unknown status is ignored (the rest still applies)."""
+        An unknown status is ignored (the rest still applies). `ext` replaces
+        the task's outside link (see add_task); changing only the link is
+        saved but adds no history entry."""
         with self._lock:
             t = self._tasks.get(task_id)
             if not t:
                 return None
             now = self._now()
             changed = False
+            if ext is not None:
+                link = _clean_ext(ext)
+                if link is not None and t.get("ext") != link:
+                    t["ext"] = link
+                    self._save_locked()
             if status is not None and status in STATUSES:
                 if t.get("status") != status:
                     changed = True
@@ -309,6 +380,9 @@ class Board:
     def _save_locked(self):
         if not self.path:
             return False
+        if self._defer > 0:                 # inside deferred(): save once at the end
+            self._dirty = True
+            return True
         data = {
             "version": SCHEMA,
             "saved_at": self._now(),
@@ -371,7 +445,7 @@ class Board:
     @staticmethod
     def _clean_task(t):
         status = t.get("status")
-        return {
+        out = {
             "id": t["id"],
             "goal_id": t.get("goal_id"),
             "title": str(t.get("title") or "(untitled task)"),
@@ -387,6 +461,10 @@ class Board:
             "updated_at": t.get("updated_at") or t.get("created_at") or 0,
             "history": list(t.get("history") or []),
         }
+        link = _clean_ext(t.get("ext"))
+        if link is not None:                # old rows have none: left without the key
+            out["ext"] = link
+        return out
 
 
 default = Board()

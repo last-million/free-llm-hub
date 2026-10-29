@@ -486,6 +486,23 @@ def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _cli_todo_sync_off_unless_tested(request, monkeypatch):
+    """THE CLI'S OWN TO-DO LIST ON THE TASK BOARD (app `_cli_todo_sync`, flag
+    `cli_todo_sync`) is default ON (2026-10-29): a /v1 request whose history holds
+    a todowrite / TodoWrite / update_plan / TaskCreate call writes tasks (and maybe
+    a goal) onto taskboard.default. Every other test file pins the board as it
+    was, byte for byte; the feature's own file turns it back on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_cli_todo_sync":
+        try:
+            import app
+            monkeypatch.setattr(app, "_ctd_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _conversation_memory_off_unless_tested(request, monkeypatch, tmp_path):
     """DURABLE CONVERSATION MEMORY (app `_cmem_*`, convmem.py, flags
     `conversation_memory` / `conversation_memory_note`) is default ON
