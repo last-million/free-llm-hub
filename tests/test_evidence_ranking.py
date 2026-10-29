@@ -66,8 +66,11 @@ def tool(mid, pid=PID):
 # --------------------------------------------------------------------------- #
 
 def test_tool_turn_order_is_exactly_the_terminal_bench_order(_no_penalties):
+    # OWNER ORDER 2026-10-29 overrides the boards for ONE pair: DeepSeek V4.1 Flash leads
+    # GLM 5.3 (it used to sit third, behind a 25-point dialect penalty and GLM's TB4.0 42).
+    # The rest is still the Terminal-Bench order.
     order = sorted(SIX, key=lambda m: -tool(m))
-    assert order == [GLM53, GLM53_FLASH, DSV41_FLASH, GEMINI38_FLASH, KIMI_K3, QWEN_27B], \
+    assert order == [DSV41_FLASH, GLM53, GLM53_FLASH, GEMINI38_FLASH, KIMI_K3, QWEN_27B], \
         {m: round(tool(m), 3) for m in SIX}
 
 
@@ -88,20 +91,24 @@ def test_qwen_27b_is_last_on_tool_turns(_no_penalties):
 # --------------------------------------------------------------------------- #
 
 def test_chat_top_three_are_close_and_the_rest_are_below():
+    # OWNER ORDER 2026-10-29: DeepSeek V4.1 Flash now sits just over GLM 5.3 in chat too,
+    # so it joins the close top cluster and GLM 5.3 is the first one under it.
     top3 = sorted(SIX, key=lambda m: -gen(m))[:3]
-    assert set(top3) == {KIMI_K3, GEMINI38_FLASH, GLM53}
+    assert set(top3) == {KIMI_K3, GEMINI38_FLASH, DSV41_FLASH}
     spread = max(gen(m) for m in top3) - min(gen(m) for m in top3)
     assert spread < 0.5, {m: round(gen(m), 3) for m in top3}        # "close at the top"
-    for low in (GLM53_FLASH, DSV41_FLASH, QWEN_27B):
+    for low in (GLM53, GLM53_FLASH, QWEN_27B):
         assert gen(low) < min(gen(m) for m in top3), low            # the rest below
+    assert gen(DSV41_FLASH) > gen(GLM53)                            # the owner's order
 
 
 def test_chat_order_is_not_the_tool_order(_no_penalties):
     # GLM 5.3 leads agent work but not chat; Kimi K3 tops the chat cluster but is
     # near the bottom of the agentic order -- the two paths genuinely differ.
-    assert max(SIX, key=lambda m: -gen(m) * 0 + gen(m)) != GLM53     # chat leader is not GLM 5.3
-    assert max(SIX, key=tool) == GLM53                               # tool leader IS GLM 5.3
-    assert gen(KIMI_K3) >= gen(GLM53) and tool(KIMI_K3) < tool(GLM53)
+    # (OWNER ORDER 2026-10-29: the tool leader of these six is now DeepSeek V4.1 Flash.)
+    assert max(SIX, key=gen) != DSV41_FLASH                          # chat leader is not the tool leader
+    assert max(SIX, key=tool) == DSV41_FLASH                         # tool leader
+    assert gen(KIMI_K3) >= gen(DSV41_FLASH) and tool(KIMI_K3) < tool(DSV41_FLASH)
 
 
 # --------------------------------------------------------------------------- #

@@ -8147,3 +8147,32 @@ answer ... if a model doesn't answer more than 3 times in 24 hours, blacklist it
   (e.g. a long provider outage) is also blocked for the day; its first real answer through a Test lifts it.
 
 Release-note: new: a model that keeps failing without ever answering is now set aside for 24 hours automatically, so requests stop being wasted on it.
+
+## A bare "Polling its status." is not an answer; owner order DeepSeek > GLM (2026-10-29)
+
+Covered by `tests/test_owner_order_and_progress_lines.py` (38) and the updated
+`tests/test_evidence_ranking.py` / `tests/test_rebench_2026_09.py`.
+
+- **Announced, then stopped.** Owner said "continue" (OpenCode, `coding-max`, served by a g4f relay copy of
+  GLM-5.3-Flash). The reply: a leaked `<think>` ending "Let me poll the crew status." and the visible text
+  "Crew job ... accepted. Polling its status." -- no tool call, OpenCode ended the turn. Both announcement
+  detectors key on a SUBJECT ("I'll", "let me"); a bare "-ing" progress line has none. And the leaked `<think>`
+  counted toward `_ANNOUNCE_MAX_CHARS`, so a longer one switched the check off. Now (`_ann_split`,
+  `_progress_line`, `_think_announces`): replies are judged on their VISIBLE text; a short bare progress line as
+  the last sentence is an announcement ("Polling its status.", "Checking the logs now."), but a report is not
+  ("Testing complete.", "Running the tests showed 3 failures.", "Waiting for your confirmation."); a short status
+  note whose leaked thinking ends on an action intent is one too, unless the intent is to write the answer.
+  The stream peek holds while a leaked `<think>` is open AND right after it closes (it used to commit at that
+  instant: the visible reply had not started). A false positive costs one retry on another model.
+- **Owner order** (`_owner_rank_key`): DeepSeek V4.1 Pro > MiMo V2.6 Pro > DeepSeek V4.1 Flash > GLM 5.3.
+  WHY GLM ALWAYS WON TOOL TURNS: every "deepseek-v4" id lost `_TOOL_DIALECT_PENALTY` (25; July evidence from
+  V4 PRO) while GLM 5.3 earned the TB4.0 bonus. Measured today, V4.1 Flash's g4f copies served 34/35, 32/33 and
+  20/20 hops, mostly OpenCode coding tool turns. V4.1+ is exempt now (V4.0 keeps it). Chat floors:
+  `_OWNER_DS_FLASH_FLOOR` 134.05 (over GLM 5.3's 134.03), MiMo's existing 134.09, `_OWNER_DS_PRO_FLOOR` 134.12,
+  ceiling 134.49, before modelrank (a newer release still leads). Tool turns: `_owner_agentic_bonus` = GLM 5.3's
+  own bonus + 2.2 / 2.7 / 3.2, so V4.1 Flash clears `_AUTO_TOP_BAND` over GLM 5.3 (first while healthy, GLM next)
+  -- all under Claude, Kimi K3.1 and the GPT cap. Measured reliability, rests and the 24 h block still apply.
+  The 2026-08-03 rule "V4 Flash is better than the Pro" still holds for V4.0; the owner's newer word places
+  V4.1 PRO on top. Today neither V4.1 Pro nor MiMo V2.6 Pro is in the fleet, so in practice: V4.1 Flash > GLM.
+
+Release-note: fix: a model that only says what it is about to do ("Polling its status.") no longer ends your turn, and DeepSeek V4.1 Flash is now preferred over GLM 5.3.

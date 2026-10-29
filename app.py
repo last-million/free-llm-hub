@@ -3407,6 +3407,18 @@ def _benchmark_score(pid, model_id, _rank=True):
                                        _MIMO_PRO_CEILING))
         except ValueError:
             pass
+    # OWNER ORDER 2026-10-29 (see _owner_rank_key): DeepSeek V4.1 Pro > MiMo V2.6 Pro >
+    # DeepSeek V4.1 Flash > GLM 5.3. MiMo's floor above already sits at 134.09; GLM 5.3 is
+    # board-placed at 134.03. Before modelrank, so a newer release still leads an older one.
+    _ok_key, _ok_ver = _owner_rank_key(low)
+    if _ok_key == "ds_flash":
+        score = max(score, min(_OWNER_DS_FLASH_FLOOR
+                               + _band_version_bump(_ok_ver[0], _ok_ver[1], 4, 1),
+                               _OWNER_ORDER_CEILING))
+    elif _ok_key == "ds_pro":
+        score = max(score, min(_OWNER_DS_PRO_FLOOR
+                               + _band_version_bump(_ok_ver[0], _ok_ver[1], 4, 1),
+                               _OWNER_ORDER_CEILING))
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
     # better than deepseek 4 / v4 — but gemini pro is better than gemini flash,
     # of course."
@@ -18578,12 +18590,83 @@ def _is_tool_proven(model_id):
     return bool(hits)
 
 
+# --------------------------------------------------------------------------- #
+# OWNER ORDER 2026-10-29: "MiMo V2.6 Pro is higher than DeepSeek V4.1 Flash but not
+# the Pro, and then comes GLM 5.3", after "DeepSeek V4.1 is better than GLM normally"
+# and "if available he always goes to GLM". So:
+#
+#     DeepSeek V4.1 Pro  >  MiMo V2.6 Pro  >  DeepSeek V4.1 Flash  >  GLM 5.3
+#
+# WHY GLM ALWAYS WON TOOL TURNS (measured the same day): every "deepseek-v4" id lost
+# _TOOL_DIALECT_PENALTY (25) on tool turns -- evidence from July, deepseek-v4-PRO
+# mangling apply_patch shapes -- while GLM 5.3 earned the Terminal-Bench bonus (TB 42
+# against DeepSeek V4.1 Flash's 27). The penalty no longer matches what V4.1 does
+# here: its g4f copies served 34 of 35, 32 of 33 and 20 of 20 hops, nearly all of them
+# OpenCode coding tool turns. So V4.1+ is exempt; V4.0 keeps the penalty (no new
+# evidence). The owner's order then sets the agentic bonus of the three named lines
+# relative to GLM 5.3's own (_owner_agentic_bonus): DeepSeek V4.1 Flash clears
+# _AUTO_TOP_BAND over GLM 5.3 (it goes first while healthy; GLM is the next choice,
+# not a coin flip), MiMo and the Pro a step above. Everything stays under Claude,
+# Kimi K3.1 and the GPT cap. Measured reliability, rests and blocks still apply on top:
+# an owner order never keeps a failing pair in front.
+# --------------------------------------------------------------------------- #
+_OWNER_DS_FLASH_FLOOR = 134.05        # chat: just over GLM 5.3's board-placed 134.03
+_OWNER_DS_PRO_FLOOR = 134.12          # chat: over MiMo V2.6 Pro's 134.09
+_OWNER_ORDER_CEILING = 134.49         # never past hy3 (134.5), like MiMo's ceiling
+_OWNER_TOOL_OVER_GLM = {"ds_flash": 2.2, "mimo_pro": 2.7, "ds_pro": 3.2}
+_DS_V41_SPELLING_RE = re.compile(r"deepseek[-_ ]?v4[.-]1(?![0-9])", re.I)
+_owner_rank_cache = {}
+
+
+def _owner_rank_key(model_id):
+    """("ds_pro" | "mimo_pro" | "ds_flash" | None, version) for a model id in the
+    owner's order. Cached; never raises."""
+    low = (model_id or "").lower()
+    hit = _owner_rank_cache.get(low)
+    if hit is not None:
+        return hit
+    out = (None, None)
+    try:
+        p = modelrank.parse(low)
+        if p is not None and p.family == "deepseek" and p.tier in ("pro", "flash"):
+            ver = tuple(p.version or (0, 0))
+            if ver < (4, 1) and _DS_V41_SPELLING_RE.search(low):
+                ver = (4, 1)                     # "deepseek-v4-1-flash" (relay spelling)
+            if ver >= (4, 1):
+                out = ("ds_pro" if p.tier == "pro" else "ds_flash", ver)
+        elif (p is not None and p.family == "mimo" and p.tier == "pro"
+              and tuple(p.version or (0, 0)) >= (2, 6)):
+            out = ("mimo_pro", tuple(p.version))
+    except Exception:                                            # noqa: BLE001
+        out = (None, None)
+    if len(_owner_rank_cache) < 8192:
+        _owner_rank_cache[low] = out
+    return out
+
+
+def _owner_agentic_bonus(model_id):
+    """The agentic board bonus, lifted for the owner's order (see above). Only ever
+    raises, only the three named lines; never raises."""
+    own = _ev_agentic_bonus(model_id)
+    key, _ver = _owner_rank_key(model_id)
+    if key is None:
+        return own
+    try:
+        return max(own, _ev_agentic_bonus("z-ai/glm-5.3") + _OWNER_TOOL_OVER_GLM[key])
+    except Exception:                                            # noqa: BLE001
+        return own
+
+
 def _tool_dialect_penalty(model_id):
     """Points deducted from an AGENTIC pick for a model whose tool-call payloads
     a CLI cannot consume. Extend _TOOL_DIALECT_MISMATCH only with EVIDENCE from a
     real failed run — never on suspicion."""
     low = (model_id or "").lower()
-    return _TOOL_DIALECT_PENALTY if any(f in low for f in _TOOL_DIALECT_MISMATCH) else 0.0
+    if not any(f in low for f in _TOOL_DIALECT_MISMATCH):
+        return 0.0
+    if _owner_rank_key(low)[0] in ("ds_flash", "ds_pro"):
+        return 0.0          # DeepSeek V4.1+: measured to call tools fine (OWNER ORDER)
+    return _TOOL_DIALECT_PENALTY
 
 
 def _agentic_score(entry, sustain_override=None):
@@ -18621,7 +18704,7 @@ def _agentic_score(entry, sustain_override=None):
         - _latency_penalty(entry[1], entry[2])
         - _answer_quality_penalty(entry[1], entry[2])
         + (0.0 if _rp_withholds_evidence(entry[1], entry[2])
-           else _ev_agentic_bonus(entry[2])),
+           else _owner_agentic_bonus(entry[2])),
         entry[2])
 
 
@@ -40711,15 +40794,119 @@ def _ends_on_future_intent(text):
         return False
 
 
+# A BARE PROGRESS LINE, OR A LEAKED <think> THAT ENDS ON AN INTENT (2026-10-29).
+# MEASURED (OpenCode, coding-max, g4f relay GLM-5.3-Flash, owner said "continue"):
+#
+#     <think> The crew job started with job_id 73b... I need to poll it to see the
+#     status. The user said continue. Let me poll the crew status. </think>
+#     Crew job 73b... accepted. Polling its status.
+#
+# No tool call; OpenCode ended the turn. Both detectors above key on a SUBJECT
+# ("I'll", "let me"); "Polling its status." has none, so the reply was served as the
+# final answer. And the leaked <think> block counted toward _ANNOUNCE_MAX_CHARS, so a
+# longer one switched the whole check off. Now: the reply is judged on its VISIBLE
+# text (a leading <think> block is set aside), a last sentence that is a short bare
+# "-ing" progress line counts as an announcement, and so does a short visible reply
+# whose leaked thinking ENDS on an action intent (the model's own words say what it
+# was about to do). A false positive costs one retry on another model
+# (_announce_skip_spent); a miss ends the user's turn.
+_LEAD_THINK_RE = re.compile(r"^\s*<(think|thinking)>(.*?)</\1>\s*", re.S | re.I)
+_OPEN_THINK_RE = re.compile(r"^\s*<(?:think|thinking)>", re.I)
+_PROGRESS_LINE_RE = re.compile(
+    r"^\W*(?:(?:now|still|currently|just|ok(?:ay)?|alright|so|first|next|then),?\s+)*"
+    r"(?P<w>[a-z]{2,}ing)\b(?P<rest>[^.!?]*)[.!?\u2026]*\W*$", re.I)
+# -ing words that are nouns, courtesy, or a deliberate stop for the user.
+_PROGRESS_NOT_RE = re.compile(
+    r"^(?:thing|everything|nothing|something|anything|morning|evening|string|ring|king"
+    r"|being|waiting|awaiting|hoping|standing|pending|thanking|remaining|following"
+    r"|looking forward|nothing|during|according|regarding|including|concerning"
+    r"|missing|outstanding|interesting|amazing|exciting)$", re.I)
+# ...and a rest that makes the sentence a REPORT, not a progress line.
+_PROGRESS_REPORT_RE = re.compile(
+    r"\b(?:is|are|was|were|has|have|had|done|complete|completed|finished|failed|passed"
+    r"|succeeded|successful|worked|works|returned|showed|shows|found|ok|fine|ready"
+    r"|forward|for you|your)\b", re.I)
+# Verbs that end REASONING before a real answer ("Let me write the response").
+_THINK_ANSWER_VERB_RE = re.compile(
+    r"^(?:respond|reply|answer|summari[sz]e|explain|tell|present|conclude|wrap|finali[sz]e"
+    r"|recap|describe|provide|give|state|mention|inform|report|say|greet|acknowledge"
+    r"|confirm|clarify|output|produce|return|put)$", re.I)
+# ...and a WRITING verb whose object is the answer ("Let me write the final answer").
+_THINK_WRITE_VERB_RE = re.compile(
+    r"^(?:write|draft|compose|craft|formulate|prepare|put|form|construct|deliver)$", re.I)
+_THINK_ANSWER_OBJECT_RE = re.compile(
+    r"\b(?:response|reply|answer|summary|message|explanation|final|conclusion)s?\b", re.I)
+
+
+def _ann_split(text):
+    """(visible reply, leaked thinking) -- a leading <think>/<thinking> block set
+    aside. Never raises."""
+    try:
+        m = _LEAD_THINK_RE.match(text or "")
+        if m:
+            return text[m.end():], m.group(2) or ""
+    except Exception:                                            # noqa: BLE001
+        pass
+    return text or "", ""
+
+
+def _progress_line(sentence):
+    """True for a short bare "-ing" progress line: "Polling its status.",
+    "Checking the logs now.", "Running the tests." Never raises."""
+    try:
+        s = (sentence or "").strip()
+        if not s or len(s.split()) > 10:
+            return False
+        m = _PROGRESS_LINE_RE.match(s)
+        if not m:
+            return False
+        w = m.group("w").lower()
+        if _PROGRESS_NOT_RE.match(w) or _PROGRESS_NOT_RE.match(
+                (w + " " + (m.group("rest") or "").strip().split(" ")[0]).strip()):
+            return False
+        return not _PROGRESS_REPORT_RE.search(m.group("rest") or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _think_announces(thinking, visible):
+    """True when the leaked thinking ENDS on an action intent ("Let me poll the crew
+    status.") and the visible reply is a short status note, not an answer."""
+    try:
+        if not thinking or not visible or len(visible.strip()) > 160:
+            return False
+        if len([p for p in _LAST_SENTENCE_SPLIT_RE.split(visible.strip()) if p.strip()]) > 2:
+            return False
+        parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(thinking.strip()) if p.strip()]
+        if not parts:
+            return False
+        last = parts[-1].strip()
+        m = _FUTURE_INTENT_RE.match(last)
+        if not m or _NOT_AN_ACTION_RE.match(m.group("verb")):
+            return False
+        if _THINK_ANSWER_VERB_RE.match(m.group("verb")):
+            return False
+        if (_THINK_WRITE_VERB_RE.match(m.group("verb"))
+                and _THINK_ANSWER_OBJECT_RE.search(last[m.end():])):
+            return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _looks_like_announced_action(text):
     """True when `text` (a COMPLETE reply on a tool turn) is only an
-    announcement of an action -- see the note above. Short, no question."""
+    announcement of an action -- see the notes above. Short, no question."""
     if not text or not isinstance(text, str):
         return False
-    body = text.strip()
+    vis, think = _ann_split(text)
+    body = vis.strip()
     if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
         return False
-    return bool(_ANNOUNCE_ACTION_RE.search(body)) or _ends_on_future_intent(body)
+    if _ANNOUNCE_ACTION_RE.search(body) or _ends_on_future_intent(body):
+        return True
+    parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(body) if p.strip()]
+    return _progress_line(parts[-1] if parts else body) or _think_announces(think, body)
 
 
 def _announced_only(text):
@@ -40750,7 +40937,8 @@ def _ends_with_announcement(text):
     try:
         if not text or not isinstance(text, str):
             return False
-        body = text.strip()
+        vis, think = _ann_split(text)
+        body = vis.strip()
         if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
             return False
         parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(body) if p.strip()]
@@ -40759,7 +40947,9 @@ def _ends_with_announcement(text):
             return True
         if _LAST_INTENT_RE.match(last) and _WORK_VERB_RE.search(last):
             return True
-        return _ends_on_future_intent(last)
+        if _ends_on_future_intent(last):
+            return True
+        return _progress_line(last) or _think_announces(think, body)
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -40777,7 +40967,12 @@ def _announce_possible(text):
     try:
         if not text or not isinstance(text, str):
             return False
-        body = text.strip()
+        vis, _think = _ann_split(text)
+        if vis is text and _OPEN_THINK_RE.match(text):
+            return True          # still inside a leaked <think>: the reply has not started
+        body = vis.strip()
+        if not body and vis is not text:
+            return True          # the <think> just closed: the reply has not started yet
         return bool(body) and len(body) <= _ANNOUNCE_MAX_CHARS             and "?" not in body and "```" not in body
     except Exception:                                            # noqa: BLE001
         return False
@@ -40791,11 +40986,11 @@ def _announce_pending(text):
     try:
         if not text or not isinstance(text, str):
             return False
-        body = text.strip()
+        if _ends_with_announcement(text):
+            return True
+        body = _ann_split(text)[0].strip()
         if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
             return False
-        if _ends_with_announcement(body):
-            return True
         # ...or its last sentence is still OPEN and opens with the intent
         # ("I'll read the" -- the action may be the next word).
         parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(body) if p.strip()]

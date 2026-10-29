@@ -118,7 +118,11 @@ def test_deepseek_v41_above_v4_but_under_qwen38_and_gemini38():
 
 
 def test_user_rule_flash_over_pro_survives_the_minor_bump():
-    assert s("deepseek-v4.1-pro") < s("deepseek-v4-flash")
+    # The 2026-08-03 rule ("v4 flash is better than the pro") still holds for V4.0 ...
+    assert s("deepseek-v4-pro") < s("deepseek-v4-flash")
+    # ... but OWNER ORDER 2026-10-29 puts DeepSeek V4.1 PRO at the top of its own list
+    # (V4.1 Pro > MiMo V2.6 Pro > V4.1 Flash > GLM 5.3): the newer, more specific word wins.
+    assert s("deepseek-v4.1-pro") > s("deepseek-v4.1-flash") > s("deepseek-v4-flash")
 
 
 # --------------------------------------------------------------------------- #
