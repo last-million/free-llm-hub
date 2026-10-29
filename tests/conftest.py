@@ -431,6 +431,26 @@ def _multi_auto_retry_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _scope_card_off_unless_tested(request, monkeypatch):
+    """THE PROGRAM SCOPE CARD + SCOPE GUARD (app, flags `scope_card` / `scope_guard`)
+    are default ON (2026-10-29): a request whose project folder holds a scope file
+    or whose user message declares a scope gets a scope note on every hop, and a
+    tool call aimed at an out-of-scope host is blocked. Other test files build
+    requests with project folders and pin the exact messages sent upstream; off
+    here keeps them byte for byte, and no test writes a scopes.json. The feature's
+    own file turns them on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_scope_guard":
+        try:
+            import app
+            monkeypatch.setattr(app, "_scope_card_on", lambda: False)
+            monkeypatch.setattr(app, "_scope_guard_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _stall_recheck_off_unless_tested(request, monkeypatch):
     """THE COMPLETENESS CHECK (app._stall_on_turn_end, registered as agentic_chat's
     turn-end hook; flag `stall_recheck`) is default ON, but it RE-SENDS Continue to a Build

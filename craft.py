@@ -208,6 +208,57 @@ _SECURITY_RE = re.compile(
     r"\bonline store\b|\bstorefront\b|\be-?commerce\b|\bsaas\b|\bmulti-?tenant\b",
     re.I)
 
+# TARGET_TESTING, added 2026-10-29 at the owner's request: free models doing AUTHORIZED
+# testing -- a bug bounty program, a client engagement, or the owner's own app/site/API --
+# must stay inside scope, keep to the rules of engagement and report only what they
+# observed. Discipline and evidence at checklist level only: no exploit code, no payload
+# lists, no attack recipes. A domain brief, ranked FIRST: it is the task, and when it
+# matches it replaces the BUILD briefs (web design, landing, store, ship, seo, images --
+# "check my website for vulnerabilities" is not a request to design a website) while the
+# engineering brief and the builder's security brief stay for the fix that follows.
+# Settings -> Skills id `app_testing`; switched off there, match() is exactly as before.
+TARGET_TESTING = """TESTING BRIEF -- AUTHORIZED SECURITY TESTING (a program, a client, or your own app)
+- Scope first: test only assets the program lists in scope, a client authorized in writing, or the user owns. Read the scope and rules before any request; nothing stated? Ask, do not guess.
+- Program/client: obey its rules (rate limits, required headers), no DoS, no brute force, no social engineering, no spam; only your own test accounts; never view, change or keep other users' data beyond the minimum proof; stop at proof of impact.
+- Own app: prefer staging and test accounts, never real users' data, no load or DoS against production, back up before anything destructive.
+- Method: passive recon first (docs, public JS, DNS), then light active requests. Map the surface (hosts, endpoints, params, roles, auth flows), rank by impact, check the classes that fit the stack: access control/IDOR, auth/session, injection, XSS by context, SSRF, CSRF/CORS, uploads, open redirect, exposed secrets, misconfig, known CVEs of exposed versions.
+- Evidence or it is not a finding: an observed, reproducible request and response that shows impact. Anything less is "unverified" and labelled so.
+- Not findings: reflected input that never executes, a 200 with no protected data, self-XSS, missing headers alone (usually out of scope). Check duplicates, known issues and exclusions before reporting.
+- Report: title, asset, severity with reasoning, steps to reproduce, impact, proof (request/response), remediation.
+ANTI: a host outside scope; scanning the rules forbid; real user data as "proof"; a finding, scan run, response or result you did not observe; a theory called a vulnerability."""
+
+_TARGET_TESTING_RE = re.compile(
+    r"\bbug[- ]?bount(?:y|ies)\b|\bbounty (?:program|hunt\w*|report)s?\b|"
+    r"\bhackerone\b|\bbugcrowd\b|\bintigriti\b|\byeswehack\b|\bsynack\b|"
+    r"\bpen[- ]?test\w*\b|\bpenetration[- ]test\w*\b|\btest d'intrusion\b|"
+    r"\bred[- ]team(?:ing)?\b|\brecon\b|\breconnaissance\b|\battack surface\b|"
+    r"\bsubdomain (?:enum\w*|takeover)s?\b|"
+    r"\b(?:in|out[- ]of)[- ]scope (?:assets?|targets?|domains?|hosts?|subdomains?|urls?|endpoints?)\b|"
+    r"\b(?:responsible|coordinated) (?:vulnerability )?disclosure\b|\bvulnerability disclosure\b|"
+    r"\b(?:security|vulnerability) (?:assessments?|audits?)\b|\baudit de s[ée]curit[ée]\b|"
+    r"\bsecurity[- ]testing\b|\bsecurity[- ]test (?:of|on|against|for|my|our|the|this|it)\b|"
+    r"\b(?:vulnerability|security|pentest|bounty) (?:report|finding|write-?up)s?\b|"
+    r"\b(?:burp(?: suite)?|nuclei|sqlmap|ffuf|gobuster|dirsearch|feroxbuster|subfinder|amass|nmap)\b|"
+    r"\bexploitab\w+\b|"
+    r"\b(?:is|are) (?:my|our|the|this) (?:server|site|website|app|application|api|host|domain|"
+    r"instance|endpoint|saas)s? vulnerable\b|"
+    # a testing verb aimed at a vulnerability class ("find XSS", "hunt for IDORs",
+    # "test for SSRF") -- never a fix ("fix the XSS in comments.js") and never a
+    # test being WRITTEN ("a unit test for the XSS escaper").
+    r"(?:\bfind(?:ing)?|\bhunt(?:ing)?|\blook(?:ing)? for|\bsearch(?:ing)? for|\bdiscover|\bidentify|"
+    r"\benumerate|\bprob(?:e|ing)|(?<!\ba )(?<!\bunit )(?<!\bthe )(?<!\bnew )(?<!\bregression )"
+    r"(?<!\bintegration )\btest(?:ing)? for|\bscan(?:ning)? for|\bcheck(?:ing)? for|\baudit(?:ing)? for)"
+    r"(?:\W+\w+){0,4}?\W+(?:vulnerabilit\w*|vulns?|xss|ssrf|idors?|sqli|sql injection|csrf|rce|"
+    r"cve-[\d-]+|open redirects?|security (?:issues|holes|bugs|flaws))\b|"
+    # self-testing: "check my site for vulnerabilities", "audit our API's security"
+    r"\b(?:test|scan|audit|check|probe|assess|review|pentest)\w* (?:(?:my|our|the|this|a) )?(?:own )?"
+    r"(?:web ?)?(?:app|apps|application|site|website|saas|api|server|platform|domain)s?(?:'s)? "
+    r"(?:for (?:security|vulnerab\w*|vulns?|xss|ssrf|idor|sqli|csrf)|security)\b",
+    re.I)
+
+# The BUILD briefs a testing task does not want (see TARGET_TESTING above).
+_TESTING_REPLACES = frozenset(("web_design", "landing", "ecommerce", "ship", "seo", "images"))
+
 _SHIP_RE = re.compile(
     r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
     r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b|"
@@ -215,6 +266,7 @@ _SHIP_RE = re.compile(
     r"\bpreview\b|\blocalhost\b|\bstart the (?:app|server|site)\b", re.I)
 
 _BRIEFS = [
+    ("app_testing", _TARGET_TESTING_RE, TARGET_TESTING),
     ("ship", _SHIP_RE, SHIP),
     ("landing", re.compile(
         r"\blanding page\b|\bsales page\b|\bfunnel\b|\bconversion rate\b|\bcta\b|\bopt[- ]?in page\b", re.I),
@@ -301,8 +353,12 @@ def match(text):
         return []
     disabled, custom, ecc_on = _skill_state()
     out = []
+    # An authorized-testing task replaces the build briefs (_TESTING_REPLACES);
+    # with the app_testing skill switched off nothing is replaced.
+    skip = (_TESTING_REPLACES if "app_testing" not in disabled
+            and _TARGET_TESTING_RE.search(text) else frozenset())
     for name, rx, brief in _BRIEFS:
-        if name in disabled:
+        if name in disabled or name in skip:
             continue
         if rx.search(text):
             out.append((name, brief))
@@ -310,7 +366,7 @@ def match(text):
                 break
     extra = 0
     for name, rx, brief in _ORTHOGONAL:
-        if name in disabled:
+        if name in disabled or name in skip:
             continue
         if rx.search(text):
             out.append((name, brief))
@@ -577,7 +633,8 @@ def system_message(text, tools=True, session_id=None):
     # Multi helper) rides right after the briefs and BEFORE the loop: the loop
     # must stay last (its "every brief above" back-references), and this is
     # about the end of the work, not the loop.
-    pub = [PUBLISH_ASK] if tools and publish_wanted(text, session_id) else []
+    pub = ([PUBLISH_ASK] if tools and publish_wanted(text, session_id)
+           and not any(n == "app_testing" for n, _b in hits) else [])
     # PLAN -> ACT -> VERIFY, in that reading order: plan the work, do the work,
     # check the work. PLAN ships for any TOOL-CARRYING opening turn, in every
     # quality mode -- it used to have a single call site inside the swarm, so

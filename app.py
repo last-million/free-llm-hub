@@ -133,6 +133,7 @@ import publish
 import ghpush
 import memory
 import taskboard
+import scopecard
 
 # Both tool families are wired here, and for the same reason: every name below
 # is resolved at CALL time, not at import time, so they can live far lower in
@@ -18254,6 +18255,356 @@ def _upstream_post(pid, path, payload):
     raise RuntimeError("no keys tried for provider " + pid)
 
 
+# --------------------------------------------------------------------------- #
+# PROGRAM SCOPE CARD + SCOPE GUARD (2026-10-29)
+#
+# Authorized testing (a program, a client, or the owner's own app) lives or
+# dies on scope, and free models forget it a few turns in -- compaction drops
+# it first. The hub keeps ONE card per project folder (scopecard.py) in
+# state_dir()/scopes.json, never in the project:
+#   * read from the user's own messages of a /v1 conversation whose folder the
+#     CLI's environment block names (_cm_project_dir: never the hub's repo,
+#     never a root / home / anything above it), and, read-only and bounded,
+#     from scope files in that folder (scope*.md / SCOPE / *scope*.txt /
+#     program*.md, one level deep, no links, <= 64 KB each);
+#   * shown to the model as ONE "PROGRAM SCOPE" system note on EVERY hop
+#     (_scope_apply_note, next to the goal note in _upstream_chat) -- the card
+#     is rebuilt from disk each hop, so it survives the CLI's own compaction;
+#   * enforced on what the model SENDS BACK: a tool call aimed at a host the
+#     card lists EXPLICITLY out of scope never reaches the CLI as an executable
+#     call (_scope_guard_data on the non-stream and roles paths,
+#     _scope_guard_stream on the three streamed paths). A host merely NOT
+#     LISTED is never blocked (package registries, docs, the CLI's tooling).
+# Flags `scope_card` (card + note) and `scope_guard` (blocking; needs the card),
+# both default on; off = every request byte-identical to before.
+# --------------------------------------------------------------------------- #
+_SCOPE_FILE_RE = re.compile(
+    r"^(?:scope(?:[\w .-]*\.(?:md|txt|markdown))?|[\w .-]*scope[\w .-]*\.(?:md|txt|markdown)|"
+    r"program[\w .-]*\.(?:md|markdown))$", re.I)
+_SCOPE_FILE_RESCAN = 30.0             # seconds between looks at a folder's files
+_SCOPE_FILE_MAX_BYTES = 64 * 1024
+_SCOPE_FILES_MAX = 8
+_SCOPE_DIR_ENTRIES_MAX = 300
+_SCOPE_SUBDIRS_MAX = 40
+_SCOPE_SKIP_DIRS = frozenset((
+    "node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build", ".next",
+    "target", "vendor", ".cache", "site-packages", ".idea", ".vscode"))
+_SCOPE_MISSED_TTL = 1800.0
+_SCOPE_SEEN_MAX = 4096
+_SCOPE_MEM_MAX = 64
+_SCOPE_LOCK = threading.RLock()
+_SCOPE_MEM = {}          # folder key -> {"card", "files", "scanned"}
+_SCOPE_SEEN = {}         # sha1(folder key + user text) -> True, insertion-ordered
+_SCOPE_MISSED = {}       # folder key -> (wall time, host) of an unchecked streamed call
+_SCOPE_STORE = [None]
+
+
+def _scope_card_on():
+    try:
+        return bool(config.get_flag("scope_card", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _scope_guard_on():
+    try:
+        return bool(config.get_flag("scope_guard", True)) and _scope_card_on()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _scope_store():
+    path = os.path.join(config.state_dir(), "scopes.json")
+    st = _SCOPE_STORE[0]
+    if st is None or st.path != path:
+        st = _SCOPE_STORE[0] = scopecard.Store(path)
+    return st
+
+
+def _scope_user_texts(messages):
+    """What the USER wrote in this conversation (no tool results, no CLI
+    wrapper blocks: a fetched page cannot write the scope)."""
+    for m in messages or ():
+        if isinstance(m, dict) and m.get("role") == "user" and ctxwin.is_real_instruction(m):
+            t = ctxwin.instruction_text(ctxwin.message_text(m))
+            if t:
+                yield t
+
+
+def _scope_file_stamps(folder):
+    """{relative path: [mtime_ns, size]} of the scope files in `folder` and its
+    direct sub-folders: regular files only, no link followed, bounded."""
+    dp = _dp_module()
+    if dp is None:
+        return {}
+    root = os.path.realpath(folder)
+    found, subdirs = {}, []
+
+    def look(dir_path, prefix):
+        try:
+            entries = []
+            with os.scandir(dir_path) as it:
+                for e in it:
+                    entries.append(e)
+                    if len(entries) >= _SCOPE_DIR_ENTRIES_MAX:
+                        break
+            entries.sort(key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            if len(found) >= _SCOPE_FILES_MAX:
+                return
+            try:
+                if dp.is_link(e.path):
+                    continue
+                if e.is_file(follow_symlinks=False) and _SCOPE_FILE_RE.match(e.name):
+                    st = e.stat(follow_symlinks=False)
+                    if st.st_size <= _SCOPE_FILE_MAX_BYTES:
+                        found[prefix + e.name] = [int(st.st_mtime_ns), int(st.st_size)]
+                elif (prefix == "" and e.is_dir(follow_symlinks=False)
+                      and not e.name.startswith(".")
+                      and e.name.lower() not in _SCOPE_SKIP_DIRS
+                      and len(subdirs) < _SCOPE_SUBDIRS_MAX):
+                    subdirs.append(e)
+            except OSError:
+                continue
+
+    look(root, "")
+    for d in subdirs:
+        look(d.path, d.name + "/")
+    return found
+
+
+def _scope_read_file(folder, rel):
+    dp = _dp_module()
+    if dp is None:
+        return None
+    root = os.path.realpath(folder)
+    text, _why = dp.safe_read_text(os.path.join(root, *rel.split("/")), root,
+                                   _SCOPE_FILE_MAX_BYTES)
+    return text
+
+
+def _scope_refresh(folder, messages):
+    """The folder's card after taking in what this request adds (new user
+    messages; scope files that changed, at most every _SCOPE_FILE_RESCAN s).
+    Persisted when it changed. Never raises (None on error)."""
+    try:
+        key = _cm_folder_key(folder)
+        if not key:
+            return None
+        now = time.time()
+        with _SCOPE_LOCK:
+            ent = _SCOPE_MEM.get(key)
+            if ent is None:
+                stored = _scope_store().get(key) or {}
+                ent = {"card": stored.get("card") or scopecard.empty(),
+                       "files": dict(stored.get("files") or {}), "scanned": 0.0}
+                _SCOPE_MEM[key] = ent
+                while len(_SCOPE_MEM) > _SCOPE_MEM_MAX:
+                    _SCOPE_MEM.pop(next(iter(_SCOPE_MEM)))
+            card, changed = ent["card"], False
+            for text in _scope_user_texts(messages):
+                h = hashlib.sha1((key + "\x00" + text).encode("utf-8", "replace")).hexdigest()
+                if h in _SCOPE_SEEN:
+                    continue
+                _SCOPE_SEEN[h] = True
+                while len(_SCOPE_SEEN) > _SCOPE_SEEN_MAX:
+                    _SCOPE_SEEN.pop(next(iter(_SCOPE_SEEN)))
+                if not scopecard.has_hint(text):
+                    continue
+                new = scopecard.extract(text, src="message")
+                if not scopecard.is_empty(new):
+                    merged = scopecard.merge(card, new)
+                    if merged != card:
+                        card, changed = merged, True
+            if now - ent["scanned"] >= _SCOPE_FILE_RESCAN:
+                ent["scanned"] = now
+                stamps = _scope_file_stamps(folder)
+                old = ent["files"]
+                for rel in sorted(set(old) - set(stamps)):
+                    card = scopecard.drop_source(card, rel)
+                for rel in sorted(stamps):
+                    if old.get(rel) == stamps[rel]:
+                        continue
+                    card = scopecard.drop_source(card, rel)
+                    text = _scope_read_file(folder, rel)
+                    if text:
+                        kind = ("program" if rel.rsplit("/", 1)[-1].lower().startswith("program")
+                                else None)
+                        card = scopecard.merge(card, scopecard.extract(text, kind=kind, src=rel))
+                if stamps != old:
+                    ent["files"] = stamps
+                    changed = True
+            if changed:
+                ent["card"] = card
+                _scope_store().put(key, card, ent["files"], now=now)
+            return card
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _scope_card_for(folder):
+    """The stored card of `folder` (no reading of messages or files), or None."""
+    try:
+        key = _cm_folder_key(folder)
+        if not key:
+            return None
+        with _SCOPE_LOCK:
+            ent = _SCOPE_MEM.get(key)
+            if ent is not None:
+                return ent["card"]
+        stored = _scope_store().get(key)
+        return stored["card"] if stored else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _scope_note_text(folder, card):
+    """The PROGRAM SCOPE note (<= scopecard.NOTE_MAX_CHARS). Deterministic for a
+    given card; it only changes when the card does, or for 30 min after a
+    streamed out-of-scope call the guard could not stop in time."""
+    warn = ""
+    key = _cm_folder_key(folder)
+    with _SCOPE_LOCK:
+        missed = _SCOPE_MISSED.get(key)
+    if missed and time.time() - missed[0] < _SCOPE_MISSED_TTL:
+        warn = ("WARNING: a streamed call to %s (OUT of scope) went out before the hub "
+                "could check it. Do not repeat it; tell the user." % missed[1])
+    text = scopecard.render(card, scopecard.NOTE_MAX_CHARS - (len(warn) + 1 if warn else 0))
+    return (text + "\n" + warn) if (text and warn) else text
+
+
+def _scope_apply_note(messages):
+    """ONE "PROGRAM SCOPE" system note after the leading system messages, on
+    EVERY hop of a conversation whose project folder has a scope card. Returns
+    the original list when nothing applies. Never raises."""
+    try:
+        if not isinstance(messages, list) or not messages or not _scope_card_on():
+            return messages
+        folder = _cm_project_dir(messages)
+        if not folder:
+            return messages
+        card = _scope_refresh(folder, messages)
+        if not card or scopecard.is_empty(card):
+            return messages
+        text = _scope_note_text(folder, card)
+        if not text:
+            return messages
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict) \
+                and messages[i].get("role") == "system":
+            i += 1
+        return messages[:i] + [{"role": "system", "content": text}] + messages[i:]
+    except Exception:                                            # noqa: BLE001
+        return messages
+
+
+def _scope_ctx(messages):
+    """(folder, card) when the guard applies to this request (flags on, a known
+    project folder, a card with at least one OUT-of-scope entry), else None."""
+    try:
+        if not _scope_guard_on():
+            return None
+        folder = _cm_project_dir(messages)
+        if not folder:
+            return None
+        card = _scope_card_for(folder)
+        if not card or not card.get("out"):
+            return None
+        return folder, card
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _scope_log_block(host, folder, how):
+    _log.warning("[scope] blocked a %s call to %s (out of scope) in %s", how, host,
+                 os.path.basename(os.path.normpath(str(folder))))
+
+
+def _scope_guard_data(data, messages):
+    """Non-stream (and roles) guard: a chat-completions body whose tool call
+    aims at a host the folder's card lists OUT of scope gets that call replaced
+    by a plain assistant message saying so (finish_reason "stop"). True when it
+    blocked. Never raises."""
+    try:
+        ch = (data.get("choices") or [None])[0] if isinstance(data, dict) else None
+        msg = ch.get("message") if isinstance(ch, dict) else None
+        if not isinstance(msg, dict) or not msg.get("tool_calls"):
+            return False
+        ctx = _scope_ctx(messages)
+        if ctx is None:
+            return False
+        folder, card = ctx
+        hit = scopecard.check_calls(msg.get("tool_calls"), card)
+        if not hit:
+            return False
+        text = scopecard.block_message(*hit)
+        content = msg.get("content") if isinstance(msg.get("content"), str) else ""
+        msg["content"] = (content.strip() + "\n\n" + text) if content.strip() else text
+        msg.pop("tool_calls", None)
+        msg.pop("function_call", None)
+        if ch.get("finish_reason") in (None, "tool_calls", "function_call"):
+            ch["finish_reason"] = "stop"
+        _scope_log_block(hit[0], folder, "non-stream")
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _scope_guard_stream(items, framing, messages):
+    """Streamed guard (scopecard.guard_stream): from the first tool-call delta
+    to the end of the stream the frames are held, then released byte for byte
+    or replaced by the block message. Only for a folder whose card lists an OUT
+    entry; otherwise `items` comes back untouched. A hold past 256 KB / 30 s is
+    released unchecked (logged), and a call that turns out to have been out of
+    scope is flagged in the next turn's scope note."""
+    ctx = _scope_ctx(messages)
+    if ctx is None:
+        return items
+    folder, card = ctx
+    key = _cm_folder_key(folder)
+    host = [None]
+
+    def check(calls):
+        hit = scopecard.check_calls(calls, card)
+        if not hit:
+            return None
+        host[0] = hit[0]
+        return scopecard.block_message(*hit)
+
+    def on_event(kind, detail):
+        name = os.path.basename(os.path.normpath(str(folder)))
+        if kind == "blocked":
+            _scope_log_block(host[0], folder, "streamed")
+        elif kind == "gave_up":
+            _log.warning("[scope] a streamed tool call in %s was too long to hold (%s): "
+                         "released unchecked", name, detail)
+        elif kind == "missed":
+            with _SCOPE_LOCK:
+                _SCOPE_MISSED[key] = (time.time(), host[0])
+            _log.warning("[scope] an unchecked streamed call to %s in %s was out of scope; "
+                         "flagged in the next scope note", host[0], name)
+
+    return scopecard.guard_stream(items, framing, check, on_event=on_event)
+
+
+@app.route("/api/scope", methods=["GET"])
+def api_scope():
+    """The stored scope card of a project folder (read-only; control-token gated
+    by the /api guard like every other route)."""
+    pd = request.args.get("project_dir") or ""
+    if not pd or not os.path.isdir(pd):
+        return jsonify({"error": "project_dir must be an existing folder",
+                        "code": "bad_request"}), 400
+    card = scopecard.normalize(_scope_card_for(pd) or scopecard.empty())
+    resp = jsonify({"project_dir": os.path.abspath(pd), "card": card,
+                    "note": scopecard.render(card), "card_on": _scope_card_on(),
+                    "guard_on": _scope_guard_on()})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     """POST {base_url}/chat/completions for provider pid, rotating across the
     provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
@@ -18308,6 +18659,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # Open security findings of this conversation that no observed output proves
             # (see _findings_note).
             msgs = _findings_note(msgs)
+            # PROGRAM SCOPE: the project folder's scope card, on EVERY hop (flag
+            # scope_card; see _scope_apply_note). Skipped with the brief for
+            # pipeline stages (_no_craft).
+            msgs = _scope_apply_note(msgs)
         # An earlier hop's "your message contains only a tool setup" reply must not be
         # what this model reads as the conversation so far (see _scrub_empty_claims).
         msgs = _scrub_empty_claims(msgs)
@@ -48018,6 +48373,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
         return None
     _bandit_remember(msg.get("tool_calls"), spid, smodel, kind)
     _note_continuation_outcome(spid, smodel, messages, msg)
+    # PROGRAM SCOPE GUARD (after the ledgers above, which judge what the model did).
+    _scope_guard_data(data, messages)
     rec["served"] = "%s/%s" % (spid, smodel)
     rec["outcome"] = "tool call" if msg.get("tool_calls") else "text"
     _log.info("[roles] %s/%s served after %d actor hop(s), %d call(s)%s%s%s", spid, smodel,
@@ -50964,6 +51321,9 @@ def _chat_completions_uncached(body):
                     relay = _repair_tool_sse(relay)
                     # ...then one copy of a call sent N times (tool_rescue.dedupe_stream)
                     relay = _dedupe_tool_stream(relay, "frames", hop_pid, hop_model)
+                    # ...and a call aimed at an OUT-of-scope host is held and blocked
+                    # before the client gets it (flag scope_guard; _scope_guard_stream).
+                    relay = _scope_guard_stream(relay, "frames", payload.get("messages"))
                 # Usage frames report the ORIGINAL request size (see
                 # _reported_prompt_tokens); one is added when the client asked
                 # for usage and the upstream sent none.
@@ -51019,6 +51379,9 @@ def _chat_completions_uncached(body):
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
+            # PROGRAM SCOPE GUARD: a tool call aimed at an OUT-of-scope host becomes a plain
+            # message saying so (flag scope_guard; see _scope_guard_data).
+            _scope_guard_data(data, payload.get("messages"))
             # The CLIENT sees the size of the request it sent, not of the
             # compacted one (usage_history above keeps the real upstream count).
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
@@ -52157,8 +52520,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label,
-                                      line_iter=(_dedupe_tool_stream(gated, "lines", hop_pid,
-                                                                     hop_model)
+                                      line_iter=(_scope_guard_stream(_dedupe_tool_stream(
+                                                     gated, "lines", hop_pid, hop_model),
+                                                     "lines", payload.get("messages"))
                                                  if has_tools else gated),
                                       prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
@@ -52218,6 +52582,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
+            # PROGRAM SCOPE GUARD: a tool call aimed at an OUT-of-scope host becomes a plain
+            # message saying so (flag scope_guard; see _scope_guard_data).
+            _scope_guard_data(data, payload.get("messages"))
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, messages,
@@ -53188,8 +53555,9 @@ def v1_messages():
                 gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est,
-                                     line_iter=(_dedupe_tool_stream(gated, "lines", hop_pid,
-                                                                    hop_model)
+                                     line_iter=(_scope_guard_stream(_dedupe_tool_stream(
+                                                    gated, "lines", hop_pid, hop_model),
+                                                    "lines", payload.get("messages"))
                                                 if has_tools else gated),
                                      hop_pid=hop_pid, hop_model=hop_model,
                                      prompt_text=_prompt_text_for_check(payload),
@@ -53242,6 +53610,9 @@ def v1_messages():
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             _strip_leaked_think_data(data, hop_pid, _last_user_text_for_check(payload))
+            # PROGRAM SCOPE GUARD: a tool call aimed at an OUT-of-scope host becomes a plain
+            # message saying so (flag scope_guard; see _scope_guard_data).
+            _scope_guard_data(data, payload.get("messages"))
             _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, oai_messages,

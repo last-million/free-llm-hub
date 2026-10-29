@@ -97,7 +97,12 @@ def test_briefs_stay_small():
     # 2026-08-31 for the component-set and design-skill lines, and on
     # 2026-10-04 for the owner's anti-slop list (+353 chars, ~88 tokens, after
     # tightening the component, design-skill and animation-skill lines).
-    budget = {"web_design": 5500}
+    # app_testing (2026-10-29, authorized testing: a program, a client or the
+    # owner's own app) carries scope + rules of engagement for both cases, the
+    # method checklist, the evidence bar, the false positives and the report
+    # template; it REPLACES the build briefs when it fires, so a request pays
+    # less, not more (tests/test_testing_brief.py measures it).
+    budget = {"web_design": 5500, "app_testing": 1800}
     for name, _rx, body in craft._BRIEFS:
         limit = budget.get(name, 1400)
         assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
