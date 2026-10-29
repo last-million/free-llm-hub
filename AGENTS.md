@@ -8676,3 +8676,130 @@ an unlisted host); IPv6 scope is supported but lightly; the card is per folder, 
 one folder share one card; nothing here was run against a live hub, a real CLI or a real program.
 
 Release-note: new: authorized security testing (bug bounty programs and your own apps) gets a scope-first, evidence-only brief, and the hub keeps each project's scope in front of the model and blocks tool calls aimed at hosts listed out of scope.
+
+## Smart-contract tools for every CLI (2026-10-29)
+
+Covered by `tests/test_chainkit.py` (tools, MCP wiring, folder guard; fakes for every
+subprocess / HTTP call / clock / thread) and `tests/test_chain_brief.py` (the brief,
+observed `forge test` / `hardhat test` results, the machine block). Owner: free models
+must be maximally useful on any web3 / smart-contract project (build, test, audit,
+authorised testing) through REAL TOOLS, not only a prompt. Naming rule (owner, strict):
+no file, flag, setting or tool named with "bounty" or "security"; everything is `chain`.
+
+- **Why tools.** A free model guesses what is installed (Foundry? only in WSL?), what a
+  deployed contract contains and what the chain says now, and has no safe place to try
+  things against real state. `chainkit.py` answers each, for EVERY CLI, as MCP tools on
+  the hub's existing `POST /mcp` (a fifth family in `hub_mcp`, slot `_CHAIN`
+  {enabled, tools, call}; `tools/list` stays dynamic; MCP tools are not routes, README
+  route count unchanged).
+- **The tools** (`chainkit.Kit`; every effect a constructor argument; a bad ARGUMENT
+  raises `chainkit.ArgError` -> JSON-RPC -32602, everything else is a dict, a failure
+  `{error, code}`, nothing raises):
+  - `chain_tools_status {refresh?}`: forge, cast, anvil, chisel, solc, slither, aderyn,
+    node, npx -- natively (`which` + one `--version`) and inside WSL (ONE
+    `wsl.exe -e bash -lic` call, `@@tool\tversion` lines), cached 5 min; the official
+    install command for each missing group (foundryup via Git Bash/WSL, pipx
+    slither-analyzer, aderyn's installer script / npm / cyfrinup, solc-select, Node.js).
+    **The hub never installs anything**: the answer tells the model to give the user
+    the command (a test asserts only `--version` and the WSL probe ever run).
+  - `chain_source {address, chain, project_dir}`: verified source from Sourcify API v2
+    (`GET https://sourcify.dev/server/v2/contract/{chainId}/{address}?fields=sources,
+    compilation,abi,proxyResolution`, keyless; v1 was switched off 2026-07-07). Written
+    under `<project>/.chain-src/<chain>-<address>/` (+ `chain-source.json` with the full
+    compilation object, `abi.json`, and `.chain-src/.gitignore` = `*`). The answer is a
+    file list (first 40), compiler (version, optimizer, evm version, viaIR), match, and
+    a proxy's implementation addresses with "fetch those too" -- never the source.
+    Source paths are attacker-chosen: `safe_rel` drops `..`/absolute/drive parts,
+    replaces odd characters, prefixes dot-files and Windows device names, dedupes case
+    collisions; every write is re-checked inside the target and never through a link.
+    Any numeric chain id is passed to Sourcify. 404 = `not_verified` (says to work from
+    `eth_getCode`), 400 = Sourcify's own message, 429 = `rate_limited`.
+  - `chain_read {chain, method, params?}`: READ-ONLY JSON-RPC. Two allowlists (the tool
+    and the param checker): eth_call (no state-override param, call keys
+    to/data/input/from/value/gas/gasPrice only), eth_getBalance, eth_getCode,
+    eth_getStorageAt, eth_blockNumber, eth_chainId, eth_getTransactionByHash,
+    eth_getTransactionReceipt, eth_getLogs (numeric fromBlock/toBlock at most 2000
+    blocks apart, or blockHash; <= 20 addresses, <= 4 topics), eth_getBlockByNumber.
+    Never a send/sign/personal_*/anvil_*/debug_* method. 60 reads a minute per public
+    chain, results cut at 60K chars / 200 list items, RPC answers read to 4 MB.
+    `chain` may also be a running fork id (local, not rate-limited).
+  - `chain_fork_start {chain, block?}` / `chain_fork_stop {id}` / `chain_fork_list`:
+    `anvil --fork-url <rpc> --host 127.0.0.1 --port N [--fork-block-number B]` on a
+    free port in 18545-18644 (never the hub's port), natively or via
+    `wsl.exe -e bash -lic 'exec anvil ...'` when anvil is only in WSL (WSL localhost
+    forwarding). At most 2; the same chain+block is reused; readiness = eth_chainId on
+    the local URL within 45 s, else killed with a scrubbed log tail; stopped after 60
+    minutes without use through the hub tools (start/reuse, chain_read on it,
+    chain_fork_list), by a reaper thread that runs only while forks exist, and at hub
+    exit (atexit); killed as a whole tree (taskkill /T, killpg).
+  - `chain_analyze {project_dir, tool=slither|aderyn}` or `{job_id}`: `slither . --json
+    .chain-reports/slither-<stamp>.json` / `aderyn . --no-snippets -o
+    .chain-reports/aderyn-<stamp>.json`, run in the project (or in WSL: the project's
+    distro for a `\\wsl.localhost\` path, `/mnt/<drive>/...` otherwise), 600 s then the
+    tree is killed. One call waits up to 45 s, else answers `running` + job_id (codex's
+    MCP tool timeout is short); at most 2 at once. Answer: counts by severity, the top
+    10 (impact/confidence/check/where, or severity/title/detector/instances/where), the
+    report path and "findings are leads, not proof".
+- **Folder guard** (`app._chain_folder_guard`, POST /mcp is unauthenticated): absolute,
+  existing, not a link, not too broad (drive root, home, above it; a WSL root, /home,
+  /home/<user>, /mnt/<drive>), not the hub's repo or state folder, and INSIDE the user's
+  home, a WSL distro, or a folder listed in setting `chain_project_roots`. The last rule
+  is what stops another OS user's process from making the hub run an analyzer (slither
+  may run the project's own Hardhat config, i.e. JS) in a folder that user controls.
+  An unwired Kit (no guard) refuses every folder.
+- **Secrets**: an RPC URL never reaches an answer or a log line (a private URL can carry
+  a key); every echoed text goes through `chainkit.scrub` (URLs -> `<url>`). Optional
+  setting `chain_rpc_urls` {chain: url} (https, or http only to loopback; anything else
+  ignored) overrides a default RPC or adds a chain name. Etherscan was left out on
+  purpose (an API key to store and a route/UI to set it; Sourcify covers the keyless
+  case).
+- **Default RPCs**, checked 2026-10-29 in each chain's docs: base mainnet.base.org /
+  sepolia.base.org, arbitrum arb1.arbitrum.io/rpc, optimism mainnet.optimism.io (rate
+  limited), polygon polygon.drpc.org, bsc bsc-dataseed.bnbchain.org (its docs: eth_getLogs
+  disabled there), ethereum ethereum-rpc.publicnode.com and sepolia
+  ethereum-sepolia-rpc.publicnode.com (ethereum.org lists none; PublicNode's own pages).
+- **The brief**: `craft.CHAIN_DEV` (1369 chars, under the 1400 domain-brief budget, so
+  `test_briefs_stay_small` did not move), skill id `chain_dev` "Smart contracts / web3"
+  in `skills.BUILTIN` (toggled like the others). FIRST in `craft._BRIEFS`, so a dapp
+  landing page keeps it. Word-bounded triggers: solidity, vyper, foundry (not "ai/azure
+  foundry", "foundry local/vtt"), `forge test|build|script...`, hardhat, anvil, smart
+  contract(s), evm, erc20/721/1155/4626/2612/4337, defi, web3, dapp, viem, wagmi,
+  ethers.js, uniswap, slither, aderyn, sepolia, "<token|nft|staking|vault|lending|
+  governance|multisig> contract". Content: Foundry/Hardhat conventions, unit + fuzz +
+  invariant tests run and pasted, gas after correctness; checklist (reentrancy, access
+  control, oracle/price manipulation, rounding, signature replay, upgradeability/storage
+  layout, unchecked calls, unbounded loops); safety (fork/testnet first, no mainnet
+  transaction unless explicitly asked, exploit proofs only on a local fork for code the
+  user owns or may test, no key/seed phrase in code/commits/logs/prompts, .env +
+  .gitignore); the chain_* tools "if offered". The three canonical worst-case requests
+  do not match it; heaviest chain request measured ~13.8K chars, under the ceiling.
+- **Observed evidence** (`evidence.py`): `forge test|t` (Suite/Test result lines and the
+  "N tests passed, M failed, K skipped (T total tests)" total, read from Foundry's
+  result.rs; compile failure; "No tests found/match" = NO_TESTS), `forge build|b`,
+  `hardhat test` (Hardhat 2 mocha "N passing/failing/pending"; Hardhat 3 one summary per
+  runner, added up, per its reporter.ts), `hardhat compile`. `npx`/`pnpm`/`yarn hardhat`
+  and an echoed `npm test` -> `hardhat test` are read through; `forge test` joins the
+  unechoed-wrapper sniff list. The usual rules hold: never PASS without exit 0, never
+  FAIL on exit 0, a pipe after the check = unknown.
+- **Machine block** (`envprobe.py`): forge / anvil / slither probed like the other tools
+  and named ("forge 1.3, anvil 1.3, slither 0.10") ONLY when present; contract builds
+  (dapp, smart contract) now count as app builds for `wants_block`.
+- **Flags**: `chain_tools` (`config.get_flag`, default ON; unreadable config = off): off
+  = the seven tools are not listed and a call answers -32602 "Unknown tool". The brief is
+  toggled through Settings -> Skills (`chain_dev`). `tests/conftest.py`
+  `_chain_tools_off_unless_tested` turns the flag off for every other test file and, for
+  every test, makes chainkit's real network / subprocess / spawn / thread defaults fail
+  loudly (and `which` find nothing).
+- **Limits, plainly.** Nothing was run against a real Foundry, slither, aderyn or anvil
+  on this machine (none is installed here and the rules forbid installing); the version
+  and report shapes come from the tools' docs/source and are covered by fakes. Forking
+  over a free public RPC can be slow or refused (the answer says to set
+  `chain_rpc_urls`). The idle timer only sees use THROUGH the hub (an agent hammering the
+  fork with cast for an hour still gets it stopped at 60 minutes; chain_fork_list keeps
+  it alive). A hub exit mid-analysis leaves the analyzer running until its own 600 s
+  limit. Re-fetching a contract overwrites its files but keeps files an earlier fetch
+  wrote (chain-source.json lists the current set). A project outside the home folder
+  needs `chain_project_roots`. `foundry`/`anvil` as plain words can still misfire on an
+  unrelated text that uses them (Anvil Works apps other than "anvil.works").
+
+Release-note: new: coding agents get real smart-contract tools through the hub -- installed-tool check, verified contract source, read-only chain queries, local forks and slither/aderyn reports -- plus a Solidity brief, in every CLI.
