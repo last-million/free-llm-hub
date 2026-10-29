@@ -15733,11 +15733,16 @@ def _summarize_worker(key, text, sid=None, conv=None, prev=None, head=None,
             _summary_inflight.discard(key)
 
 
-# OPTIONAL model-based fact extraction (flag memory_fact_extractor, default
-# OFF). memory.harvest_facts files the durable facts of every finished turn by
+# Model-based fact extraction (flag memory_fact_extractor, default ON since
+# 2026-10-29, owner: "memories written and updated automatically after each
+# turn"). memory.harvest_facts files the durable facts of every finished turn by
 # pattern alone, for free; with the flag on it ALSO asks one cheap free model
 # for the facts a pattern cannot see. Runs on memory's own daemon thread,
 # never on a request; never a paid subscription; any failure files nothing.
+# Build/Multi call it once per finished turn; /v1 traffic once per FINISHED
+# exchange (_mfx_v1_pass, below _v1_observe). With flag memory_fact_updates
+# (default on) the model is also shown the facts already remembered and may
+# REPLACE one (memory._run_extractor) instead of filing a contradiction.
 _FACT_EXTRACT_SYSTEM = (
     "From this finished exchange between a user and a coding agent, list the "
     "DURABLE facts worth remembering for future work in the same project: "
@@ -15745,18 +15750,33 @@ _FACT_EXTRACT_SYSTEM = (
     "work, where things live. One per line, each a short standalone sentence, "
     "at most 5. Nothing temporary, nothing speculative, nothing not stated in "
     "the exchange. If there are none, reply NONE.")
+_FACT_EXTRACT_KNOWN_RULE = (
+    " KNOWN FACTS already remembered for this project are numbered in the "
+    "message. Never repeat one of them. When a new fact REPLACES or "
+    "contradicts a known fact (the user switched from X to Y, a decision was "
+    "reversed), write that line as: REPLACES <number>: <the new fact>")
 _FACT_EXTRACT_MAX_TOKENS = 400
+_FACT_KNOWN_SHOWN_CHARS = 200
+_FACT_REPLACES_RE = re.compile(r"^REPLACES\s*#?\s*(\d+)\s*[:.)\-]\s*(.+)$", re.I)
 
 
-def _memory_fact_extractor(request_text, reply_text):
+def _memory_fact_extractor(request_text, reply_text, known=None):
     try:
-        if not config.get_flag("memory_fact_extractor", False):
+        if not config.get_flag("memory_fact_extractor", True):
             return []
     except Exception:                                            # noqa: BLE001
         return []
-    msgs = [{"role": "system", "content": _FACT_EXTRACT_SYSTEM},
-            {"role": "user", "content": "USER:\n%s\n\nAGENT:\n%s"
-             % (str(request_text or "")[:3000], str(reply_text or "")[-6000:])}]
+    # Not filtered: a REPLACES number must point at the caller's own list.
+    known = [k if isinstance(k, str) else str(k) for k in (known or ())]
+    system, content = _FACT_EXTRACT_SYSTEM, "USER:\n%s\n\nAGENT:\n%s" % (
+        str(request_text or "")[:3000], str(reply_text or "")[-6000:])
+    if known:
+        system += _FACT_EXTRACT_KNOWN_RULE
+        content = "KNOWN FACTS:\n%s\n\n%s" % ("\n".join(
+            "%d. %s" % (i + 1, k[:_FACT_KNOWN_SHOWN_CHARS]) for i, k in enumerate(known)),
+            content)
+    msgs = [{"role": "system", "content": system},
+            {"role": "user", "content": content}]
     try:
         pid, model, _d = _route_by_difficulty(msgs, _FACT_EXTRACT_MAX_TOKENS,
                                               require_tools=False,
@@ -15784,6 +15804,16 @@ def _memory_fact_extractor(request_text, reply_text):
             facts = []
             for line in out.splitlines():
                 line = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line).strip()
+                if known:
+                    line = line.strip("`").strip()
+                    m = _FACT_REPLACES_RE.match(line)
+                    if m:
+                        n, new = int(m.group(1)), m.group(2).strip()
+                        if new and 1 <= n <= len(known):
+                            facts.append({"text": new[:memory.MAX_FACT_CHARS],
+                                          "replaces": known[n - 1]})
+                            continue
+                        line = new
                 if line and line.upper() != "NONE":
                     facts.append(line[:memory.MAX_FACT_CHARS])
             return facts[:5]
@@ -15794,12 +15824,20 @@ def _memory_fact_extractor(request_text, reply_text):
 
 def _memory_fact_extractor_on():
     try:
-        return bool(config.get_flag("memory_fact_extractor", False))
+        return bool(config.get_flag("memory_fact_extractor", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _memory_fact_updates_on():
+    try:
+        return bool(config.get_flag("memory_fact_updates", True))
     except Exception:                                            # noqa: BLE001
         return False
 
 
 _memory_fact_extractor.enabled = _memory_fact_extractor_on
+_memory_fact_extractor.wants_known = _memory_fact_updates_on
 memory.set_fact_extractor(_memory_fact_extractor)
 
 
@@ -45271,11 +45309,118 @@ def _v1_observe(messages, body=None):
                 key = _orch_key(body, messages)
             except Exception:                                    # noqa: BLE001
                 key = None
+        # The pattern harvest runs on every hop, as before. The MODEL pass never
+        # does: it would cost a model call per hop of a tool loop. It runs once
+        # per FINISHED exchange instead (_mfx_v1_pass), or not at all on /v1
+        # when flag memory_fact_extractor_v1 is off.
         memory.harvest_facts(key or "v1", request=_team_instruction(messages),
                              reply=_v1_last_assistant_text(messages), project_dir=cwd,
-                             tools=_v1_write_tool_strings(messages), results=rows)
+                             tools=_v1_write_tool_strings(messages), results=rows,
+                             model_pass=False)
+        if _v1_flag("memory_fact_extractor_v1"):
+            _mfx_v1_pass(messages, key, cwd)
     except Exception:                                            # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------- #
+# MEMORY WRITER, ONCE PER FINISHED EXCHANGE (/v1)
+#
+# Owner 2026-10-29: "agents' memories written and updated automatically after
+# each turn, in every CLI". Build and Multi run the model fact extractor once per
+# finished turn (agentic_chat / the Multi report). A terminal CLI on /v1 sends
+# the hub one request per HOP of its tool loop, and the hub never learns that a
+# turn ended -- except when the NEXT instruction arrives: a request that ends on
+# a fresh user instruction right after a finished assistant reply (text, no
+# pending tool call) proves the previous exchange is over. That request judges
+# the PREVIOUS instruction and that final reply, on memory's daemon thread.
+# Never on a tool-result continuation, never on a CLI's own compaction request,
+# never for a /build session (Build/Multi file their own), at most once per
+# conversation per _MFX_COOLDOWN_S and _MFX_HOURLY_CAP passes per hour for the
+# whole hub. In memory only. Never raises, never waits, never logs user text.
+# --------------------------------------------------------------------------- #
+
+_MFX_COOLDOWN_S = 600.0
+_MFX_HOURLY_CAP = 60
+_MFX_MIN_CHARS = 60              # instruction + reply shorter than this: nothing durable
+_MFX_KEYS_MAX = 2000
+_MFX_LOCK = threading.Lock()
+_MFX_LAST = collections.OrderedDict()     # conversation key -> monotonic time of its last pass
+_MFX_CALLS = collections.deque()          # monotonic times of the passes started this hour
+
+
+def _mfx_exchange(messages):
+    """(instruction, final reply) of the exchange that just FINISHED, or None.
+
+    The request must end on a real user instruction (CLI wrapper blocks such
+    as <system-reminder> do not count) whose nearest earlier non-system message
+    is an assistant reply with text and no tool calls; the instruction is the
+    real user instruction before that reply. Pure; never raises."""
+    try:
+        seq = [m for m in (messages or ()) if isinstance(m, dict)
+               and m.get("role") not in ("system", "developer")]
+        if not seq or not ctxwin.is_real_instruction(seq[-1]):
+            return None
+        i = len(seq) - 2
+        while i >= 0 and seq[i].get("role") == "user" and not ctxwin.is_real_instruction(seq[i]):
+            i -= 1                                # a wrapper-only user message
+        if i < 0 or seq[i].get("role") != "assistant" or seq[i].get("tool_calls"):
+            return None
+        reply = _strip_thinking(ctxwin.message_text(seq[i]) or "").strip()
+        if not reply:
+            return None
+        for m in reversed(seq[:i]):
+            if ctxwin.is_real_instruction(m):
+                prev = ctxwin.instruction_text(ctxwin.message_text(m))
+                if not prev or ctxwin.is_compaction_request([{"role": "user", "content": prev}]):
+                    return None
+                if len(prev) + len(reply) < _MFX_MIN_CHARS:
+                    return None
+                return prev, reply
+        return None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _mfx_reserve(key, now=None):
+    """True (and the slot taken) when this conversation is out of its cooldown
+    and the hub is under its hourly cap. Never raises."""
+    now = time.monotonic() if now is None else now
+    with _MFX_LOCK:
+        while _MFX_CALLS and now - _MFX_CALLS[0] >= 3600.0:
+            _MFX_CALLS.popleft()
+        last = _MFX_LAST.get(key)
+        if last is not None and now - last < _MFX_COOLDOWN_S:
+            return False
+        if len(_MFX_CALLS) >= _MFX_HOURLY_CAP:
+            return False
+        _MFX_LAST[key] = now
+        _MFX_LAST.move_to_end(key)
+        while len(_MFX_LAST) > _MFX_KEYS_MAX:
+            _MFX_LAST.popitem(last=False)
+        _MFX_CALLS.append(now)
+        return True
+
+
+def _mfx_v1_pass(messages, key, cwd):
+    """Start the model fact pass for the exchange this request just closed, when
+    every rule above allows it. True when started. Never raises."""
+    try:
+        if not cwd or _build_sid():
+            return False
+        if not _memory_fact_extractor_on():
+            return False
+        if ctxwin.is_compaction_request(messages):
+            return False
+        ex = _mfx_exchange(messages)
+        if not ex:
+            return False
+        if not _mfx_reserve(key or ("dir:" + os.path.normcase(os.path.abspath(cwd)))):
+            return False
+        return bool(memory.extract_facts(key or "v1", request=ex[0], reply=ex[1],
+                                         project_dir=cwd))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _role_log_http_body(pid, model, resp):

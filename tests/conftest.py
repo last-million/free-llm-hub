@@ -430,6 +430,29 @@ def _stall_recheck_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _memory_model_extractor_off_unless_tested(request, monkeypatch):
+    """THE MODEL FACT EXTRACTOR (app._memory_fact_extractor, flag
+    `memory_fact_extractor`) is default ON (2026-10-29): every finished Build/Multi
+    turn and every finished /v1 exchange starts a background thread that routes a
+    model call. Off here for every other test file (no extractor installed in
+    memory), so no test fires background model calls or files extra facts; the
+    feature's own file installs what it needs. Files that set their own extractor
+    (memory.set_fact_extractor) still do, and monkeypatch puts the hub's back."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_memory_writer_per_turn":
+        try:
+            import app  # noqa: F401  -- importing it installs the extractor; patch after
+        except Exception:
+            pass
+        try:
+            import memory
+            monkeypatch.setattr(memory, "_FACT_EXTRACTOR", None)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _auto_block_off_unless_tested(request, monkeypatch):
     """A MODEL THAT NEVER ANSWERS IS BLOCKED FOR A DAY (app, flag
     `auto_block_no_answer`) is default ON (2026-10-29): four failures with no answer

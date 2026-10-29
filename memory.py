@@ -1263,8 +1263,11 @@ _RUNS_VERIFY_RE = re.compile(
     r"(?:(?:npx|pnpx|bunx|uvx|uv\s+run|poetry\s+run|pipenv\s+run|pdm\s+run|hatch\s+run"
     r"|python\d*(?:\.\d+)?\s+-m|py\s+-m)\s+)?(?:\./)?" + _VERIFY_CMD_RE.pattern, re.I)
 
-# Optional model-based extractor (flag memory_fact_extractor, default off; the
-# hub installs it). `fn(request, reply) -> [str]`, run OFF the caller's thread.
+# Optional model-based extractor (flag memory_fact_extractor, default ON since
+# 2026-10-29; the hub installs it). `fn(request, reply) -> [str]`, run OFF the
+# caller's thread. An extractor with a true `wants_known` is called as
+# `fn(request, reply, known=[str])` and may also return {"text", "replaces"}
+# (see _run_extractor).
 _FACT_EXTRACTOR = None
 
 
@@ -1460,14 +1463,18 @@ def _receipt_suffix(receipt):
 
 
 def harvest_facts(session_id, request="", reply="", project_dir=None, tools=(),
-                  results=(), receipt=None):
+                  results=(), receipt=None, model_pass=True):
     """File the durable facts of a finished turn (see above). Returns the
     facts it filed. Never raises.
 
     `results`: the turn's OBSERVED tool results (parser tool_result events or
     evidence rows) -- the only source of "Commands verified to work here".
     `receipt`: the receipt file those results were written to; the commands
-    fact names it."""
+    fact names it.
+    `model_pass`: False runs the pattern harvest only, never the optional
+    model extractor. The /v1 path passes False and starts the model pass
+    itself, once per FINISHED exchange (extract_facts), instead of on every
+    hop of a tool loop."""
     filed = []
     try:
         scope = project_key(project_dir) if project_dir else session_id
@@ -1490,27 +1497,141 @@ def harvest_facts(session_id, request="", reply="", project_dir=None, tools=(),
                                    HARVEST_COMMANDS, "; ", by=by,
                                    suffix=_receipt_suffix(receipt)):
             filed.append(COMMANDS_FACT_PREFIX + "; ".join(cmds))
-        extractor = _FACT_EXTRACTOR
-        enabled = getattr(extractor, "enabled", None)
-        if extractor is not None and callable(enabled) and not enabled():
-            extractor = None              # switched off: no thread at all
-        if extractor is not None and (request or reply):
-            threading.Thread(target=_run_extractor,
-                             args=(extractor, scope, request, reply, project_dir),
-                             kwargs={"by": by},
-                             daemon=True, name="memory-facts").start()
+        if model_pass:
+            _start_model_pass(scope, request, reply, project_dir, by)
     except Exception:                                            # noqa: BLE001
         _log.debug("[memory] harvest failed", exc_info=True)
     return filed
 
 
+def _start_model_pass(scope, request, reply, project_dir, by=None):
+    """Start the optional model extractor on memory's own daemon thread.
+    True when a thread was started. Never raises, never waits."""
+    extractor = _FACT_EXTRACTOR
+    enabled = getattr(extractor, "enabled", None)
+    if extractor is not None and callable(enabled) and not enabled():
+        extractor = None              # switched off: no thread at all
+    if extractor is None or not (request or reply):
+        return False
+    threading.Thread(target=_run_extractor,
+                     args=(extractor, scope, request, reply, project_dir),
+                     kwargs={"by": by},
+                     daemon=True, name="memory-facts").start()
+    return True
+
+
+def extract_facts(session_id, request="", reply="", project_dir=None):
+    """The MODEL pass alone, for one finished exchange: the user's
+    instruction and the agent's final reply to it. Same scope and `by` as
+    harvest_facts (project scope when a folder is known). Runs on memory's
+    own daemon thread; True when it was started. Never raises."""
+    try:
+        scope = project_key(project_dir) if project_dir else session_id
+        if not scope:
+            return False
+        by = session_id if project_dir else None
+        return _start_model_pass(scope, request, reply, project_dir, by)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[memory] model pass not started", exc_info=True)
+        return False
+
+
+# UPDATES, NOT ONLY APPENDS. An extractor that declares `wants_known` (the
+# hub's, flag memory_fact_updates) is shown the facts already remembered and
+# may return {"text": new, "replaces": <one of those facts, verbatim>}: the
+# older fact is removed and the new one filed, so "we switched from pnpm to
+# npm" does not leave both "use pnpm" and "use npm" in the project's memory.
+# A restatement of a known fact (same words once labels, case and
+# punctuation are ignored) is not filed twice. A plain extractor (no
+# `wants_known`) keeps the old behaviour exactly.
+KNOWN_FOR_EXTRACTOR = 15
+_FACT_LABEL_RE = re.compile(r"^(?:user preference|decision|decided|note|constraint)\s*:\s*",
+                            re.I)
+
+
+def _norm_fact(text):
+    """A fact reduced for the duplicate test: its label ("Decision:",
+    "User preference:") dropped, case folded, punctuation and spacing
+    ignored. Word ORDER is kept: "use pnpm, not npm" is not "use npm, not
+    pnpm"."""
+    t = _FACT_LABEL_RE.sub("", " ".join(str(text or "").split()))
+    return " ".join(re.sub(r"[^\w]+", " ", t.casefold()).split())
+
+
+def _rolling(fact):
+    return fact.startswith((FILES_FACT_PREFIX, COMMANDS_FACT_PREFIX))
+
+
+def known_facts(scope, limit=KNOWN_FOR_EXTRACTOR):
+    """The newest `limit` facts of a scope an extractor may be shown (the
+    rolling file/command lists are left out: they are merged, never
+    replaced)."""
+    facts = [f for f in get(scope).get("facts") or [] if isinstance(f, str)]
+    return [f for f in facts if not _rolling(f)][-max(0, int(limit)):]
+
+
+def _is_known_restatement(scope, text):
+    n = _norm_fact(text)
+    if not n:
+        return False
+    return any(_norm_fact(f) == n
+               for f in get(scope).get("facts") or [] if isinstance(f, str))
+
+
+def supersede_fact(scope, old, new, project_dir=None, by=None):
+    """File `new` in place of the stored fact `old` (verbatim text). `old`
+    is removed only when it is still stored and is not a rolling list; `new`
+    is filed either way (deduplicated). Returns remember_fact's result."""
+    new = " ".join((new or "").replace("\x00", " ").split())[:MAX_FACT_CHARS]
+    if not new:
+        return False
+    old = " ".join(str(old or "").split())
+    if old and old != new and not _rolling(old):
+        with _LOCK:
+            mem = get(scope)
+            facts = [f for f in mem.get("facts") or [] if isinstance(f, str)]
+            if old in facts:
+                facts.remove(old)
+                mem["facts"] = facts
+                meta = mem.get("fact_meta") if isinstance(mem.get("fact_meta"), dict) else {}
+                meta.pop(_fact_key(old), None)
+                mem["fact_meta"] = meta
+                _save(mem)
+                _log.info("[memory] a remembered fact was superseded by a newer one")
+    return remember_fact(scope, new, project_dir=project_dir, by=by)
+
+
+def _wants_known(extractor):
+    wk = getattr(extractor, "wants_known", None)
+    try:
+        return bool(wk() if callable(wk) else wk)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _run_extractor(extractor, scope, request, reply, project_dir, by=None):
     try:
-        facts = extractor(request or "", reply or "") or []
+        if not _wants_known(extractor):
+            facts = extractor(request or "", reply or "") or []
+            for f in list(facts)[:HARVEST_MAX_DECISIONS]:
+                if (isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS
+                        and not _looks_secret(f)):
+                    remember_fact(scope, f.strip(), project_dir=project_dir, by=by)
+            return
+        known = known_facts(scope)
+        facts = extractor(request or "", reply or "", known=list(known)) or []
         for f in list(facts)[:HARVEST_MAX_DECISIONS]:
-            if (isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS
+            old = None
+            if isinstance(f, dict):
+                old, f = f.get("replaces"), f.get("text")
+            if not (isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS
                     and not _looks_secret(f)):
-                remember_fact(scope, f.strip(), project_dir=project_dir, by=by)
+                continue
+            f = f.strip()
+            if isinstance(old, str) and old in known:
+                supersede_fact(scope, old, f, project_dir=project_dir, by=by)
+            elif not _is_known_restatement(scope, f):
+                remember_fact(scope, f, project_dir=project_dir, by=by)
     except Exception:                                            # noqa: BLE001
         _log.debug("[memory] fact extractor failed", exc_info=True)
 
