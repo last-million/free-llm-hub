@@ -671,11 +671,75 @@ def _env_text(goal, who):
     return _clip_text(out, ENV_BLOCK_CHARS) if isinstance(out, str) else ""
 
 
-def plan_system(goal, managed=False, helpers=None):
+# ONE HELPER PER TARGET (2026-10-29; app.py section "MULTI PER TARGET", flag
+# `multi_per_target`): when an authorized-testing goal works on two or more
+# targets of the folder's scope card, the planner is asked for ONE phase per
+# target plus one final merge phase (multitarget.plan_ask / fit_plan), and each
+# target phase's worker gets ONLY its own target's block -- scope, open findings,
+# board tasks, the last state of its notes file. Registered by app.py:
+#   names_fn(project_dir, goal) -> [target name] (two or more) or []
+#   block_fn(project_dir, target or None, names, goal) -> str
+# Unregistered, or [] = no target = every prompt and plan exactly as before.
+TARGET_BLOCK_CHARS = 1500
+_TARGET_HOOKS = {"names": None, "block": None}
+
+
+def set_target_source(names_fn, block_fn):
+    _TARGET_HOOKS["names"] = names_fn if callable(names_fn) else None
+    _TARGET_HOOKS["block"] = block_fn if callable(block_fn) else None
+
+
+def _targets_for(project_dir, goal):
+    """The targets a run of `goal` in `project_dir` works on: two or more names,
+    or []. Never raises."""
+    fn = _TARGET_HOOKS["names"]
+    if fn is None:
+        return []
+    try:
+        got = fn(project_dir, goal or "")
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] target lookup failed (planned as before): %s", exc)
+        return []
+    names = []
+    for n in got or ():
+        n = " ".join(str(n or "").split())[:80]
+        if n and n.lower() not in {x.lower() for x in names}:
+            names.append(n)
+    return names[:MAX_AGENTS - 2] if len(names) >= 2 else []
+
+
+def _target_block(run, agent):
+    """The target block of one worker's prompt ("" for a run with no targets):
+    a target phase gets its own target's state, any other phase the list of
+    targets. Read fresh at every prompt, so a retry or a resumed run sees what
+    the earlier attempts left (notes file, findings, board)."""
+    names = list(getattr(run, "targets", None) or ())
+    fn = _TARGET_HOOKS["block"]
+    if len(names) < 2 or fn is None:
+        return ""
+    try:
+        out = fn(run.project_dir, getattr(agent, "target", None), names, run.goal)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return _clip_text(out, TARGET_BLOCK_CHARS) if isinstance(out, str) else ""
+
+
+def _target_plan_ask(targets):
+    if not targets:
+        return ""
+    try:
+        import multitarget              # lazy: this module stays a leaf at import
+        return multitarget.plan_ask(targets, REVIEW_TITLE)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def plan_system(goal, managed=False, helpers=None, targets=None):
     """The planner's system prompt for `goal` ({modes} still unfilled): the
     base prompt with the number of helpers that can run at once, plus the
     micro-task ask for a sizeable goal, the visual-decision ask for a web/UI
-    goal and the THIS MACHINE block for an app build."""
+    goal, the per-target ask when `targets` names two or more, and the THIS
+    MACHINE block for an app build."""
     try:
         n = int(helpers) if helpers else _concurrency()
     except Exception:                                            # noqa: BLE001
@@ -690,6 +754,8 @@ def plan_system(goal, managed=False, helpers=None):
             base += _WEB_PLAN_ASK
     except Exception:                                            # noqa: BLE001
         pass
+    if targets:
+        base += _target_plan_ask(targets)
     env = _env_text(goal, "planner")
     return base + ("\n" + env + "\n" if env else "")
 
@@ -825,6 +891,10 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=(), notes=None):
             row["files"] = files
         if p.get("parallel") is True or str(p.get("parallel")).lower() == "true":
             row["parallel"] = True
+        # The target a per-target plan gave this phase (only when present).
+        target = " ".join(str(p.get("target") or "").split())[:80]
+        if target:
+            row["target"] = target
         out.append(row)
     return merge_handoffs(out, notes=notes) if len(out) >= 1 else []
 
@@ -845,6 +915,8 @@ _ACTS_RE = re.compile(
 
 
 def _looks_only(phase):
+    if phase.get("target"):
+        return False                # a target's own phase ("Research portal") stays
     title = str(phase.get("title") or "")
     return bool(_LOOK_ONLY_RE.search(title)) and not _ACTS_RE.search(title)
 
@@ -947,7 +1019,7 @@ class _Agent:
                  "receipt", "files", "free_check", "widen", "slop",
                  "parallel", "pair_session", "pair_state", "pair_summary",
                  "pair_error", "pair_started_at", "pair_ended_at", "label",
-                 "attempts", "last_failure")
+                 "attempts", "last_failure", "target")
 
     def __init__(self, index, phase):
         self.index = index
@@ -956,6 +1028,8 @@ class _Agent:
         # What added this phase when it is not one the planner wrote: the
         # run-end deploy check's ONE fix phase is "deploy_fix". None = planned.
         self.label = phase.get("label") or None
+        # The target this phase works on in a per-target run, else None.
+        self.target = phase.get("target") or None
         self.done_when = phase.get("done_when") or ""
         self.needs = list(phase.get("needs") or ())
         self.mode = phase.get("mode") or None
@@ -1061,6 +1135,8 @@ class _Agent:
         }
         if self.label:
             out["label"] = self.label
+        if self.target:
+            out["target"] = self.target
         if with_events:
             out["log"] = list(self.events)
         return out
@@ -1081,15 +1157,18 @@ class _Run:
                  "free_verdict", "search", "search_saved", "goal_brief",
                  "budget", "spent_fn", "budget_elapsed", "budget_walk_start",
                  "budget_note", "budget_reached", "deploy_check", "deploy",
-                 "deploy_fix_used", "env_block")
+                 "deploy_fix_used", "env_block", "targets")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=(), context="", default_mode=None,
                  design=None, check_report=None, free_verdict=None, search=None,
                  goal_brief="", budget=None, spent=None, deploy_check=None,
-                 env_block=""):
+                 env_block="", targets=()):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
+        # THE TARGETS of a per-target run (see set_target_source): two or more
+        # names, else []. Persisted, so a resume keeps each phase on its target.
+        self.targets = [str(t) for t in (targets or ()) if t][:MAX_AGENTS]
         # THE RUN-END DEPLOY CHECK (2026-10-10; app._dp_run_deploy_check):
         # `deploy_check(run) -> {ok, url, port, error, log_tail} | None` starts
         # the finished project through the preview and waits for an HTTP
@@ -1252,6 +1331,7 @@ class _Run:
             "deploy": dict(self.deploy) if isinstance(self.deploy, dict) else None,
             "deploy_fix_used": bool(self.deploy_fix_used),
             "env_block": self.env_block or "",
+            **({"targets": list(self.targets)} if self.targets else {}),
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -1275,6 +1355,7 @@ class _Run:
                    "files": [str(f) for f in (a.get("files") or ())
                              if isinstance(f, str)][:plan_check.MAX_FILES],
                    "label": a.get("label") if isinstance(a.get("label"), str) else None,
+                   "target": a.get("target") if isinstance(a.get("target"), str) else None,
                    **{k: a.get(k) or "" for k in BRIEF_FIELDS}}
                   for a in (row.get("agents") or ())
                   if isinstance(a, dict)]
@@ -1326,6 +1407,8 @@ class _Run:
             run.deploy = dep
         run.deploy_fix_used = bool(row.get("deploy_fix_used"))
         run.env_block = _clip_text(row.get("env_block") or "", ENV_BLOCK_CHARS)
+        run.targets = [str(t) for t in (row.get("targets") or ())
+                       if isinstance(t, str) and t][:MAX_AGENTS]
         saved = row.get("search")
         if isinstance(saved, dict) and isinstance(saved.get("log"), list):
             run.search_saved = {"posteriors": saved.get("posteriors") or {},
@@ -1552,6 +1635,12 @@ def _full_agent_prompt(run, agent):
     if gb:
         parts += ["THE GOAL BEHIND THIS WORK (keep every step serving it):",
                   gb, ""]
+    # ONE HELPER PER TARGET: this phase's own target (scope, findings, notes,
+    # board), or the list of targets for the final phase. Still an instruction.
+    # "" (not a per-target run) = the prompt is unchanged.
+    tb = _target_block(run, agent)
+    if tb:
+        parts += [tb, ""]
     # THE SHARED DESIGN (owner, 2026-10-04: "design, plan well in a perfect
     # architecture, then go"): helpers working at the same time build to the
     # same interfaces, and each knows which files are its own. Absent for a
@@ -1720,6 +1809,10 @@ def _fit_agent_prompt(run, agent, cap):
         lead += ["A PREVIOUS ATTEMPT AT THIS PHASE FAILED (reason: %s). Any partial work "
                  "it left is in the project folder. Do the whole phase this time, and "
                  "avoid whatever caused that failure." % agent.last_failure, ""]
+    # The target block is an instruction too (what to test, inside what scope).
+    tb = _target_block(run, agent)
+    if tb:
+        lead += [tb, ""]
     # The review's own per-phase verification lines are instructions (what to
     # fix, what to leave): keep them inline, as the full prompt does.
     lead += _review_verification_lines(run, agent)
@@ -2856,6 +2949,10 @@ def pair_eligible(run, agent, review=None):
             return False
         if agent is review or getattr(agent, "pair_state", None) or _is_review(run, agent):
             return False
+        if getattr(agent, "target", None):
+            # ONE helper per target: a second session on the same target would
+            # double the requests its program's rate limits allow.
+            return False
         return bool(getattr(agent, "parallel", False)
                     or len(getattr(agent, "files", None) or ()) >= PAIR_MIN_FILES)
     except Exception:                                            # noqa: BLE001
@@ -2873,6 +2970,9 @@ def _pair_prompt(run, agent):
         "WITH it, in your own session, on the SAME task:", "", agent.task, ""]
     if agent.done_when:
         lines += ["DONE WHEN (for the pair): " + agent.done_when, ""]
+    tb = _target_block(run, agent)
+    if tb:
+        lines += [tb, ""]
     lines += [
         "RULES (hard):",
         "- Read anything and review the lead's progress freely.",
@@ -3506,7 +3606,7 @@ def _plan_design(obj, phases):
 
 
 def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="",
-         out=None):
+         out=None, targets=None):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
 
     `out` (a dict, optional) receives "design" (the plan's design, {} for a
@@ -3536,7 +3636,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
 
     if manager is not None:
         try:
-            raw = manager(plan_system(goal, True).replace("{modes}", mode_list),
+            raw = manager(plan_system(goal, True, targets=targets).replace("{modes}", mode_list),
                           _with_context(goal, context, MANAGER_CONTEXT_CHARS))
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] manager planner raised: %s", exc)
@@ -3547,7 +3647,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
         if raw:
             _log.warning("[swarm] manager plan unreadable (%d chars); free planner "
                          "takes over", len(raw))
-    system = plan_system(goal).replace("{modes}", mode_list)
+    system = plan_system(goal, targets=targets).replace("{modes}", mode_list)
     goal = _with_context(goal, context, PLAN_CONTEXT_CHARS)
     ask = goal
     window = PLAN_ATTEMPT_SECONDS if bounds_on() else None
@@ -3846,7 +3946,7 @@ class _PlanMeter:
 
 
 def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="",
-            notes=(), max_phases=MAX_AGENTS, planned_in=0.0):
+            notes=(), max_phases=MAX_AGENTS, planned_in=0.0, targets=None):
     """The plan's DRY RUN, before any worker starts: (phases, design, report).
 
     plan_check.check_plan finds what the plan would get wrong and applies what
@@ -3876,7 +3976,8 @@ def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="
         ask = plan_check.replan_ask(_with_context(goal, context, PLAN_CONTEXT_CHARS),
                                     replan, fixed, design)
         try:
-            raw = _ask_planner(planner, _PLAN_SYSTEM.replace("{helpers}", str(_concurrency()))
+            raw = _ask_planner(planner, (_PLAN_SYSTEM.replace("{helpers}", str(_concurrency()))
+                                         + _target_plan_ask(targets))
                                .replace("{modes}", mode_list), ask,
                                DRY_RUN_SECONDS if bounded else None)
         except Exception as exc:                                 # noqa: BLE001
@@ -3901,6 +4002,26 @@ def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="
         if f.get("action") == "replan":        # fail open: run, but say so
             f["action"] = "warn"
     return fixed, design, report
+
+
+def _fit_targets(phases, targets, goal, planned):
+    """A planned run: one phase per target + the final merge phase
+    (multitarget.fit_plan). Phases the caller gave: only tagged with their
+    target. Fails open to `phases`."""
+    try:
+        import multitarget              # lazy: this module stays a leaf at import
+        if planned:
+            before = [p.get("title") for p in phases or ()]
+            out = clean_phases({"phases": multitarget.fit_plan(
+                phases, targets, goal, REVIEW_TITLE, max_phases=MAX_AGENTS)})
+            if [p.get("title") for p in out] != before:
+                _log.info("[swarm] per-target plan: %d targets, %d phases",
+                          len(targets), len(out))
+            return out or phases
+        return multitarget.annotate(phases, targets)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] per-target plan failed (planned as before): %s", exc)
+        return phases
 
 
 def _search_policy(search, run=None):
@@ -3947,11 +4068,16 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     meter = _PlanMeter(manager) if manager is not None else None
     info = {}
     planned_in = 0.0
+    # ONE HELPER PER TARGET (see set_target_source): [] = planned as before.
+    targets = _targets_for(project_dir, goal)
+    planned = phases is None
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
         plan_context = (gb + "\n\n" + context).strip() if gb else context
         extra = {"context": plan_context} if plan_context else {}
+        if targets:
+            extra["targets"] = targets
         t_plan = _mono()
         phases = plan(goal, planner, modes=modes,
                       manager=meter.ask if meter else None, out=info, **extra)
@@ -3963,6 +4089,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
                   "" if len(phases or ()) == 1 else "s")
     notes = list(info.get("notes") or ())
     phases = clean_phases({"phases": phases}, modes=modes, notes=notes) if phases else []
+    if targets:
+        phases = _fit_targets(phases, targets, goal, planned)
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
     design = info.get("design") or {}
@@ -3972,9 +4100,12 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     try:
         phases, design, report = dry_run(goal, phases, design, project_dir,
                                          planner=planner, modes=modes, context=context,
-                                         notes=notes, planned_in=planned_in)
+                                         notes=notes, planned_in=planned_in,
+                                         **({"targets": targets} if targets else {}))
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] plan dry run failed (run goes ahead): %s", exc)
+    if targets:
+        phases = _fit_targets(phases, targets, goal, planned)
     if review:
         phases = with_review(phases)
     if report is not None:
@@ -3989,7 +4120,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
                default_mode=default_mode, design=design, check_report=report,
                free_verdict=free_verdict, search=_search_policy(search),
                goal_brief=gb, budget=budget, spent=spent,
-               deploy_check=deploy_check, env_block=_env_text(goal, "worker"))
+               deploy_check=deploy_check, env_block=_env_text(goal, "worker"),
+               targets=targets)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

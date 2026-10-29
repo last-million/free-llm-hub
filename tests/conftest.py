@@ -393,6 +393,23 @@ def _team_notes_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _multi_per_target_off_unless_tested(request, monkeypatch):
+    """ONE HELPER PER TARGET (app `_mt_*`, flag `multi_per_target`) is default ON
+    (2026-10-29): a Multi run whose testing goal works on two or more targets of the
+    folder's scope card is planned one phase per target, and each worker prompt gets
+    a target block. Other test files pin plans and worker prompts byte for byte; off
+    here keeps them so. The feature's own file turns it on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_multi_per_target":
+        try:
+            import app
+            monkeypatch.setattr(app, "_mt_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _findings_check_off_unless_tested(request, monkeypatch):
     """THE FINDINGS CHECK (app, flag `findings_check`) is default ON (2026-10-29): a
     reply that claims a security finding is filed in a ledger under the state dir, may

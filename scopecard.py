@@ -24,12 +24,24 @@ closed to "nothing": an empty card, no hosts, no block).
   block_message(host, entry) -> str
   guard_stream(items, framing, check, ...)          SSE wrapper (see its docstring)
   Store(path)                                       scopes.json, atomic, bounded
+  targets(card) -> [{name, in, out, rules}]         the card's NAMED targets
+  render_target(card, name, max_chars) -> str       one target's scope note
 
 A CARD is {"in": [entry], "out": [entry], "rules": [rule]}; an entry is
 {"p": pattern, "kind": "program" | "owner-declared", "src": "message" | <file>}
 where a pattern is an exact host ("app.example.com"), a wildcard
 ("*.example.com": sub-hosts only, never the apex), an IP or a CIDR. A rule is
 {"t": text, "kind": ..., "src": ...}.
+
+SEVERAL TARGETS ON ONE CARD (2026-10-29). A scope text that names two or more
+programs / apps under their own headings ("## acme", "Program: acme",
+"App: shop.example.com", each followed by its own in/out lists or rules) gives
+each entry and rule it lists a "tg" (the target's name), and the card a
+"targets" list [{"name", "src"}] in the order they were declared. Entries
+written before the first target heading carry no "tg": they are shared by every
+target. A text with fewer than two target headings is read exactly as before
+(no "tg", no "targets"), so an old scopes.json loads unchanged. The scope guard
+and render() still read the whole card (the union of all targets).
 """
 import ipaddress
 import json
@@ -46,6 +58,8 @@ MAX_RULE_CHARS = 160
 MAX_TEXT = 200_000         # chars read from one source
 NOTE_MAX_CHARS = 800
 MAX_FOLDERS = 64           # cards kept in scopes.json
+MAX_TARGETS = 12           # named targets on one card
+TARGET_NAME_MAX = 60
 KINDS = ("program", "owner-declared")
 
 
@@ -388,26 +402,158 @@ def _pattern(host):
     return None
 
 
-def _add(card, lst, pattern, kind, src):
-    if pattern and len(card[lst]) < MAX_HOSTS and all(e["p"] != pattern for e in card[lst]):
-        card[lst].append({"p": pattern, "kind": kind, "src": src})
+def _clean_tg(tg):
+    """A stored target name, or None."""
+    if not isinstance(tg, str):
+        return None
+    tg = " ".join(tg.split())[:TARGET_NAME_MAX]
+    return tg or None
 
 
-def _add_rule(card, text, kind, src):
+def _add(card, lst, pattern, kind, src, tg=None):
+    # An entry is unique per (pattern, target): two programs may both list a
+    # host. A card with no named targets dedups exactly as before.
+    if pattern and len(card[lst]) < MAX_HOSTS and all(
+            e["p"] != pattern or e.get("tg") != tg for e in card[lst]):
+        e = {"p": pattern, "kind": kind, "src": src}
+        if tg:
+            e["tg"] = tg
+        card[lst].append(e)
+
+
+def _add_rule(card, text, kind, src, tg=None):
     t = " ".join(str(text or "").split()).strip(" -*:.;")
     if len(t) < 3:
         return
     if len(t) > MAX_RULE_CHARS:
         t = t[:MAX_RULE_CHARS - 3].rstrip() + "..."
     low = t.lower()
-    if len(card["rules"]) < MAX_RULES and all(r["t"].lower() != low for r in card["rules"]):
-        card["rules"].append({"t": t, "kind": kind, "src": src})
+    if len(card["rules"]) < MAX_RULES and all(
+            r["t"].lower() != low or r.get("tg") != tg for r in card["rules"]):
+        r = {"t": t, "kind": kind, "src": src}
+        if tg:
+            r["tg"] = tg
+        card["rules"].append(r)
+
+
+def _add_target(card, name, src):
+    name = _clean_tg(name)
+    if not name:
+        return
+    lst = card.setdefault("targets", [])
+    if len(lst) < MAX_TARGETS and all(t["name"].lower() != name.lower() for t in lst):
+        lst.append({"name": name, "src": src})
+
+
+# --------------------------------------------------------------------------- #
+# Several named targets in one text
+# --------------------------------------------------------------------------- #
+
+# "Program: acme", "App: shop.example.com", "Client - Globex". Not "Target:":
+# "Targets: a.example.com" has always been an in-scope list.
+_TARGET_LABEL_RE = re.compile(
+    r"^(?:program(?:me)?|app|application|web\s?app|site|website|project|client|engagement|"
+    r"product)(?:\s+name)?\s*[:\-–—]\s*(?P<name>\S.*)$", re.I)
+_MD_HEAD_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$")
+# Headings a program page carries that are never a target's name.
+_GENERIC_HEADS = frozenset((
+    "overview introduction intro about summary rewards reward bounties payouts payout "
+    "disclosure contact contacts faq notes details description eligibility reporting "
+    "submission submissions severity timeline legal terms updates changelog thanks "
+    "acknowledgements acknowledgments references resources general appendix background "
+    "context testing methodology findings report reports vulnerabilities vdp programs "
+    "programmes apps applications sites websites projects clients").split()) | {
+    "disclosure policy", "safe harbor", "safe harbour", "hall of fame", "response targets",
+    "response times", "known issues", "getting started", "vulnerability types", "bug bounty",
+    "how to report", "program details", "program overview"}
+_SCOPE_WORDS_RE = re.compile(r"\bin[- ]scope\b|\bout[- ]of[- ]scope\b", re.I)
+
+
+def _target_name(raw):
+    """A clean target name from a heading's text ("Program: Acme", "acme (program)",
+    "shop.example.com"), or None when it does not read as one."""
+    s = re.sub(r"[*_`\"]", "", str(raw or "")).strip().strip(":").strip()
+    m = _TARGET_LABEL_RE.match(s)
+    if m:
+        s = m.group("name").strip().strip(":").strip()
+    s = re.sub(r"\s*\((?:program(?:me)?|scope|target|app)\)\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s+(?:program(?:me)?|scope|targets?|assets?)$", "", s, flags=re.I).strip()
+    s = " ".join(s.split())
+    if not s or len(s) > TARGET_NAME_MAX or len(s.split()) > 4 or re.search(r"[,;|]", s):
+        return None
+    if s.lower() in _GENERIC_HEADS or not re.search(r"[a-z0-9]", s, re.I):
+        return None
+    if len(_hosts_with_pos(s)) > 1:
+        return None
+    return s
+
+
+def _target_heads(lines):
+    """{line index: target name} for the lines of `lines` that open a named
+    target, or {} when fewer than two DISTINCT targets are named (a single
+    program page reads exactly as it always did).
+
+    A markdown heading ("## acme") opens a target only when the part under it
+    (to the next heading of the same or a higher level) carries its own scope
+    section or an in/out-of-scope marker; a label line ("Program: acme") when
+    the part under it (to the next target line) names a host or a scope
+    section, or the name itself is a host. A scope heading ("## Out of scope")
+    is never a target."""
+    shapes = []                                   # (index, kind, level, name)
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or len(line) > 200:
+            continue
+        m = _MD_HEAD_RE.match(line)
+        if m:
+            if _heading(line)[0]:
+                continue
+            name = _target_name(m.group(2))
+            if name:
+                shapes.append((i, "md", len(m.group(1)), name))
+            continue
+        s = re.sub(r"^(?:[-+•>*_]\s*)+|[*_\s]+$", "", line).replace("**", "").replace("__", "")
+        if _TARGET_LABEL_RE.match(s) and not _heading(line)[0]:
+            name = _target_name(s)
+            if name:
+                shapes.append((i, "label", 0, name))
+    found = []                                    # (index, end, kind, name)
+    for n, (i, kind, level, name) in enumerate(shapes):
+        end = len(lines)
+        if kind == "md":
+            for j in range(i + 1, len(lines)):
+                mm = _MD_HEAD_RE.match(lines[j].strip())
+                if mm and len(mm.group(1)) <= level:
+                    end = j
+                    break
+        elif n + 1 < len(shapes):
+            end = shapes[n + 1][0]
+        block = [ln.strip() for ln in lines[i + 1:end] if ln.strip()]
+        if kind == "md":
+            ok = any(_heading(ln)[0] in ("in", "out") or _SCOPE_WORDS_RE.search(ln)
+                     for ln in block)
+        else:
+            ok = (_pattern(name) is not None
+                  or any(_heading(ln)[0] or _hosts_with_pos(ln) for ln in block))
+        if ok:
+            found.append((i, end, kind, name))
+    # A heading that holds other targets ("# Programs" over "## acme", "## globex")
+    # is a container, not a target.
+    heads = {i: name for i, end, kind, name in found
+             if not (kind == "md" and any(i < j < end for j, _e, _k, _n in found))}
+    if len({v.lower() for v in heads.values()}) < 2:
+        return {}
+    return heads
 
 
 def extract(text, kind=None, src="message"):
     """The scope card written in `text` (a program page, a SCOPE.md, a user
     message). Only what a scope section or an explicit marker says counts: a
-    host merely mentioned in prose is not scope. Never raises."""
+    host merely mentioned in prose is not scope. Never raises.
+
+    Two or more named targets (see _target_heads) tag what each one lists with
+    its name; the name of a target that is itself a host ("App: shop.example.com")
+    is in scope for that target."""
     card = empty()
     try:
         if not isinstance(text, str) or not text.strip():
@@ -415,28 +561,36 @@ def extract(text, kind=None, src="message"):
         text = text[:MAX_TEXT]
         kind = kind if kind in KINDS else detect_kind(text)
         src = str(src or "message")[:120]
-        section, blank = None, False
-        for raw in text.splitlines():
+        lines = text.splitlines()
+        heads = _target_heads(lines)
+        section, blank, tg = None, False, None
+        for i, raw in enumerate(lines):
             line = raw.strip()
             if not line:
                 blank = True
+                continue
+            if i in heads:
+                tg = _clean_tg(heads[i])
+                section, blank = None, False
+                _add_target(card, tg, src)
+                _add(card, "in", _pattern(tg), kind, src, tg)
                 continue
             hk, rest = _heading(line)
             if hk:
                 section, blank = hk, False
                 if rest:
-                    _take(card, rest, hk, kind, src)
+                    _take(card, rest, hk, kind, src, tg)
                 continue
             if blank and section and not _scopeish(line):
                 section = None
             blank = False
-            _take(card, line, section, kind, src)
+            _take(card, line, section, kind, src, tg)
     except Exception:                                            # noqa: BLE001
         return empty()
     return card
 
 
-def _take(card, line, section, kind, src):
+def _take(card, line, section, kind, src, tg=None):
     body = _clean(line)
     if not body:
         return
@@ -446,18 +600,18 @@ def _take(card, line, section, kind, src):
         pairs = _assign(clause, section)
         for host, lst in pairs:
             found_host = True
-            _add(card, lst, _pattern(host), kind, src)
+            _add(card, lst, _pattern(host), kind, src, tg)
         if section == "rules":
             continue
         if _RULE_RE.search(clause):
-            _add_rule(card, clause, kind, src)
+            _add_rule(card, clause, kind, src, tg)
     if section == "rules":
-        _add_rule(card, body, kind, src)
+        _add_rule(card, body, kind, src, tg)
     elif section == "out" and not found_host and re.search(r"[a-z]{3}", body, re.I) \
             and len(body) <= 100 and not _RULE_RE.search(body):
         # "Out of scope" lists issue types too (self-XSS, missing headers):
         # worth keeping as a rule line, never as a host.
-        _add_rule(card, "Out of scope: " + body, kind, src)
+        _add_rule(card, "Out of scope: " + body, kind, src, tg)
 
 
 def normalize(card):
@@ -471,11 +625,16 @@ def normalize(card):
                 if isinstance(e, dict) and isinstance(e.get("p"), str):
                     p = _pattern(e["p"])
                     k = e.get("kind") if e.get("kind") in KINDS else "program"
-                    _add(out, lst, p, k, str(e.get("src") or "message")[:120])
+                    _add(out, lst, p, k, str(e.get("src") or "message")[:120],
+                         _clean_tg(e.get("tg")))
         for r in card.get("rules") or ():
             if isinstance(r, dict) and isinstance(r.get("t"), str):
                 k = r.get("kind") if r.get("kind") in KINDS else "program"
-                _add_rule(out, r["t"], k, str(r.get("src") or "message")[:120])
+                _add_rule(out, r["t"], k, str(r.get("src") or "message")[:120],
+                          _clean_tg(r.get("tg")))
+        for t in card.get("targets") or ():
+            if isinstance(t, dict):
+                _add_target(out, t.get("name"), str(t.get("src") or "message")[:120])
     except Exception:                                            # noqa: BLE001
         return empty()
     return out
@@ -489,9 +648,11 @@ def merge(card, new):
         add = normalize(new)
         for lst in ("in", "out"):
             for e in add[lst]:
-                _add(out, lst, e["p"], e["kind"], e["src"])
+                _add(out, lst, e["p"], e["kind"], e["src"], e.get("tg"))
         for r in add["rules"]:
-            _add_rule(out, r["t"], r["kind"], r["src"])
+            _add_rule(out, r["t"], r["kind"], r["src"], r.get("tg"))
+        for t in add.get("targets") or ():
+            _add_target(out, t["name"], t["src"])
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -502,7 +663,60 @@ def drop_source(card, src):
     out = normalize(card)
     for lst in ("in", "out", "rules"):
         out[lst] = [e for e in out[lst] if e.get("src") != src]
+    if "targets" in out:
+        out["targets"] = [t for t in out["targets"] if t.get("src") != src]
+        if not out["targets"]:
+            del out["targets"]
     return out
+
+
+def targets(card):
+    """The card's targets as [{"name", "in", "out", "rules"}] (entries as in the
+    card). Named targets in the order they were declared; each also gets the
+    SHARED entries (written before any target heading). A card with no named
+    target is ONE unnamed target ({"name": ""}, the whole card); an empty card
+    has none. Never raises."""
+    try:
+        card = normalize(card)
+        names = [t["name"] for t in card.get("targets") or ()]
+        low = {n.lower() for n in names}
+        for lst in ("in", "out", "rules"):
+            for e in card[lst]:
+                tg = e.get("tg")
+                if tg and tg.lower() not in low:
+                    names.append(tg)
+                    low.add(tg.lower())
+        if not names:
+            if is_empty(card):
+                return []
+            return [{"name": "", "in": list(card["in"]), "out": list(card["out"]),
+                     "rules": list(card["rules"])}]
+        out = []
+        for name in names[:MAX_TARGETS]:
+            key = name.lower()
+
+            def mine(e, key=key):
+                tg = e.get("tg")
+                return not tg or tg.lower() == key
+            out.append({"name": name, "in": [e for e in card["in"] if mine(e)],
+                        "out": [e for e in card["out"] if mine(e)],
+                        "rules": [r for r in card["rules"] if mine(r)]})
+        return out
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _target_of(card, name):
+    """The targets() row of `name` (case-insensitive). On a card with no named
+    target, any name gets the one unnamed target (a host the goal named)."""
+    ts = targets(card)
+    if len(ts) == 1 and not ts[0]["name"]:
+        return ts[0]
+    key = " ".join(str(name or "").split()).lower()
+    for t in ts:
+        if t["name"].lower() == key:
+            return t
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -614,6 +828,26 @@ def render(card, max_chars=NOTE_MAX_CHARS):
     """The PROGRAM SCOPE note for `card`: deterministic (sorted, no clock), never
     longer than max_chars; "" for an empty card. OUT of scope is kept first and
     longest, the in-scope list and the rules give way first."""
+    return _render(card, max_chars, None)
+
+
+def render_target(card, name, max_chars=NOTE_MAX_CHARS):
+    """The scope note of ONE target of `card` (its own entries plus the shared
+    ones), same rules as render(); "" when the card does not know `name`. On a
+    card with no named target the whole card is that target's scope."""
+    try:
+        t = _target_of(card, name)
+        label = " ".join(str(name or "").split())[:TARGET_NAME_MAX]
+        if t is None or not label:
+            return ""
+        sub = {lst: [{k: v for k, v in e.items() if k != "tg"} for e in t[lst]]
+               for lst in ("in", "out", "rules")}
+        return _render(sub, max_chars, t["name"] or label)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _render(card, max_chars, target):
     try:
         card = normalize(card)
         if is_empty(card):
@@ -622,13 +856,18 @@ def render(card, max_chars=NOTE_MAX_CHARS):
         who = ("program rules and owner-declared" if len(kinds) > 1
                else "owner-declared: your own app" if kinds == {"owner-declared"}
                else "from the program")
-        head = "PROGRAM SCOPE for this project folder (%s). Check every host against it before any request." % who
+        if target is None:
+            head = "PROGRAM SCOPE for this project folder (%s). Check every host against it before any request." % who
+        else:
+            head = ("SCOPE OF TARGET %s (%s). Test only this target; check every host against it "
+                    "before any request." % (target, who))
         foot = ("A host not listed is NOT in the listed scope: confirm before testing it "
                 "(package registries and docs are fine). The hub blocks tool calls aimed at an "
                 "OUT-of-scope host.")
-        outs = sorted(_label(e) for e in card["out"])
-        ins = sorted(_label(e) for e in card["in"])
-        rules = [r["t"] for r in card["rules"]]
+        # A host two targets both list is shown once.
+        outs = sorted({_label(e) for e in card["out"]})
+        ins = sorted({_label(e) for e in card["in"]})
+        rules = list(dict.fromkeys(r["t"] for r in card["rules"]))
         room = max(0, int(max_chars) - len(head) - len(foot) - 3)
         lines = [head]
         if outs:

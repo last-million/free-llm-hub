@@ -18600,9 +18600,109 @@ def api_scope():
     card = scopecard.normalize(_scope_card_for(pd) or scopecard.empty())
     resp = jsonify({"project_dir": os.path.abspath(pd), "card": card,
                     "note": scopecard.render(card), "card_on": _scope_card_on(),
-                    "guard_on": _scope_guard_on()})
+                    "guard_on": _scope_guard_on(),
+                    "targets": [t["name"] for t in scopecard.targets(card) if t["name"]]})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# --------------------------------------------------------------------------- #
+# MULTI PER TARGET (2026-10-29)
+#
+# The owner tests several targets at once from one folder (several authorized
+# programs, or several of their own apps/sites). When a Multi run's goal is an
+# authorized-testing task (craft TARGET_TESTING matcher) and the folder's scope
+# card knows two or more targets (named targets, or two in-scope hosts the goal
+# names), swarm_windows plans ONE phase per target plus one final merge phase,
+# and each target phase's worker gets ONLY its own target block (multitarget.py):
+# its scope (scopecard.render_target), its findings from the ledger (filtered to
+# its hosts, with the proof still missing), its open board tasks, and the last
+# state of its notes file notes/<target>.md -- read fresh at every prompt, so a
+# retry, a "continue" or a later run in the same folder carries on from it.
+# Flag `multi_per_target` (default on); off = every plan and prompt as before.
+# Needs the scope card on (`scope_card`): no card, no targets.
+# --------------------------------------------------------------------------- #
+
+def _mt_on():
+    """Flag `multi_per_target` (default on); an unreadable config counts as off."""
+    try:
+        return bool(config.get_flag("multi_per_target", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _mt_mod():
+    return _optional_module("multitarget", ("plan_targets", "notes_map", "block", "overview",
+                                            "target_hosts"))
+
+
+def _mt_targets_for(project_dir, goal):
+    """swarm_windows' names hook: the targets a Multi run of `goal` in
+    `project_dir` works on (two or more), or []. Never raises."""
+    try:
+        if not project_dir or not _mt_on() or not _scope_card_on():
+            return []
+        mt = _mt_mod()
+        if mt is None or not craft.is_app_testing(goal or ""):
+            return []
+        card = _scope_refresh(project_dir, [])
+        if card is None:
+            card = _scope_card_for(project_dir)
+        if not card:
+            return []
+        names = mt.plan_targets(card, goal or "")
+        if names:
+            _log.info("[multi] one helper per target: %d targets", len(names))
+        return names
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _mt_read_notes(project_dir, rel):
+    """A target's notes file (inside the project, no link, bounded), or ""."""
+    dp = _dp_module()
+    mt = _mt_mod()
+    if dp is None or mt is None:
+        return ""
+    try:
+        root = os.path.realpath(project_dir)
+        text, _why = dp.safe_read_text(os.path.join(root, *rel.split("/")), root,
+                                       mt.NOTES_MAX_BYTES)
+        return text or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _mt_block_for(project_dir, target, names, goal):
+    """swarm_windows' block hook: ONE target's block for its worker (scope,
+    findings, last state of its notes file, open board tasks), or the list of
+    targets for a phase that is no target's. Never raises."""
+    try:
+        if not _mt_on():
+            return ""
+        mt = _mt_mod()
+        if mt is None:
+            return ""
+        nm = mt.notes_map(names)
+        key = {n.lower(): n for n in nm}.get(" ".join(str(target or "").split()).lower())
+        if not key:
+            return mt.overview(names)
+        card = _scope_card_for(project_dir) or scopecard.empty()
+        scope_text = scopecard.render_target(card, key, mt.SCOPE_CHARS)
+        hosts = mt.target_hosts(card, key)
+        led = _fc_ledger()
+        rows = led.rows(project_dir) if led is not None else []
+        try:
+            tasks = taskboard.default.tasks(project_dir=project_dir)
+        except Exception:                                        # noqa: BLE001
+            tasks = []
+        return mt.block(key, scope_text, rows, hosts, tasks,
+                        _mt_read_notes(project_dir, nm[key]), nm[key])
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+swarm_windows.set_target_source(_mt_targets_for, _mt_block_for)
 
 
 def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):

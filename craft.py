@@ -577,6 +577,16 @@ def is_web_ui(text):
     return isinstance(text, str) and bool(_WEB_UI_RE.search(text))
 
 
+def is_app_testing(text):
+    """True when `text` is an authorized-testing task (the TARGET_TESTING brief's
+    own matcher) and the `app_testing` skill is on."""
+    try:
+        return (isinstance(text, str) and skill_enabled("app_testing")
+                and bool(_TARGET_TESTING_RE.search(text)))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def plan_message():
     """The phased-plan instruction as a standalone system message.
 
