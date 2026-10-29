@@ -541,7 +541,9 @@ def test_the_note_rides_every_hop_of_upstream_chat_and_never_a_pipeline_stage(sc
     assert not any(str(m.get("content", "")).startswith("PROGRAM SCOPE") for m in sent_stage)
 
 
-def test_api_scope_returns_the_card(scope):
+def test_api_scope_returns_the_card(scope, monkeypatch):
+    # No control token: an earlier test on this worker may have created one.
+    monkeypatch.setattr(A.config, "get_control_token", lambda: None)
     (scope["proj"] / "SCOPE.md").write_text(PROGRAM, "utf-8")
     A._scope_refresh(str(scope["proj"]), [_env(scope["proj"])])
     r = A.app.test_client().get("/api/scope", query_string={"project_dir": str(scope["proj"])})

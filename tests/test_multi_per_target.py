@@ -441,7 +441,9 @@ def test_no_scope_card_means_no_split(world, monkeypatch):
     assert A._mt_targets_for("", GOAL) == []
 
 
-def test_api_scope_lists_the_targets(world):
+def test_api_scope_lists_the_targets(world, monkeypatch):
+    # No control token: an earlier test on this worker may have created one.
+    monkeypatch.setattr(A.config, "get_control_token", lambda: None)
     A._scope_refresh(str(world["proj"]), [])
     r = A.app.test_client().get("/api/scope", query_string={"project_dir": str(world["proj"])})
     assert r.status_code == 200 and r.get_json()["targets"] == ["acme", "globex"]

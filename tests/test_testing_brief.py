@@ -195,7 +195,9 @@ def test_it_is_a_builtin_skill_with_a_neutral_id():
     assert not re.search(r"bounty|security", "app_testing")
 
 
-def test_the_skills_api_lists_it():
+def test_the_skills_api_lists_it(monkeypatch):
+    # No control token: an earlier test on this worker may have created one.
+    monkeypatch.setattr(app.config, "get_control_token", lambda: None)
     r = app.app.test_client().get("/api/skills")
     assert r.status_code == 200
     ids = [b["id"] for b in r.get_json()["builtin"]]

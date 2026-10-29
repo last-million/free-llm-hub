@@ -8803,3 +8803,220 @@ no file, flag, setting or tool named with "bounty" or "security"; everything is 
   unrelated text that uses them (Anvil Works apps other than "anvil.works").
 
 Release-note: new: coding agents get real smart-contract tools through the hub -- installed-tool check, verified contract source, read-only chain queries, local forks and slither/aderyn reports -- plus a Solidity brief, in every CLI.
+
+## Any developer CLI, any MCP server (2026-10-29)
+
+Covered by `tests/test_toolscan.py` (46) and `tests/test_mcp_gateway.py` (45). Owner: the hub must
+work with ANY developer CLI and ANY MCP server (Shopify, Vercel, gh, Stripe, Supabase, Netlify,
+Firebase, Wrangler, AWS/gcloud, Docker, Terraform ...): models must know which tools exist and be
+able to use them, and an MCP server added once must be available everywhere.
+
+**CLI TOOLS HERE (`toolscan.py`, app `_ts_*`, flag `tool_scan`, default on).**
+- Data-driven list (`toolscan.TOOLS`, 21 tools): shopify, vercel, netlify, gh, stripe, supabase,
+  firebase, wrangler, aws, gcloud, az, heroku, railway, flyctl, docker, kubectl, terraform, pnpm, bun,
+  deno, uv. Native detection = `shutil.which` + ONE version call per installed tool (6 s), all on
+  threads; only the parsed version NUMBER is kept. WSL = one bash script per distro that is ALREADY
+  RUNNING (`wsl.exe -l --running -q`, at most 2): a scan never boots a WSL VM; a stopped distro keeps
+  its last result.
+- Login state ONLY where the vendor documents a non-interactive status command whose exit code
+  separates logged in / out (read 2026-10-29, cited per tool in the code): `gh auth status`, `vercel
+  whoami`, `netlify status --json`, `wrangler whoami --json`, `aws sts get-caller-identity` (254/255 =
+  network error = unknown), `az account show`, `heroku auth:whoami`, `railway whoami`, `fly auth
+  whoami --json`. NOT used because they exit 0 when logged out: plain `netlify status`, plain
+  `wrangler whoami`, `gh auth status --json`, `firebase login:list`. Unknown (no documented exit code):
+  shopify, stripe, supabase, firebase, gcloud; no login concept: docker, kubectl, terraform, pnpm,
+  bun, deno, uv. The status command's OUTPUT IS NEVER READ (natively DEVNULL, in WSL >/dev/null): only
+  the exit code becomes True / False; a timeout or crash is None ("unknown").
+- Cached `TTL` 600 s, refreshed in the background (`snapshot(wait=0)` never waits; the Multi planner
+  waits up to 5 s for the first scan). `block(snap, max_chars=350)`: "CLI TOOLS HERE: gh (logged in),
+  vercel (not logged in: ask the user to run `vercel login`), docker; in WSL Ubuntu: supabase. Run them
+  non-interactively (...); never run an interactive login yourself, ask the user." Deterministic and
+  bounded: long login asks and the long tail shrink before any tool is dropped ("+N more").
+  `rows(snap)` gives the dashboard each tool's one-line non-interactive hint (from the vendor docs).
+- Where it goes: (1) the craft brief (Build brief file + /v1 opening turns) through a NEW craft slot
+  `craft.set_tools_source`, shipped next to the machine block and DROPPED FIRST when a brief would
+  cross `BRIEF_CEILING_CHARS` (`craft._fit_extras`: tools, then machine), so it can never cost the
+  machine block its place; (2) Multi planner + worker prompts: `_ts_env_block` replaces
+  `_dp_env_block` as `swarm_windows`' env source -- machine block first, tools block in what is left of
+  `ENV_BLOCK_CHARS` (700); (3) `_ts_apply_note` in `_upstream_chat` right after `_apply_goal_note`:
+  one system note on the opening turn of a TOOL-CARRYING conversation, never on a continuation, a
+  compaction request or a `_no_craft` stage, and skipped when any message already carries the marker
+  (so a hop carries the block exactly once).
+
+**THE MCP GATEWAY (`mcpgateway.py`, app `_gw_*`, flag `mcp_gateway`, default on; an unreadable config
+counts as OFF).**
+- The owner registers stdio servers (command + args + env) or streamable-HTTP servers (url + optional
+  bearer token) in the hub; their tools are re-exposed through the hub's own `POST /mcp` as
+  `<server>__<tool>` (sanitized to `[A-Za-z0-9_-]`, at most 45 characters so `mcp__free-llm-hub__` +
+  the name fits a 64-character limit; a truncated or colliding name gets a hash, deterministically).
+  Every CLI and Build/Multi session that has the hub's MCP entry gets them -- no per-CLI config write.
+- `hub_mcp.add_tool_provider(list, call)`: a generic hook (`_with_extra_tools` in tools/list,
+  `_dispatch_call` in tools/call). The hub's own tools always win: an extra tool with a built-in name
+  is never listed nor called; a provider that raises never breaks the endpoint.
+- tools/list is answered from a per-server CACHE (persisted in `state_dir()/mcp-gateway-tools.json`,
+  keyed by a signature of the server's shape, never of its secret values), so a connecting CLI never
+  waits for or spawns anything. It is refreshed when the owner adds/updates a server (background), on
+  every start of a server, and on `notifications/tools/list_changed`.
+- stdio: started lazily (first call or the owner's Add), JSON-RPC over stdin/stdout, server->client
+  requests answered (`ping` ok, everything else -32601) so a server never hangs; at most `MAX_PROCS`
+  (4) at once (the least recently used IDLE one makes room; all busy = a plain tool error); stopped as
+  a whole process tree (Windows `taskkill /T` only while it still runs, POSIX its own session's group)
+  after `IDLE_TTL` (600 s) by one reaper thread, on removal and at hub exit (atexit). A `.cmd`/`.bat`
+  target (npx on Windows) refuses arguments with cmd.exe metacharacters. The child gets the hub's
+  environment minus the hub's port vars, plus the owner's env.
+- HTTP: https, or http to loopback only; no credentials in the URL; `Authorization: Bearer`,
+  `Mcp-Session-Id` kept; JSON or SSE answers; REDIRECTS ARE NEVER FOLLOWED (a redirect would carry the
+  token to another host -- a test with two local servers proves the token never arrives).
+- Calls: `INIT_TIMEOUT` 90 s, `CALL_TIMEOUT` 120 s, output capped at 60 000 characters (non-text items
+  over the cap become a note), every failure a TOOL error (`isError`) the model can read; a dead stdio
+  server or a dropped HTTP session gets one fresh start.
+- Secrets: env VALUES and the token are encrypted at rest (secretstore, under `config["mcp_gateway"]`,
+  outside `providers` like the GitHub token, so migrations' key fingerprint never counts them), never
+  logged, never returned: a server is shown with its env KEY names, `has_token`, args with secret-
+  looking values masked and the URL without its query string. Secrets belong in env / the token
+  field, not in args (args are stored as typed).
+- Routes (token + dashboard header gated like every `/api/*`; README route count 200 -> 203):
+  `GET /api/mcp-gateway` (servers, running, catalog, the CLI scan; `?rescan=1` starts a fresh scan),
+  `POST /api/mcp-gateway` (add/update; needs `confirm: true`; 403 `disabled` while the flag is off;
+  on update an env value left "" and a token left out keep the stored ones, `clear_token: true`
+  removes it), `POST /api/mcp-gateway/delete {name}` (stops it; works with the flag off).
+- Dashboard: "Shared MCP servers (every CLI)" inside `#lifecycle-mcp`: list + Remove, the catalog
+  (a click FILLS the form, nothing runs until the owner ticks "I trust this server" and saves), an add
+  form (name, command or URL, password fields for the token and env), and "Developer CLIs on this
+  computer". textContent only, theme tokens only (`mcp-gateway-css` / `mcp-gateway-js` blocks).
+- CATALOG (each read on the vendor's own docs/repo 2026-10-29, `source` field): Shopify Dev MCP
+  (`npx -y @shopify/dev-mcp@latest`), GitHub (`https://api.githubcopilot.com/mcp/`, PAT bearer),
+  Supabase (`https://mcp.supabase.com/mcp`, PAT bearer), Stripe (`https://mcp.stripe.com`, agent API
+  key bearer; Stripe refuses full-access secret keys from December 2026), Cloudflare docs
+  (`https://docs.mcp.cloudflare.com/mcp`, no auth), Cloudflare API (`https://mcp.cloudflare.com/mcp`,
+  API token bearer), Netlify (`npx -y @netlify/mcp`, optional `NETLIFY_PERSONAL_ACCESS_TOKEN`),
+  Firebase (`npx -y firebase-tools@latest mcp`, the user's firebase login), Playwright
+  (`npx @playwright/mcp@latest`), Context7 (`https://mcp.context7.com/mcp`, optional key), AWS
+  Knowledge (`https://knowledge-mcp.global.api.aws`, no account), Terraform (`docker run -i --rm
+  hashicorp/terraform-mcp-server`), Neon (`https://mcp.neon.tech/mcp`, API key bearer), Linear
+  (`https://mcp.linear.app/mcp`, API key bearer). Left out: Vercel's and Sentry's servers (OAuth only;
+  this gateway sends a bearer token at most) and every package the official pages did not name.
+
+**Tests / fences.** `tests/conftest.py::_tool_scan_and_gateway_off_unless_tested` (immediately before
+`_reset_quiet_tables`): `_ts_on` / `_gw_on` and `toolscan.ENABLED` off for every other file (briefs,
+prompts and tools/list byte for byte), and for EVERY file a fence -- toolscan's default runner and
+mcpgateway's default spawn / HTTP refuse AND record, and the test fails at teardown (a scan runs on
+worker threads where a raised error alone would be swallowed); every gateway process is stopped after
+each test. The gateway tests run a fake stdio MCP server the test writes (a python script) through an
+injected spawn, a fake HTTP transport, and two LOCAL http.servers (redirect, SSE).
+
+**Limits, said plainly.**
+- Login checks for gh, aws, heroku, railway, vercel and fly make a read-only network call; they run at
+  most once per scan (every 10 minutes while the hub is used). "Not logged in" can also mean the
+  check failed for another reason the exit code does not separate (gh exits 1 for an invalid token
+  too). Version and login commands of CLIs installed through nvm inside WSL are found through
+  `bash -lic`, like wslpath; not measured on every distro.
+- The fly exit code was read as "an error path" in its source, not as a specific number.
+- No OAuth: OAuth-only remote servers cannot be added. A server whose tool list changes is re-read
+  only when it says so or is restarted. Args are stored as typed (not encrypted): put secrets in env.
+- tools/list carries at most 128 tools per server; descriptions are cut at 1024 characters and a
+  schema over 20 000 characters is replaced by a permissive one. Third-party tool descriptions are
+  shown to models as the server wrote them (the owner chose to trust the server).
+- Not live-verified: no real CLI and no real MCP server was run for this change; the gateway was
+  proven against the fake server and fake/local HTTP only.
+
+Release-note: new: the hub now tells every model which developer CLIs are installed and logged in, and MCP servers you add once in the hub (Shopify, GitHub, Supabase, Stripe, Cloudflare and more) reach every connected CLI.
+
+## One Multi helper per target (2026-10-29)
+
+Covered by `tests/test_multi_per_target.py` (hermetic: synthetic targets on
+example.com / example.net / example.org hosts, temp scope store, findings ledger and
+task board, fake planner / spawn / run_turn; the one file where the conftest fixture
+`_multi_per_target_off_unless_tested` leaves the feature on).
+
+Owner: when several targets are tested at once (several authorized programs, or several
+of the owner's own apps/sites), Multi must run ONE helper per target, each knowing only
+its own scope, its own open findings and what was already done, and a later run must
+continue each target from where it stopped. Before this, one Multi run saw one folder
+card (the union of every program) and a planner free to split the work any way, so a
+helper could mix scopes and nothing remembered per target what was done.
+
+- **Several targets on one scope card** (`scopecard.py`). A scope text that names two
+  or more targets under their own headings -- a markdown heading (`## acme`) whose part
+  holds its own in/out-of-scope section or marker, or a label line (`Program: acme`,
+  `App: shop.example.com`, `Client - Globex`; not `Target:`, which has always been an
+  in-scope list) whose part names a host or a scope section, or whose name is itself a
+  host -- tags each entry and rule it lists with `"tg": <name>`, and the card gets
+  `"targets": [{"name", "src"}]` in declared order. A heading that holds other targets
+  (`# Programs` over `## acme`, `## globex`) is a container, not a target; generic
+  program-page headings (Overview, Rewards, Disclosure, FAQ...) never are. Entries
+  written before the first target heading carry no tag: they are SHARED by every
+  target. A name that is a host is in scope for its target. Fewer than two target
+  headings = the text is read exactly as before (no `tg`, no `targets`), so an old
+  `scopes.json` loads unchanged. New: `targets(card) -> [{name, in, out, rules}]` (own +
+  shared entries; a card with no named target = ONE unnamed target `{"name": ""}`, an
+  empty card = `[]`) and `render_target(card, name, max_chars)` ("SCOPE OF TARGET ...").
+  Entries dedup per (pattern, target); `normalize` / `merge` / `drop_source` / `Store`
+  carry the tags; `render()` and the scope guard still read the whole card (a host two
+  targets both list is shown once). `GET /api/scope` gains `targets` (names).
+- **Which runs split** (`app._mt_targets_for`, registered with
+  `swarm_windows.set_target_source`, called once in `swarm_windows.start` for every
+  entry point: Build/CLI Multi, REST, MCP, heartbeat): the goal is an authorized-testing
+  task (`craft.is_app_testing`: the TARGET_TESTING matcher with skill `app_testing` on),
+  the scope card is on (`scope_card`; the folder's scope files are re-read through
+  `_scope_refresh`, rate-limited as before), and `multitarget.plan_targets(card, goal)`
+  names two or more: with 2+ named targets, the ones the goal names when it names 2+,
+  none when it names exactly one (that is one target's work), all of them when it names
+  none; with no named target, the in-scope hosts the goal names when there are 2+. At
+  most 8 targets. No card, no testing goal, one target = planned exactly as before (no
+  I/O for a non-testing goal).
+- **The plan** (`multitarget.plan_ask` appended to `plan_system(..., targets=)`, also on
+  the dry run's re-ask): ONE phase per target -- `"title"` = the target name exactly,
+  `"target"`, `"parallel": true`, `"needs": []`, `"files"` = that target's own notes file
+  only -- then ONE last phase titled "Review and finish" that merges the results into
+  `notes/summary.md` (per target: proven findings, unverified leads, what remains).
+  `multitarget.fit_plan` (before AND after the dry run; idempotent) enforces it: a plan
+  with exactly one phase per target keeps its tasks (title forced to the name, a target
+  never needs another target, a setup phase that needs no target is kept), the planner's
+  own merge phase is replaced by the hub's final phase; any other plan is replaced by the
+  hub's own per-target plan (each task = "Work ONLY on the target X for this goal: ...").
+  The final phase IS the review phase (`_is_review`), so a "continue" re-runs it after a
+  re-done target and `with_review` adds no second one. A target phase is never folded
+  into its follower (`_looks_only`), and never gets a PAIR co-pilot (`pair_eligible`):
+  one helper per target, never a second session doubling the requests a program's rate
+  limits allow -- `"parallel": true` is kept in the phase only because the owner's spec
+  asks for it. Phases a caller passes explicitly are only tagged (`multitarget.annotate`).
+  Notes files: `notes/<slug>.md`, unique per run (`notes_map`: collisions get -2, -3...;
+  `notes/summary.md` is reserved for the merge).
+- **The worker prompt** (`swarm_windows._target_block`, after the goal brief and before
+  the design in `_full_agent_prompt`; inline in `_fit_agent_prompt`; in `_pair_prompt`):
+  a target phase gets ONLY its own block (`multitarget.block`, <= 1500 chars,
+  deterministic, no clock): "YOUR TARGET: X -- work ONLY on this target", its scope
+  (`render_target`, <= 560 chars), its findings from the findings ledger (rows whose host
+  its own in-scope entries cover -- a wildcard's apex counts for attribution -- open ones
+  first with the reason and the proof still missing, then proven ones), the LAST STATE of
+  its notes file (Remaining / Leads / Done from those headings or `- [ ]` / `- [x]`
+  checkboxes, else the file's tail), its open board tasks (title or detail naming the
+  target or one of its exact hosts), then how to keep notes: sections Done / Remaining /
+  Leads in its own file, a finding "unverified" until an observed request + response
+  proves it. Any other phase (the final merge, a setup phase) gets the list of targets
+  and their notes files. Read fresh at every prompt (`app._mt_block_for`: stored card,
+  `_fc_ledger().rows`, `taskboard.default.tasks`, the notes file read through
+  `deploy_perfect.safe_read_text` -- regular file inside the project, no link, <= 64 KB).
+- **Continue later.** `run.targets` and each phase's `target` are persisted (row /
+  from_row), so a "continue" (`resume`) or a boot resume re-runs only the unfinished
+  targets, each with its own block. A NEW run in the same folder for the same targets
+  plans the same per-target phases (same titles, so the board's title match re-uses each
+  target's task) and every worker reads its target's notes file, findings and board
+  tasks as they stand -- what was done, what remains.
+- **Flag** `multi_per_target` (`config.get_flag`, default on; an unreadable config counts
+  as off). Off, or no hooks registered, or the feature does not apply = planner prompt,
+  phases and worker prompts byte for byte as before (pinned by a test comparing runs).
+- **Limits, said plainly.** A goal that does not read as testing to the TARGET_TESTING
+  matcher ("check acme and globex", "continue where we stopped" in a NEW run) is not
+  split; a "continue" in the same conversation resumes the per-target run instead. One
+  line per target ("acme: a.example.com, b.example.com" inside one In scope list) is not
+  read as targets -- headings or label lines are needed. The scope guard and the per-hop
+  PROGRAM SCOPE note still use the whole card, not the worker's own target (a host OUT of
+  scope for one program and IN scope for another is blocked for both). A finding whose
+  target names only a path (no host) is shown under no target. The final merge phase is
+  titled "Review and finish", not "Summary". Free planners often ignore the ask; then the
+  hub's own per-target tasks replace the planner's (the planner's tailoring is lost). Not
+  run against a live hub or a real CLI.
+
+Release-note: new: when you test several programs or apps at once, Multi now gives each one its own helper that knows only that target's scope, findings and notes, and a later run picks each target up where it stopped.

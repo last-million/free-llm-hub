@@ -759,6 +759,9 @@ def test_the_background_verdict_runs_off_the_request_thread_on_another_family(fc
 
 def test_api_findings_lists_the_ledger_and_is_token_gated(fc, monkeypatch):
     _check(_conv(fc["project"], XSS_REPLY, tools=[REFLECT]))
+    # No control token configured for the first half (an earlier test on this worker may
+    # have created one); the gate is checked explicitly below.
+    monkeypatch.setattr(A.config, "get_control_token", lambda: None)
     client = A.app.test_client()
     r = client.get("/api/findings", query_string={"project_dir": fc["project"]})
     assert r.status_code == 200
