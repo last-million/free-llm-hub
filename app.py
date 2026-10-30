@@ -42712,7 +42712,13 @@ def _ends_with_announcement(text):
         return False
 
 
-_ANNOUNCE_HOLD_S = 10.0   # longest the peek holds a short reply to see if it ends as a bare announcement
+# Longest the peek holds a short reply to see if it ends as a bare announcement (still
+# capped by what the peek itself may wait). MEASURED 2026-10-30 02:19 UTC (codex,
+# `coding`): a g4f relay took 18-23 s to stream a 189-char reply ending "I'll start with
+# Box, Arc, Live Nation, and A&F to read their published scope lists." -- the 10 s hold ran
+# out first, the stream was committed unjudged and the codex turn ended on it. Holding a
+# short reply until it is whole costs no time to finish: it is shown when complete.
+_ANNOUNCE_HOLD_S = 45.0
 
 
 def _announce_possible(text):
@@ -42758,17 +42764,22 @@ def _announce_pending(text):
         return False
 
 
+_ANNOUNCE_RETRIES = 2   # bare-announcement replies per request that walk the chain on
+
+
 def _announce_skip_spent(kind):
-    """ONE retry per request for a reply that only announced its action: the
-    first such reply walks the chain on (kind "announced"); a second one in
-    the same request is served, so a pool that keeps announcing cannot burn
-    the whole deadline. False for any other kind. Never raises."""
+    """_ANNOUNCE_RETRIES retries per request for a reply that only announced its
+    action: those walk the chain on (kind "announced"); the next one in the same
+    request is served, so a pool that keeps announcing cannot burn the whole
+    deadline. It was ONE until 2026-10-30: with several relays that announce, the
+    second one ended the user's turn. False for any other kind. Never raises."""
     if kind != "announced":
         return False
     try:
-        if getattr(g, "hub_announce_skipped", False):
+        used = int(getattr(g, "hub_announce_skips", 0) or 0)
+        if used >= _ANNOUNCE_RETRIES:
             return True
-        g.hub_announce_skipped = True
+        g.hub_announce_skips = used + 1
     except Exception:                                            # noqa: BLE001
         pass
     return False

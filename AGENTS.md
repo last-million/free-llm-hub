@@ -9353,3 +9353,33 @@ Covered by `tests/test_relay_injection_rest.py` (36, hermetic: fake chains, the 
   - Not verified against a live relay.
 
 Release-note: fix: a free relay that tells its model to stop using tools is now set aside for tool work right away, so agents stop halting after one step.
+
+## A slow relay's "I'll do it" no longer ends a codex turn (2026-10-30)
+
+Covered by `tests/test_peek_holds_short_replies.py`. Owner, codex: "I ask him to do something
+and he says he will do it but he does nothing and he stops."
+
+- **MEASURED** (codex rollout + the hub's Activity rows, 2026-10-30 02:19 UTC, codex model
+  `coding`): the turn was served on its FIRST hop, no retry, by `g4f/...:claude-opus-4.7`, which
+  took 18-23 s to stream a 189-char reply ending "I'll start with Box, Arc, Live Nation, and A&F to
+  read their published scope lists." No tool call, so codex ended the turn.
+- **The detector was not the problem**: `_ends_with_announcement`, `_announce_possible` and
+  `_looks_like_announced_action` all return True on that exact text. The PATH let it through: the
+  stream peek holds a short tool-turn reply until it is whole (see "A short reply that ends on
+  'Let me check ...' is not committed (2026-10-25)"), but only for `_ANNOUNCE_HOLD_S`, which was
+  10 s. The slow relay outlasted it, the hold was dropped and the stream committed unjudged (the
+  existing `test_the_hold_is_time_bounded` pins exactly that fallback).
+- **Fix.** `_ANNOUNCE_HOLD_S` 10 -> 45 s, still capped by what the peek itself may wait (the
+  `ann_until` formula is unchanged), so a request cannot hang on it; a short reply is shown when
+  whole instead of token by token, which costs no time to finish. And `_ANNOUNCE_RETRIES` = 2: two
+  bare-announcement replies in one request walk the chain on and only a third is served
+  (`_announce_skip_spent` now counts in `g.hub_announce_skips`; it was a single boolean, so with
+  several announcing relays the SECOND one ended the turn).
+- **Limits.** A reply longer than `_ANNOUNCE_MAX_CHARS` (400) that ends on an announcement is
+  still committed as it streams and never judged; so is one that outlasts the peek's own wait.
+  Once a stream is committed the hub has no way to continue a terminal CLI's turn (the Build page
+  has the stall auto-continue; terminal CLIs do not). Not done, an option for later: end such a
+  committed tool-turn stream with the protocol's retryable failure (the broken-stream endings)
+  so the CLI itself retries, bounded per conversation.
+
+Release-note: fix: when a slow free model says "I'll do it" and stops without doing anything, the hub now catches it and gives the turn to another model instead of letting your CLI stop.

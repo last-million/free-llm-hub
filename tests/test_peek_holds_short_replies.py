@@ -147,3 +147,42 @@ def test_an_intent_in_the_middle_is_not_the_end():
     # reported having done it
     assert A._ends_with_announcement(
         "Let me check the file. Checked: the bug is on line 12, fixed.") is False
+
+# --------------------------------------------------------------------------- #
+# A slow relay's short announcement (MEASURED 2026-10-30 02:19 UTC, codex `coding`):
+# g4f claude-opus-4.7 took 18-23 s for this 189-char reply; the 10 s hold ran out,
+# the stream was committed unjudged and the codex turn ended on it.
+# --------------------------------------------------------------------------- #
+CODEX_0219 = ("You're right \u2014 I haven't acted yet. Let me check HackerOne program pages "
+              "now for unauth-testable targets.\nI'll start with Box, Arc, Live Nation, and "
+              "A&F to read their published scope lists.")
+
+
+def _slow(pieces, gap):
+    import time as _t
+    for f in _frames(pieces):
+        _t.sleep(gap)
+        yield f
+
+
+def test_the_measured_codex_reply_is_an_announcement():
+    assert A._ends_with_announcement(CODEX_0219) is True
+
+
+def test_the_hold_outlasts_a_slow_relay():
+    assert A._ANNOUNCE_HOLD_S >= 30
+
+
+def test_a_reply_dribbled_within_the_hold_is_judged(monkeypatch):
+    monkeypatch.setattr(A, "_ANNOUNCE_HOLD_S", 3.0)
+    status, _buf = A._peek_until_content(_slow(_cut(CODEX_0219, 20), 0.12), 5, check=_check())
+    assert (status, A._take_nonanswer_kind()) == ("nonanswer", "announced")
+
+
+def test_two_announcements_walk_on_and_the_third_is_served():
+    with A.app.test_request_context():
+        assert A._ANNOUNCE_RETRIES == 2
+        assert A._announce_skip_spent("announced") is False      # 1st: next model
+        assert A._announce_skip_spent("announced") is False      # 2nd: next model
+        assert A._announce_skip_spent("announced") is True       # 3rd: served
+        assert A._announce_skip_spent("empty") is False          # other kinds untouched

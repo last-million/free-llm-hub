@@ -546,14 +546,17 @@ def test_an_announcement_followed_by_its_tool_call_is_served(hub, proto, lead):
 
 
 @pytest.mark.parametrize("proto", ["responses", "messages", "chat"])
-def test_the_announcement_retry_happens_once_per_request(hub, proto):
-    """p1 and p2 both only announce: p1 is retried on p2 ONCE, p2's reply is
-    served, p3 is never tried -- a pool that keeps announcing cannot eat the
-    whole deadline."""
+def test_the_announcement_retry_is_bounded_per_request(hub, proto):
+    """p1, p2 and p3 all only announce: p1 and p2 walk on (the budget is
+    _ANNOUNCE_RETRIES = 2 since 2026-10-30), p3's reply is served and p4 is
+    never tried -- a pool that keeps announcing cannot eat the whole deadline."""
+    assert A._ANNOUNCE_RETRIES == 2
+    hub.state["chain"] = [("p1", "m1"), ("p2", "m2"), ("p3", "m3"), ("p4", "m4")]
     hub.state["script"] = {
         "p1": lambda s: _Resp(lines=list(_token_lines(ANNOUNCE))),
         "p2": lambda s: _Resp(lines=list(_token_lines("Let me check big1.txt now."))),
-        "p3": lambda s: pytest.fail("the announcement retry is once per request")}
+        "p3": lambda s: _Resp(lines=list(_token_lines("I'll read big1.txt next."))),
+        "p4": lambda s: pytest.fail("the announcement retry is bounded per request")}
     r = _post(hub, proto, True, "What is the last line of big1.txt?")
-    assert hub.state["calls"] == ["p1", "p2"]
-    assert "Let me check big1.txt now." in _text_of(proto, r.get_data(as_text=True), True)
+    assert hub.state["calls"] == ["p1", "p2", "p3"]
+    assert "I'll read big1.txt next." in _text_of(proto, r.get_data(as_text=True), True)
