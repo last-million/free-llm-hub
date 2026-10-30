@@ -41,6 +41,7 @@ class _RawHTTP:
         self.srv.listen(16)
         self.port = self.srv.getsockname()[1]
         self.accepted = 0
+        self.closed = 0                # connections the server has finished (its end closed)
         self._stop = False
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -82,6 +83,7 @@ class _RawHTTP:
                 c.close()
             except OSError:
                 pass
+            self.closed += 1
 
     def stop(self):
         self._stop = True
@@ -134,6 +136,14 @@ def test_a_shared_pool_discards_the_dropped_socket(raw_http):
         _post(url, sess).close()                   # conn pooled under t1
         before = raw_http.accepted
         t1.cancel("client gone")                   # shuts the pooled socket
+        # On Windows the dropped socket becomes visible to urllib3 (readable) only once
+        # the server has seen the shutdown and closed its end. Under a loaded parallel
+        # run the next post could beat that server thread and reuse the socket
+        # (WSAESHUTDOWN, 2026-10-30): a race in this test's own fake, not in the pool.
+        # Wait, bounded, for that precondition.
+        end = time.time() + 3
+        while time.time() < end and raw_http.closed < 1:
+            time.sleep(0.02)
         t2 = clientgone.Token("t2")
         clientgone.set_current(t2)
         r = _post(url, sess)                        # must reopen, not reuse

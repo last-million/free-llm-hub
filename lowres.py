@@ -99,7 +99,9 @@ def workers(default, m=None):
 # MEASURED cost. It never kills, suspends or loses a running helper: over
 # budget means "do not start the next one" (queued phases wait). Below a
 # critical floor it also lowers the OS priority of the hub's own worker
-# processes (only those carrying the CALVOUN_AGENT_TURN marker). Any error,
+# processes (only those carrying the CALVOUN_AGENT_TURN marker); on Linux /
+# macOS only a worker it can raise back later (see _can_restore_nice), and a
+# restore the OS refuses is kept and retried, never reported as done. Any error,
 # no psutil, a stale monitor or mode "off" = headroom() is None = the old
 # behaviour (no live limit at all).
 RESERVE_MIN_GB = 3.0
@@ -248,18 +250,206 @@ def _psutil_cpu():
     return max(0.0, total - own)
 
 
-def _psutil_priority(pids, low):
+LOW_NICE = 10                   # POSIX niceness a worker gets below the floor
+CAP_SYS_NICE = 23               # Linux capability bit (linux/capability.h)
+_ORIG_NICE = {}                 # (pid, create_time) -> niceness before the hub lowered it
+
+
+def _read_cap_eff(path="/proc/self/status"):
+    """The hub's effective capability mask on Linux, or None (other OS, any
+    error)."""
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    return int(line.split(":", 1)[1].strip(), 16)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _init_user_ns(path="/proc/self/uid_map"):
+    """False when the hub runs inside a non-initial Linux user namespace
+    (rootless containers): capabilities held there do not count for
+    setpriority, which the kernel checks against the initial namespace. True
+    for the full identity map, or when the map cannot be read (no user
+    namespaces)."""
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as f:
+            rows = [ln.split() for ln in f.read().splitlines() if ln.strip()]
+    except Exception:                                            # noqa: BLE001
+        return True
+    return rows == [["0", "0", "4294967295"]]
+
+
+def _rlimit_nice(proc):
+    """Soft RLIMIT_NICE of `proc` (Linux; the hub's own as a fallback, which a
+    child inherits), float('inf') for unlimited, None when this OS has none
+    (macOS, Windows) or it cannot be read."""
+    try:
+        import psutil
+        if hasattr(psutil, "RLIMIT_NICE") and hasattr(proc, "rlimit"):
+            soft = proc.rlimit(psutil.RLIMIT_NICE)[0]
+            return float("inf") if soft == psutil.RLIM_INFINITY or soft < 0 else soft
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NICE)[0]
+        return float("inf") if soft == resource.RLIM_INFINITY or soft < 0 else soft
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _can_restore_nice(proc, nice, geteuid=None, cap_eff=None, rlimit_nice=None,
+                      init_userns=None):
+    """True when the hub may later set `proc` back to niceness `nice` after
+    lowering it. A POSIX process may RAISE a niceness but not lower it again
+    (setpriority answers EACCES) without privilege. Linux (kernel can_nice):
+    CAP_SYS_NICE in the initial user namespace, or the process's RLIMIT_NICE
+    soft limit allowing that value (20 - nice <= rlim_cur) -- the uid alone
+    does not count (root in a default Docker container lacks CAP_SYS_NICE).
+    macOS / BSD (no capability set to read): root only, or an RLIMIT_NICE
+    where the OS has one. Every input is injectable (tests); unknown or any
+    error = False, so the worker is simply not lowered. Never raises."""
+    try:
+        caps = (cap_eff or _read_cap_eff)()
+        if caps is not None:
+            if caps & (1 << CAP_SYS_NICE) and (init_userns or _init_user_ns)():
+                return True
+        else:
+            ge = geteuid if geteuid is not None else getattr(os, "geteuid", None)
+            if ge is not None and ge() == 0:
+                return True
+        soft = (rlimit_nice or _rlimit_nice)(proc)
+        if soft is not None and 20 - int(nice) <= soft:
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _forget_pid(memo, pid, keep=None):
+    """Drop the memo entries of `pid`. With `keep` (this process's own key, its start
+    time known) only an OLDER process with that pid goes: an entry whose start time
+    could not be read may be this very process, so it stays."""
+    for k in [k for k in memo if k[0] == pid and k != keep
+              and (keep is None or k[1] is not None)]:
+        memo.pop(k, None)
+
+
+def _memo_key_for(memo, pid, ctime):
+    """The key the hub lowered `pid` under, tolerant of a start time read on one side
+    only (lowering vs restore): the exact key, else the pid's unread-time entry, else
+    -- the time unread now -- the pid's only entry. None when the hub never lowered it,
+    or when it cannot tell which entry is this process."""
+    if (pid, ctime) in memo:
+        return (pid, ctime)
+    if ctime is not None:
+        return (pid, None) if (pid, None) in memo else None
+    keys = [k for k in memo if k[0] == pid]
+    return keys[0] if len(keys) == 1 else None
+
+
+def _proc_gone(exc):
+    """The process no longer exists: nothing is left to lower or restore."""
+    try:
+        import psutil
+        if isinstance(exc, psutil.NoSuchProcess):
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return isinstance(exc, ProcessLookupError)
+
+
+def _posix_priority(pids, low, proc_factory=None, can_restore=None, memo=None):
+    """POSIX half of _psutil_priority: lower a worker to LOW_NICE only when the
+    hub can raise it back later, restore each to the niceness it had before. A
+    worker found at exactly LOW_NICE while the hub holds lowered workers is a
+    process one of them started (a child inherits its parent's niceness): it is
+    the hub's to give back too. Returns the pids it did not change. Never raises."""
+    pids = list(pids or [])
+    try:
+        if proc_factory is None:
+            import psutil
+            proc_factory = psutil.Process
+    except Exception:                                            # noqa: BLE001
+        return pids                                  # nothing could be changed
+    can_restore = can_restore or _can_restore_nice
+    memo = _ORIG_NICE if memo is None else memo
+    missed = []
+    for pid in pids:
+        try:
+            p = proc_factory(pid)
+            try:
+                ctime = p.create_time()
+            except Exception as e:                               # noqa: BLE001
+                if _proc_gone(e):
+                    raise
+                ctime = None
+            key = (pid, ctime)
+            if ctime is not None:
+                _forget_pid(memo, pid, keep=key)     # an older process with this pid is gone
+            mk = _memo_key_for(memo, pid, ctime)
+            if low:
+                if mk is not None:
+                    continue                         # lowered earlier, still the hub's to give back
+                cur = p.nice()
+                if cur >= LOW_NICE:
+                    # Already this low. At exactly LOW_NICE while the hub holds lowered
+                    # workers, it was started by one of them and inherited the level:
+                    # the hub's to give back, to the highest original niceness of the
+                    # workers it lowered (never above any of them). Niced lower by
+                    # someone else, or a level the hub may not set: left alone.
+                    base = max(memo.values()) if memo else None
+                    if (cur == LOW_NICE and base is not None and base < cur
+                            and can_restore(p, base)):
+                        memo[key] = base
+                    else:
+                        missed.append(pid)
+                    continue
+                if not can_restore(p, cur):
+                    missed.append(pid)               # could not be given back: never lowered
+                    continue
+                p.nice(LOW_NICE)
+                memo[key] = cur
+            else:
+                if mk is None:
+                    continue                         # the hub never lowered this process
+                p.nice(memo[mk])
+                memo.pop(mk, None)
+        except Exception as e:                                   # noqa: BLE001
+            if _proc_gone(e):
+                _forget_pid(memo, pid)
+                continue
+            missed.append(pid)
+    return missed
+
+
+def _psutil_priority(pids, low, posix=None, proc_factory=None, can_restore=None,
+                     memo=None):
+    """Lower (low=True) or restore the OS priority of the worker `pids`.
+
+    Returns the pids it could NOT change ([] = all done; a process that is gone
+    counts as done). Windows: BELOW_NORMAL / NORMAL exactly as before, never a
+    failure reported (a process's owner can always set it back to NORMAL).
+    POSIX (`posix`, default: not Windows): see _posix_priority -- an
+    unprivileged process cannot lower a niceness again, so a worker is lowered
+    only when the restore is possible, and a refused restore is reported."""
+    if posix is None:
+        posix = os.name != "nt"
+    if posix:
+        return _posix_priority(pids, low, proc_factory=proc_factory,
+                               can_restore=can_restore, memo=memo)
     import psutil
     for pid in pids:
         try:
             p = psutil.Process(pid)
-            if os.name == "nt":
-                p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if low
-                       else psutil.NORMAL_PRIORITY_CLASS)
-            else:
-                p.nice(10 if low else 0)
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if low
+                   else psutil.NORMAL_PRIORITY_CLASS)
         except Exception:                                        # noqa: BLE001
             continue
+    return []
 
 
 class Governor:
@@ -293,6 +483,7 @@ class Governor:
         self.cpu_hold = False
         self.low_prio = False
         self._low_pids = []
+        self.prio_unrestored = []      # lowered workers whose restore the OS refused
         self.nonhub_cpu = None
 
     # -- measurements ------------------------------------------------------
@@ -376,18 +567,52 @@ class Governor:
             self._hot_since = None
             self.cpu_hold = False
 
+    def _apply(self, pids, low):
+        """Run the priority hook; the set of pids it reports it did NOT change.
+        A hook that returns None (the old contract, tests' own fakes) = all
+        changed, i.e. the old behaviour."""
+        res = self._prio(pids, low)
+        if res is None:
+            return set()
+        try:
+            return set(res)
+        except Exception:                                        # noqa: BLE001
+            return set()
+
     def _priority(self, free_gb, pids):
         if mode() == "off":
             return
         try:
             if free_gb < CRITICAL_FREE_GB and pids:
-                self._prio(pids, True)
-                self.low_prio = True
-                self._low_pids = list(pids)
+                missed = self._apply(pids, True)
+                prev = set(self._low_pids)
+                # held low by the hub: what it lowered now or before, plus a
+                # worker whose restore was refused (still low, still to restore)
+                held = [p for p in pids if p not in missed or p in prev]
+                held += [p for p in self.prio_unrestored if p not in held]
+                self._low_pids = held
+                self.low_prio = bool(held)
             elif self.low_prio and free_gb >= RECOVER_FREE_GB:
-                self._prio(self._low_pids, False)
-                self.low_prio = False
-                self._low_pids = []
+                self._restore_locked()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _restore_locked(self):
+        """Give the held workers their priority back. A worker the OS refused
+        to restore stays held (low_prio stays True) and is tried again on a
+        later tick: the governor never reports a restore it did not get."""
+        missed = self._apply(self._low_pids, False)
+        left = [p for p in self._low_pids if p in missed]
+        self._low_pids = left
+        self.prio_unrestored = list(left)
+        self.low_prio = bool(left)
+
+    def restore_priority(self):
+        """The run ended: give the workers' priority back. Never raises."""
+        try:
+            with self._lock:
+                if self.low_prio:
+                    self._restore_locked()
         except Exception:                                        # noqa: BLE001
             pass
 
@@ -443,13 +668,9 @@ def _monitor_loop():
         except Exception:                                        # noqa: BLE001
             pass
         time.sleep(TICK_SECONDS)
-    # the run ended: give the workers' priority back
-    try:
-        if GOV.low_prio:
-            GOV._prio(GOV._low_pids, False)
-            GOV.low_prio = False
-    except Exception:                                            # noqa: BLE001
-        pass
+    # the run ended: give the workers' priority back (a refused restore stays
+    # held and is retried by the next run's ticks)
+    GOV.restore_priority()
 
 
 def status():

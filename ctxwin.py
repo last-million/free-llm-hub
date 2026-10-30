@@ -99,11 +99,17 @@ def _image_dims(raw):
                 return w, h
         if raw[:2] == b"\xff\xd8":
             i = 2
-            while i + 9 < len(raw):
+            # A SOF's dimension bytes are raw[i+5:i+9]: readable as soon as
+            # len(raw) >= i + 9, i.e. also when the last one is the last byte
+            # of the peeked buffer (image_tokens decodes only its head).
+            while i + 9 <= len(raw):
                 if raw[i] != 0xFF:
                     i += 1
                     continue
                 marker = raw[i + 1]
+                if marker == 0xFF:     # a fill byte before the marker
+                    i += 1
+                    continue
                 if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
                     i += 2
                     continue

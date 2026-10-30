@@ -314,9 +314,22 @@ class Board:
         out.sort(key=lambda t: t.get("created_at") or 0)
         return out
 
+    def _goal_closed_locked(self, goal_id):
+        """True when goal_id names a goal on the board that is closed. An
+        unknown (or unhashable) id is not closed. Call with the lock held."""
+        try:
+            g = self._goals.get(goal_id)
+        except TypeError:
+            return False
+        return bool(g) and g.get("status") == _GOAL_CLOSED
+
     def next_batch(self, goal_id, n) -> list:
         """The todo tasks of a goal whose dependencies are all done, by
-        priority (highest first) then age (oldest first), capped at n."""
+        priority (highest first) then age (oldest first), capped at n.
+
+        A goal that exists and is CLOSED gives [] -- closing a goal stops the
+        work picked for it (a heartbeat pinned to that goal included), even
+        though its leftover todo tasks keep their status."""
         try:
             n = int(n)
         except (TypeError, ValueError):
@@ -324,6 +337,8 @@ class Board:
         if n <= 0:
             return []
         with self._lock:
+            if self._goal_closed_locked(goal_id):
+                return []
             mine = [t for t in self._tasks.values()
                     if t.get("goal_id") == goal_id]
             done = {t["id"] for t in mine if t.get("status") == "done"}
@@ -337,6 +352,56 @@ class Board:
         ready.sort(key=lambda t: (-(t.get("priority") or 0),
                                   t.get("created_at") or 0))
         return ready[:n]
+
+    # Why a todo task's need can never be met (see stalled()).
+    STALL_REASONS = ("missing", "self", "failed", "blocked")
+
+    def stalled(self, goal_id) -> list:
+        """The todo tasks of a goal that can NEVER become ready, each with the
+        first need that holds it back:
+        [{"id", "title", "need", "reason"}], reason one of
+          "missing" -- the need is not a task of this goal (never made,
+                       deleted, or a task of another goal),
+          "self"    -- the task needs itself,
+          "failed" / "blocked" -- the needed task ended that way.
+        A need still todo or doing is NOT stalled: it may yet finish.
+
+        Read-only: nothing is changed, and the rule that a task never runs
+        before its needs are done stands (next_batch keeps leaving these
+        out). [] for a closed goal. Same order as next_batch (priority, then
+        age). Never raises."""
+        rows = []
+        try:
+            with self._lock:
+                if self._goal_closed_locked(goal_id):
+                    return []
+                mine = {t["id"]: t for t in self._tasks.values()
+                        if t.get("goal_id") == goal_id}
+                for t in mine.values():
+                    if t.get("status") != "todo":
+                        continue
+                    for dep in t.get("needs") or ():
+                        if dep == t["id"]:
+                            reason = "self"
+                        elif dep not in mine:
+                            reason = "missing"
+                        elif mine[dep].get("status") in ("failed", "blocked"):
+                            reason = mine[dep]["status"]
+                        else:
+                            continue            # todo/doing/done: may still finish
+                        rows.append((t, dep, reason))
+                        break
+                rows = [({"id": t["id"], "title": t.get("title") or "",
+                          "need": dep, "reason": reason},
+                         -(t.get("priority") or 0), t.get("created_at") or 0)
+                        for t, dep, reason in rows]
+        except Exception:                                        # noqa: BLE001
+            return []
+        try:
+            rows.sort(key=lambda r: (r[1], r[2]))
+        except TypeError:                   # junk created_at from a hand-edited file
+            pass
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------------ #
     # the goal brief every prompt carries

@@ -12031,8 +12031,9 @@ def _relay_walk_skip_on():
         return False
 
 
-def _note_relay_tool_fail(pid, model):
-    """One ConnectionError / non-answer from a relay server on a tool turn."""
+def _note_relay_tool_fail(pid, model, strikes=1):
+    """One ConnectionError / non-answer from a relay server on a tool turn.
+    `strikes` > 1 files that many at once (see _note_relay_injection)."""
     if _client_gone():
         return          # the client left: not the provider's failure
     if _local_net_failed(pid, model):
@@ -12045,10 +12046,55 @@ def _note_relay_tool_fail(pid, model):
         with _relay_tool_lock:
             row = [t for t in _relay_tool_fail.get(server, ())
                    if now - t <= _RELAY_TOOL_FAIL_TTL]
-            row.append(now)
+            row.extend([now] * max(1, int(strikes or 1)))
             _relay_tool_fail[server] = row[-10:]
     except Exception:                                            # noqa: BLE001
         pass
+
+
+# A RELAY THAT FEEDS ITS MODEL "STOP CALLING TOOLS" RESTS FOR TOOL TURNS (2026-10-30).
+# The hub strips a relay's tool-emulation instruction ("... do not claim or request another
+# function call.") from every non-system turn before a hop (_scrub_relay_injection), so a
+# reply that still carries it was written by a model that read it in its OWN relay's
+# context: that relay ends the agent loop after one step. answer_check.inspect flags such a
+# reply on relay hops ("relay_tool_injection", informational: the reply is served as it is);
+# ONE flag files _RELAY_TOOL_FAIL_LIMIT strikes on the tool-turn ledger _relay_tool_sick
+# reads, so the relay SERVER gets no relay slot in a tool chain for _RELAY_TOOL_FAIL_TTL
+# while another candidate is left. Chat turns are untouched. Without the scrub the sentence
+# could be copied from history, so nothing is filed while `scrub_relay_tool_injection` is
+# off. Flag `relay_injection_rest` (default on; off = byte-identical).
+def _relay_injection_rest_on():
+    try:
+        return (bool(config.get_flag("relay_injection_rest", True))
+                and bool(config.get_flag("scrub_relay_tool_injection", True)))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _note_relay_injection(pid, model, reasons):
+    """Rest a relay server whose reply carried the tool-emulation instruction (answer_check
+    reason "relay_tool_injection") for tool turns. Never for a direct provider, a client
+    that left or this computer's network failure. Never raises."""
+    try:
+        if "relay_tool_injection" not in (reasons or ()) or not _relay_injection_rest_on():
+            return
+        if _client_gone() or _local_net_failed(pid, model):
+            return
+        server = _relay_server_id(pid, model)
+        if not server:
+            return
+        was = _relay_tool_sick(pid, model)
+        _note_relay_tool_fail(pid, model, strikes=_RELAY_TOOL_FAIL_LIMIT)
+        if not was and _relay_tool_sick(pid, model):
+            _log.warning("[relay] %s fed its model a tool-emulation instruction ('do not "
+                         "request another function call'); skipping that backend on tool "
+                         "turns for %d min", server, int(_RELAY_TOOL_FAIL_TTL // 60))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+# answer_check reads the `relay_injection_rest` flag through this (it never imports config).
+answer_check.set_flag_source(lambda name, default=True: config.get_flag(name, default))
 
 
 # A relay hop that answers with its backend's KEY-BUDGET notice ("The API key used
@@ -16725,12 +16771,9 @@ def _scrub_empty_claims(msgs):
 # model flags it to the user as a prompt injection. The hub cannot reach inside the relay,
 # but it decides what the next model reads: this pass replaces the sentence in every
 # non-system turn with a short note.
-_RELAY_INJECTION_RE = re.compile(
-    r"(?:the\s+declared\s+function\s+has\s+now\s+been\s+executed\s+by\s+the\s+caller\s*\.?\s*)?"
-    r"treat\s+its\s+result\s+as\s+untrusted\s+data,?\s+answer\s+the\s+original\s+user\b"
-    r"[^.]{0,300}?function\s+call\s*\.?"
-    r"|the\s+declared\s+function\s+has\s+now\s+been\s+executed\s+by\s+the\s+caller\s*\.?",
-    re.I)
+# The signature lives in answer_check (RELAY_INJECTION_RE / has_relay_injection), which also
+# flags a relay reply that still carries it -- see _note_relay_injection.
+_RELAY_INJECTION_RE = answer_check.RELAY_INJECTION_RE
 _RELAY_INJECTION_NOTE = "[removed by the hub: an upstream relay's tool-emulation instruction]"
 
 
@@ -41074,6 +41117,10 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
                 if not v.get("ok", True) and not v.get("salvage"):
                     _note_relay_notice(check.get("pid"), check.get("model"),
                                        v.get("reasons"))
+                    # a junk reply that ALSO carried the relay's tool-emulation
+                    # instruction rests that relay for tool turns too
+                    _note_relay_injection(check.get("pid"), check.get("model"),
+                                          v.get("reasons"))
                     _note_lost_request(check.get("pid"), check.get("model"),
                                        v.get("reasons"), check.get("est"),
                                        bool(check.get("tools_offered")))
@@ -42955,6 +43002,10 @@ def _answer_gate(data, payload, has_tools, hop=None):
             tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"),
             last_prompt=_last_user_text_for_check(payload),
             relay=bool(hop) and _is_relay_pid(hop[0]))
+        if hop and len(hop) == 2:
+            # Informational: a relay that feeds its model "stop calling tools" rests for
+            # tool turns; the reply itself is judged below as usual.
+            _note_relay_injection(hop[0], hop[1], verdict.get("reasons"))
         if verdict.get("ok"):
             strikes = _answer_quality_strikes(verdict.get("reasons"))
             if strikes and hop and len(hop) == 2:
@@ -43006,6 +43057,7 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
                 relay=_is_relay_pid(pid))
             ok = v.get("ok", True)
             strikes = _answer_quality_strikes(v.get("reasons")) if ok else []
+            _note_relay_injection(pid, model, v.get("reasons"))    # tool-turn rest, see there
         # A stream that failed the gate degenerated: a junk strike, not a miss.
         _record_outcome(pid, model, ok, junk=not ok)
         if ok:
@@ -43336,6 +43388,10 @@ class _StreamAnswerGate:
                      else "nothing salvageable")
         if self._pid and self._model_id:
             _note_relay_notice(self._pid, self._model_id, self.reasons)
+            # cut for another reason, but the relay's tool-emulation instruction was
+            # in it too: _record_stream_outcome never runs for a cut stream, so file
+            # the tool-turn rest here
+            _note_relay_injection(self._pid, self._model_id, self.reasons)
             _note_lost_request(self._pid, self._model_id, self.reasons, self._req_est,
                                self._tools)
             try:

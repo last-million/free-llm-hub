@@ -6,7 +6,10 @@ a goal and starts ONE Multi run to work on them -- without the owner having to
 be there. A beat that cannot start cleanly (the owner is busy, the machine is
 short on RAM, the providers are rate-limited, or it is inside the owner's quiet
 hours) is SKIPPED with the reason recorded, and tried again on the next tick --
-never in a tight retry loop, never two beats of one schedule at once.
+never in a tight retry loop, never two beats of one schedule at once. A beat
+whose run then fails to start keeps its slot too, and is tried again no sooner
+than START_RETRY_SECONDS later. When no task is ready because todo tasks wait
+on a task that failed, is blocked or is missing, the skip reason says so.
 
 This module is pure and testable: the clock, the settings store, the "is the
 owner busy / is there RAM / are the providers ok" checks, the task board and
@@ -34,6 +37,16 @@ DEFAULT_BUDGET = {"seconds": 45 * 60, "tokens": 2_000_000, "calls": 400}
 DEFAULT_MAX_TASKS = 3
 KEEP_BEATS = 20            # how many past beats per schedule we remember
 TICK_SECONDS = 30.0        # how often the thread looks at the schedules
+# A beat whose run did not start keeps its slot (it is retried), but not
+# sooner than this after the failed attempt, so a permanent failure never
+# becomes a tight loop. Measured with the scheduler's own (injectable) clock.
+START_RETRY_SECONDS = 300
+REASON_CHARS = 240         # a recorded skip reason never grows past this
+_TITLE_CHARS = 80
+
+# stalled() reasons (taskboard.Board.STALL_REASONS) in plain words.
+_STALL_WHY = {"missing": "a missing task", "self": "itself",
+              "failed": "a failed task", "blocked": "a blocked task"}
 
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 _WEEKDAYS = [0, 1, 2, 3, 4]
@@ -276,6 +289,61 @@ def tasks_to_goal(tasks, sched=None):
     return head + "\n" + body
 
 
+def _short(text, limit):
+    """One line, at most `limit` characters ("..." when cut)."""
+    text = " ".join(str(text or "").split())
+    if len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return text
+
+
+def stalled_reason(rows):
+    """The skip reason for a beat that found no ready task while some todo
+    tasks wait on a need that can never finish (taskboard.Board.stalled()).
+    Names how many and the first one; bounded to REASON_CHARS. "" for none."""
+    rows = [r for r in (rows or ()) if isinstance(r, dict)]
+    if not rows:
+        return ""
+    first = rows[0]
+    title = _short(first.get("title"), _TITLE_CHARS) \
+        or _short(first.get("id"), 40) or "a task"
+    why = _STALL_WHY.get(first.get("reason"), "a task that cannot finish")
+    text = ("no ready tasks: %d task(s) wait on a failed, blocked or missing "
+            "task, first: %s (waits on %s)" % (len(rows), title, why))
+    return _short(text, REASON_CHARS)
+
+
+def _retry_words(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 60:
+        return "%d min" % (seconds // 60)
+    return "%d s" % seconds
+
+
+def start_failed_reason(error=None):
+    """The skip reason for a beat whose run did not start. `error` is at most
+    an exception CLASS name (never its message: it can carry paths, URLs or
+    keys). Bounded to REASON_CHARS."""
+    name = re.sub(r"[^A-Za-z0-9_.]", "", str(error or ""))[:60]
+    text = "could not start the run"
+    if name:
+        text += " (%s)" % name
+    text += "; trying again in %s" % _retry_words(START_RETRY_SECONDS)
+    return _short(text, REASON_CHARS)
+
+
+def start_retry_at(st, now):
+    """When a schedule whose last run failed to start may be tried again, or
+    None when it is not waiting. A failure stamped AFTER `now` (the clock
+    went back) is not waited out -- the next attempt re-stamps it."""
+    failed = (st or {}).get("start_failed_at")
+    if isinstance(failed, bool) or not isinstance(failed, (int, float)):
+        return None
+    if not (failed <= now < failed + START_RETRY_SECONDS):
+        return None
+    return failed + START_RETRY_SECONDS
+
+
 # --------------------------------------------------------------------------- #
 # the scheduler
 # --------------------------------------------------------------------------- #
@@ -369,18 +437,30 @@ class Scheduler:
                 continue
             if sid in self._inflight:                 # a beat of it is running
                 continue
+            if start_retry_at(st, now) is not None:   # its run just failed to start
+                continue
             reason = self._skip_reason(sched, now)
             tasks = None
             if reason is None:
-                tasks = self._collect_tasks(sched)
+                tasks, stalled = self._read_board(sched)
                 if not tasks:
-                    reason = "no tasks"
+                    reason = stalled_reason(stalled) or "no tasks"
             if reason is not None:
                 st["last_skip"] = {"at": now, "reason": reason}
                 out.append(("skip", sid, reason))
                 changed = True
                 continue
             beat = self._do_beat(sched, tasks, now)
+            if not beat.get("run_id"):
+                # The run did not start: keep the slot (last_beat_at untouched,
+                # so it stays due) and wait START_RETRY_SECONDS before trying.
+                reason = start_failed_reason(beat.get("error"))
+                st["start_failed_at"] = now
+                st["last_skip"] = {"at": now, "reason": reason}
+                out.append(("skip", sid, reason))
+                changed = True
+                continue
+            st.pop("start_failed_at", None)
             st["last_beat_at"] = now
             st["last_run_id"] = beat.get("run_id")
             st["last_result"] = beat.get("result")
@@ -410,22 +490,63 @@ class Scheduler:
             return "check failed"
         return None
 
+    @staticmethod
+    def _goal_id(tb, sched):
+        goal_id = sched.get("goal_id")
+        if not goal_id and sched.get("project_dir"):
+            goal = tb.goal_for(sched["project_dir"])
+            goal_id = goal.get("id") if isinstance(goal, dict) else goal
+        return goal_id or None
+
     def _collect_tasks(self, sched):
+        return self._read_board(sched)[0]
+
+    def _read_board(self, sched):
+        """(ready tasks, stalled rows). The stalled rows -- todo tasks waiting
+        on a need that can never finish (Board.stalled) -- are read only when
+        no task is ready; [] when the board has no stalled() or it fails."""
         try:
             tb = self._taskboard()
             if tb is None:
-                return []
-            goal_id = sched.get("goal_id")
-            if not goal_id and sched.get("project_dir"):
-                goal = tb.goal_for(sched["project_dir"])
-                goal_id = goal.get("id") if isinstance(goal, dict) else goal
+                return [], []
+            goal_id = self._goal_id(tb, sched)
             if not goal_id:
-                return []
+                return [], []
             batch = tb.next_batch(goal_id, sched.get("max_tasks") or DEFAULT_MAX_TASKS)
-            return list(batch or [])
+            batch = list(batch or [])
         except Exception as exc:                                 # noqa: BLE001
             self.log.warning("[heartbeat] could not read tasks: %s", exc)
-            return []
+            return [], []
+        if batch:
+            return batch, []
+        return batch, self._board_stalled(tb, goal_id) or []
+
+    def _board_stalled(self, tb, goal_id):
+        """Board.stalled(goal_id) as a list of dicts, or None when the board
+        has no such method or it fails. Never raises."""
+        try:
+            fn = getattr(tb, "stalled", None)
+            if not callable(fn):
+                return None
+            return [r for r in (fn(goal_id) or ()) if isinstance(r, dict)]
+        except Exception as exc:                                 # noqa: BLE001
+            self.log.warning("[heartbeat] could not read stalled tasks: %s", exc)
+            return None
+
+    def _stalled_count(self, sched):
+        """How many todo tasks of the schedule's goal wait on a need that can
+        never finish, for the status rows; None when that cannot be told."""
+        try:
+            tb = self._taskboard()
+            if tb is None or not callable(getattr(tb, "stalled", None)):
+                return None
+            goal_id = self._goal_id(tb, sched)
+            if not goal_id:
+                return 0
+            rows = self._board_stalled(tb, goal_id)
+            return None if rows is None else len(rows)
+        except Exception:                                        # noqa: BLE001
+            return None
 
     def _do_beat(self, sched, tasks, now):
         sid = sched.get("id")
@@ -433,9 +554,11 @@ class Scheduler:
         goal_text = tasks_to_goal(tasks, sched)
         self._inflight.add(sid)
         run_id = None
+        error = None
         try:
             run_id = self._start_run(sched, goal_text, tasks, budget)
         except Exception as exc:                                 # noqa: BLE001
+            error = type(exc).__name__
             self.log.warning("[heartbeat] beat of %s could not start: %s", sid, exc)
         finally:
             self._inflight.discard(sid)
@@ -447,7 +570,10 @@ class Scheduler:
             result = "could not start"
         self.log.info("[heartbeat] beat %s: %s (%d task%s) -> %s",
                       sid, result, len(ids), "" if len(ids) == 1 else "s", run_id)
-        return {"at": now, "tasks": ids, "run_id": run_id, "result": result}
+        beat = {"at": now, "tasks": ids, "run_id": run_id, "result": result}
+        if error:                       # only a failed start carries it
+            beat["error"] = error
+        return beat
 
     def _mark_tasks(self, tasks, run_id, sid):
         try:
@@ -479,6 +605,10 @@ class Scheduler:
             sid = sched.get("id")
             st = state.get(sid) or {}
             parsed = parse_when(sched.get("when"))
+            nd = next_due(parsed, now, st.get("last_beat_at"))
+            retry = start_retry_at(st, now)
+            if nd is not None and retry is not None and retry > nd:
+                nd = retry                    # waiting after a run that did not start
             rows.append({
                 "id": sid,
                 "when": sched.get("when"),
@@ -488,12 +618,15 @@ class Scheduler:
                 "max_tasks": sched.get("max_tasks"),
                 "budget": merge_budget(sched.get("budget")),
                 "valid": parsed is not None,
-                "next_due": next_due(parsed, now, st.get("last_beat_at")),
+                "next_due": nd,
                 "last_beat_at": st.get("last_beat_at"),
                 "last_run_id": st.get("last_run_id"),
                 "last_result": st.get("last_result"),
                 "last_skip": st.get("last_skip"),
                 "beats": list(st.get("beats") or [])[-5:],
+                # todo tasks of its goal waiting on a need that can never
+                # finish (None = the board cannot tell)
+                "stalled": self._stalled_count(sched),
             })
         return {"enabled": bool(self._enabled()), "schedules": rows}
 
