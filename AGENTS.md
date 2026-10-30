@@ -9691,3 +9691,28 @@ the hub's `--dangerously-bypass-approvals-and-sandbox` launch was involved.
   path. Older codex builds (top-level `tools`) are unaffected.
 
 Release-note: fix: Codex 0.165 can run commands, reach WSL and edit files through the hub again (the hub was dropping the tools the new Codex sends).
+
+## A relay that gags its model after one tool call: recognised in the model's own words (2026-10-30)
+
+Covered by `tests/test_relay_gag_paraphrase.py`. MEASURED right after the codex 0.165 fix: the real
+codex, through the live hub, was asked to run `wsl -e uname -s` and write the output to a file. The
+WSL command ran (one tool call, output "Linux"), then the turn ended without the file. Both turns were
+served by g4f `srv_mv57e8714aedb1a00bf8:poe/DeepSeek-V4.1-Flash-T`, whose leaked thinking said "The
+instruction says don't request another function call" -- the relay's tool-emulation gag, added inside
+the relay's OWN request (the hub scrubs it from everything it forwards). The existing detector only
+knew the relay's exact sentence, so this paraphrase benched nothing and the stopped reply was served.
+
+- `answer_check.RELAY_GAG_RE` / `has_relay_gag`: the exact sentence OR a negated "request another /
+  any more / a second function|tool call" or "function has been executed by the caller". inspect's
+  informational `relay_tool_injection` (relay hops only, flag `relay_injection_rest`) now uses it, so
+  one paraphrase benches that relay server for tool turns like the exact sentence. The scrub is
+  unchanged (it removes only the relay's own text).
+- codex: at the end of a `/v1/responses` stream, a RELAY reply with no tool call that carries the gag
+  (`_relay_gagged_reply`) gets the same retryable `response.failed` as a stopped announcement (shared
+  cap `_ANNOUNCE_STOP_RETRIES` per instruction, flag `announce_stop_retry`), after benching the relay,
+  so codex retries the turn on another model.
+- Limits: opencode / Claude Code get the bench (next requests avoid that relay) but not the retry of
+  the turn already served. A model that writes such a sentence on its own would bench its relay for
+  15 minutes. Only negated "request another ... call" wording is matched.
+
+Release-note: fix: when a free relay tells its model to stop after one tool call, Codex now retries the turn on another model, and that relay is set aside for tool work, so multi-step tasks (like running a WSL command and then writing a file) finish.

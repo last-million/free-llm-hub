@@ -1193,6 +1193,33 @@ def has_relay_injection(text):
         return False
 
 
+# The model's OWN WORDS for that instruction. MEASURED 2026-10-30 (the real codex 0.165
+# through the hub, served by g4f srv_mv57e8714aedb1a00bf8:poe/DeepSeek-V4.1-Flash-T): it
+# ran ONE tool call, then its leaked thinking said "The instruction says don't request
+# another function call" / "The instruction from the "caller" says ..." and it stopped
+# with the task half done. A model only writes this after its relay fed it the gag (the
+# hub scrubs the sentence from every turn it forwards), so it marks the relay like the
+# exact sentence does. Not part of the scrub (that removes only the relay's own text).
+RELAY_GAG_RE = re.compile(
+    r"\b(?:do\s*n[o'’]?t|never|not\s+to|must\s+not|should\s*n[o'’]?t|"
+    r"can\s*n?[o'’]?t|may\s+not)\s+(?:claim\s+or\s+)?request\s+"
+    r"(?:another|any\s+(?:more|other|further)|more|further|a\s+(?:second|new|further))\s+"
+    r"(?:function|tool)\s+calls?\b"
+    r"|\bfunction\s+has\s+(?:now\s+)?been\s+executed\s+by\s+the\s+caller\b",
+    re.I)
+
+
+def has_relay_gag(text):
+    """True when `text` carries the relay's tool-emulation instruction OR the model's own
+    paraphrase of it (RELAY_GAG_RE). Never raises."""
+    try:
+        if not isinstance(text, str):
+            return False
+        return has_relay_injection(text) or RELAY_GAG_RE.search(text) is not None
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # A config flag read, for the one check here that has a switch. app registers
 # config.get_flag (fn(name, default) -> bool); unregistered (tests, other processes) =
 # every flag at its default. A reader that raises counts as OFF (the old behaviour).
@@ -1883,7 +1910,7 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             result["reasons"].append("echoed_decimal")
         # Informational too, RELAY hops only: this relay feeds its model the instruction
         # to stop calling tools (see has_relay_injection). Flag `relay_injection_rest`.
-        if (relay and not partial and has_relay_injection(text)
+        if (relay and not partial and has_relay_gag(text)
                 and _flag("relay_injection_rest", True)):
             result["reasons"].append("relay_tool_injection")
         if not cuts:

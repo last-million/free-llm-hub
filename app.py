@@ -42764,6 +42764,21 @@ def _stopped_on_announcement(text):
         return False
 
 
+def _relay_gagged_reply(pid, text):
+    """A RELAY hop's reply that carries its relay's "do not request another function
+    call" instruction, or the model's own words for it (answer_check.has_relay_gag).
+    MEASURED 2026-10-30 (the real codex 0.165 through the hub): a g4f poe backend ran
+    ONE tool call, then its model quoted that gag in its thinking and ended the turn
+    with the task half done. Flags `relay_injection_rest` and `announce_stop_retry`.
+    Never raises."""
+    try:
+        if not pid or not _is_relay_pid(pid) or not _relay_injection_rest_on():
+            return False
+        return answer_check.has_relay_gag(text or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _announce_stop_allowed(instruction):
     """Spend one of this instruction's announce-stop retries; False when the flag is
     off, there is no instruction to key on, or its budget is spent. Never raises."""
@@ -53086,11 +53101,16 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
         for st in tools.values():
             if not st["name"]:
                 st["name"] = _infer_tool_name("".join(st["args"]), tool_defs) or ""
+        _gagged = _relay_gagged_reply(hop_pid, "".join(text_buf))
         if (hop_pid and tools_offered and not judged and stream_fin != "length"
                 and not cut_short[0] and not getattr(answer_gate, "cut", False)
                 and not any(st["name"] for st in tools.values())
-                and _stopped_on_announcement("".join(text_buf))
+                and (_gagged or _stopped_on_announcement("".join(text_buf)))
                 and _announce_stop_allowed(last_prompt or prompt_text or "")):
+            if _gagged:
+                # Its relay told the model to stop calling tools (answer_check.has_relay_gag):
+                # bench that relay server for tool turns, so the retry opens elsewhere.
+                _note_relay_injection(hop_pid, hop_model, ["relay_tool_injection"])
             # Announced a step and stopped (see _stopped_on_announcement): codex
             # retries a response.failed like a dropped stream and keeps nothing of
             # this reply (no output_item.done), and the pair is filed so the retry
