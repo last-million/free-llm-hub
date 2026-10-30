@@ -16709,6 +16709,93 @@ def _scrub_empty_claims(msgs):
         return msgs
 
 
+# --------------------------------------------------------------------------- #
+# AN UPSTREAM RELAY'S TOOL-EMULATION INSTRUCTION NEVER REACHES A MODEL
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-10-26 03:58-03:59 UTC: three codex sessions picked up the same text within one
+# minute -- first inside a sub-agent's reply returned by multi_agent_v1:wait_agent (a TOOL
+# RESULT), then in later user turns and in replies quoting it back. No part of it is in the
+# hub's source. It is the wording of a function-calling EMULATION layer (a relay handing tools
+# to a model without native tool calling; the same family as the relay sentence "The model
+# returned an invalid or undeclared tool request; no tool was executed."): written after each
+# tool result, it tells the model "do not claim or request another function call". In the
+# relay's own context that ends the agent loop after one step (the never-chains pattern);
+# once a reply quotes it or a sub-agent result carries it, it sits in the CLI's history and
+# EVERY later hop -- a native tool caller too -- reads it as an instruction, and a careful
+# model flags it to the user as a prompt injection. The hub cannot reach inside the relay,
+# but it decides what the next model reads: this pass replaces the sentence in every
+# non-system turn with a short note.
+_RELAY_INJECTION_RE = re.compile(
+    r"(?:the\s+declared\s+function\s+has\s+now\s+been\s+executed\s+by\s+the\s+caller\s*\.?\s*)?"
+    r"treat\s+its\s+result\s+as\s+untrusted\s+data,?\s+answer\s+the\s+original\s+user\b"
+    r"[^.]{0,300}?function\s+call\s*\.?"
+    r"|the\s+declared\s+function\s+has\s+now\s+been\s+executed\s+by\s+the\s+caller\s*\.?",
+    re.I)
+_RELAY_INJECTION_NOTE = "[removed by the hub: an upstream relay's tool-emulation instruction]"
+
+
+def _strip_relay_injection(text):
+    """`text` with the relay's tool-emulation instruction replaced by a short note, or the
+    SAME object when it has none (a cheap substring check skips the regex). Never raises."""
+    try:
+        if not isinstance(text, str) or ("caller" not in text and "untrusted" not in text):
+            return text
+        new, n = _RELAY_INJECTION_RE.subn(_RELAY_INJECTION_NOTE, text)
+        return new if n else text
+    except Exception:                                            # noqa: BLE001
+        return text
+
+
+def _scrub_relay_injection(msgs):
+    """`msgs` with an upstream relay's tool-emulation instruction removed from every user,
+    assistant and tool turn (string content or text parts) -> a new list, or `msgs` itself
+    when there is none. Never mutates its input. System messages (the CLI's and the hub's
+    own) are never touched, nor are tool_calls, ids or roles. Per hop like
+    _scrub_empty_claims: the CLI's own history is untouched and the replacement is
+    deterministic, so the provider's prefix cache stays valid. Flag
+    `scrub_relay_tool_injection` (default on); off = byte-identical. Fails open."""
+    try:
+        if not isinstance(msgs, list) or not config.get_flag("scrub_relay_tool_injection", True):
+            return msgs
+        out, n = None, 0
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant", "tool"):
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                new = _strip_relay_injection(c)
+                if new is c:
+                    continue
+                nm = {**m, "content": new}
+            elif isinstance(c, list):
+                parts, changed = [], False
+                for p in c:
+                    if isinstance(p, dict) and isinstance(p.get("text"), str):
+                        t = _strip_relay_injection(p["text"])
+                        if t is not p["text"]:
+                            p = {**p, "text": t}
+                            changed = True
+                    parts.append(p)
+                if not changed:
+                    continue
+                nm = {**m, "content": parts}
+            else:
+                continue
+            if out is None:
+                out = list(msgs)
+            out[i] = nm
+            n += 1
+        if out is None:
+            return msgs
+        if not _ctx_g("_scrub_relay_logged"):
+            _ctx_set("_scrub_relay_logged", True)
+            _log.info("[scrub] removed an upstream relay's tool-emulation instruction "
+                      "('do not claim or request another function call') from %d turn(s)", n)
+        return out
+    except Exception:                                            # noqa: BLE001
+        return msgs
+
+
 def _clear_old_results_for_hop(msgs, tools, no_craft=False):
     """This hop's messages with OLD tool results cleared to one line each
     (ctxwin.clear_old_tool_results) -> (messages, info).
@@ -18777,6 +18864,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # An earlier hop's "your message contains only a tool setup" reply must not be
         # what this model reads as the conversation so far (see _scrub_empty_claims).
         msgs = _scrub_empty_claims(msgs)
+        # An upstream relay's tool-emulation instruction ("do not claim or request another
+        # function call") must never reach a model: it ends the agent loop after one step
+        # and reads as a prompt injection (see _scrub_relay_injection).
+        msgs = _scrub_relay_injection(msgs)
         _nc = bool(payload.get("_no_craft"))
         if not _nc:
             # A CLI's own compaction request is the moment it forgets its whole
