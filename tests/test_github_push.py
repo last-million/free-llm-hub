@@ -2008,3 +2008,278 @@ def test_github_js_never_injects_server_strings_as_html():
     assert "ghSafeUrl" in js
     for code in ("unknown_project", "already_linked", "bad_link", "local_changes"):
         assert code in js, code
+
+
+# --------------------------------------------------------------------------- #
+# The project's OWN history is secret-scanned before it can be pushed, and a  #
+# .git FILE (gitdir:) is never followed. (Review fix 2026-10-30.)             #
+# --------------------------------------------------------------------------- #
+_HIST_KEY = "OPENAI_API_KEY=sk-" + "h" * 30 + "\n"
+
+
+def _project_with_history(tmp_path, commits, name="proj"):
+    """A project with its own .git: ``commits`` is a list of {path: text|None}
+    (None deletes the file), one commit each."""
+    proj = tmp_path / name
+    proj.mkdir()
+    _raw_git(str(proj), "init", "-q", "-b", "main")
+    for i, files in enumerate(commits):
+        for fn, body in files.items():
+            p = proj / fn
+            if body is None:
+                p.unlink()
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body, encoding="utf-8")
+        _raw_git(str(proj), "add", "-A")
+        _raw_git(str(proj), "commit", "-q", "-m", "c%d" % i)
+    return proj
+
+
+@requires_git
+def test_a_committed_env_in_the_projects_history_blocks_create(tmp_path):
+    proj = _project_with_history(tmp_path, [
+        {"README.md": "hi\n", ".env": _HIST_KEY},
+        {".gitignore": ".env\n"}])             # ignoring it later changes nothing
+    http = FakeHTTP()
+    gh, _c, bare = _gh(tmp_path, http=http)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    found = e.value.extra["findings"]
+    assert ".env" in [f["path"] for f in found]
+    assert all(f.get("history") for f in found if f["path"] == ".env")
+    assert any("git history" in f["detail"] for f in found)
+    assert not [c for c in http.calls if c["method"] == "POST"], \
+        "nothing may be created on GitHub when the history holds a secret"
+    assert _refs(bare) == ""
+
+
+@requires_git
+def test_a_secret_deleted_in_a_later_commit_still_blocks(tmp_path):
+    proj = _project_with_history(tmp_path, [
+        {"README.md": "hi\n", "src/config.js": "const k = '%s';\n" % ("sk-" + "q" * 30)},
+        {"src/config.js": None}])
+    gh, _c, bare = _gh(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    assert [f["path"] for f in e.value.extra["findings"]] == ["src/config.js"]
+    assert e.value.extra["findings"][0]["kind"] == "content"
+    assert _refs(bare) == ""
+
+
+@requires_git
+def test_linking_an_empty_repo_scans_the_imported_history(tmp_path):
+    gh, existing, _http, _c = _linkable(tmp_path)
+    proj = _project_with_history(tmp_path, [{"README.md": "hi\n", ".env": _HIST_KEY}])
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")
+    assert e.value.code == "secrets_found"
+    assert ".env" in [f["path"] for f in e.value.extra["findings"]]
+    assert gh.store.get_project(gh._key(str(proj))) is None
+    assert _refs(existing) == ""
+
+
+@requires_git
+def test_linking_a_non_empty_repo_does_not_push_the_imported_history(tmp_path):
+    # The imported history leaves main (it is never pushed), so a secret that
+    # was only in it does not block, and never reaches GitHub.
+    gh, existing, _http, _c = _linkable(tmp_path, nonempty=True)
+    proj = _project_with_history(tmp_path, [
+        {"README.md": "hi\n", "old.js": "k='%s'\n" % ("sk-" + "w" * 30)},
+        {"old.js": None}])
+    gh.link_repo(str(proj), "existing", overwrite_ok=True)
+    log = _raw_git(str(existing), "log", "--all", "--name-only", "--format=").stdout
+    assert "old.js" not in log
+    assert _raw_git(str(existing), "show", "main:README.md").stdout == "hi\n"
+
+
+@requires_git
+def test_after_the_history_is_cleaned_the_next_attempt_works(tmp_path):
+    proj = _project_with_history(tmp_path, [{"README.md": "hi\n", ".env": _HIST_KEY}])
+    gh, _c, bare = _gh(tmp_path)
+    with pytest.raises(ghpush.GhError):
+        gh.create_repo(str(proj), "myrepo")
+    # The owner removes the secret and starts the project's history again.
+    ghpush._rmtree(str(proj / ".git"))
+    (proj / ".env").unlink()
+    _raw_git(str(proj), "init", "-q", "-b", "main")
+    _raw_git(str(proj), "add", "-A")
+    _raw_git(str(proj), "commit", "-q", "-m", "clean start")
+    clean = _raw_git(str(proj), "rev-parse", "HEAD").stdout.strip()
+    gh.create_repo(str(proj), "myrepo")
+    assert _raw_git(str(bare), "merge-base", "--is-ancestor", clean, "main",
+                    check=False).returncode == 0, "the cleaned history was imported anew"
+    assert "\n.env\n" not in "\n" + _raw_git(str(bare), "log", "--all", "--name-only",
+                                              "--format=").stdout
+
+
+@requires_git
+def test_clean_history_already_on_github_is_not_scanned_again(tmp_path):
+    gh, proj, _bare, calls, _http = _connected(tmp_path)
+    del calls[:]
+    (proj / "more.txt").write_text("more\n", encoding="utf-8")
+    gh.push(str(proj))
+    revlists = [c["args"] for c in calls if "rev-list" in c["args"] and "--objects" in c["args"]]
+    assert revlists and all("--not" in a for a in revlists), \
+        "only what GitHub does not have yet is walked"
+
+
+@requires_git
+def test_a_gitdir_file_is_never_followed(tmp_path):
+    other = _project_with_history(tmp_path, [{"secret.js": "k='%s'\n" % ("sk-" + "z" * 30)},
+                                             {"secret.js": None, "x.txt": "x\n"}],
+                                  name="other")
+    other_head = _raw_git(str(other), "rev-parse", "HEAD").stdout.strip()
+    proj = _mk_project(tmp_path)
+    (proj / ".git").write_text("gitdir: %s\n" % (other / ".git").as_posix(), encoding="utf-8")
+    gh, _c, bare = _gh(tmp_path)
+    gh.create_repo(str(proj), "myrepo")
+    assert _bare_count(bare) == 1, "only the hub's own snapshot is pushed"
+    assert _raw_git(str(bare), "cat-file", "-e", other_head, check=False).returncode != 0, \
+        "another repository's history must never be imported"
+    assert _bare_show(bare, "README.md").stdout == "hello\n"
+
+
+@pytest.mark.parametrize("data", [
+    b"const k = \"gsk_" + b"A1b2" * 13 + b"\";",
+    b"NVIDIA=nvapi-" + b"Ab_9-" * 13,
+    b"key: csk-" + b"x7" * 24,
+    b"token = 'gho_" + b"T" * 36 + b"'",
+    b"ghu_" + b"u" * 36,
+    b"ghs_" + b"s" * 36,
+    b"ghr_" + b"r" * 36,
+])
+def test_the_hubs_own_provider_key_formats_are_found(data):
+    assert [f["kind"] for f in ghpush.scan_blob("src/config.js", data)] == ["content"], data[:20]
+
+
+@pytest.mark.parametrize("data", [b"gsk_short", b"nvapi-short", b"task-" + b"x" * 40,
+                                  b"ghx_" + b"a" * 36, b"desk-" + b"a" * 40])
+def test_lookalikes_of_the_new_key_formats_are_not_flagged(data):
+    assert ghpush.scan_blob("f.txt", data) == []
+
+
+# --------------------------------------------------------------------------- #
+# A tracking ref left by an earlier attempt never hides history, an unlinked  #
+# project's history is imported again on each attempt, and a secret-named    #
+# file in the history is named even when its content equals another file's.  #
+# (Review fix 2026-10-30, second pass.)                                       #
+# --------------------------------------------------------------------------- #
+def _repo_with_deleted_secret(tmp_path, existing):
+    """Give the stand-in GitHub repo ``existing`` a history whose first commit
+    holds a key in cfg.js and whose second commit deletes it."""
+    src = tmp_path / "a-src"
+    _raw_git(str(tmp_path), "clone", "-q", str(existing), str(src))
+    (src / "README.md").write_text("hi\n", encoding="utf-8")
+    (src / "cfg.js").write_text("k='%s'\n" % ("sk-" + "v" * 30), encoding="utf-8")
+    _raw_git(str(src), "add", "-A")
+    _raw_git(str(src), "commit", "-q", "-m", "c0")
+    (src / "cfg.js").unlink()
+    _raw_git(str(src), "add", "-A")
+    _raw_git(str(src), "commit", "-q", "-m", "c1")
+    _raw_git(str(src), "push", "-q", "origin", "HEAD:main")
+
+
+@requires_git
+def test_a_declined_link_never_hides_that_repos_history_from_a_new_repo(tmp_path):
+    gh, existing, http, _c = _linkable(tmp_path)
+    _repo_with_deleted_secret(tmp_path, existing)
+    proj = tmp_path / "proj"
+    _raw_git(str(tmp_path), "clone", "-q", str(existing), str(proj))
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")
+    assert e.value.code == "needs_overwrite_ok"
+    m = gh.mirror_path(str(proj))
+    assert _raw_git(m, "rev-parse", "--verify", "--quiet", ghpush._TRACK,
+                    check=False).returncode != 0, "a declined link leaves no tracking ref"
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    assert [(f["path"], f["kind"], f.get("history")) for f in e.value.extra["findings"]] \
+        == [("cfg.js", "content", True)]
+    assert not [c for c in http.calls if c["method"] == "POST"]
+
+
+@requires_git
+def test_create_never_trusts_a_tracking_ref_it_did_not_fetch(tmp_path):
+    # Even with a stale tracking ref still in the mirror (a crash in the middle
+    # of a link), create scans the whole history.
+    gh, existing, _http, _c = _linkable(tmp_path)
+    _repo_with_deleted_secret(tmp_path, existing)
+    proj = tmp_path / "proj"
+    _raw_git(str(tmp_path), "clone", "-q", str(existing), str(proj))
+    m = gh._ensure_mirror(str(proj))
+    gh._git(["fetch", "--quiet", str(existing), "+refs/heads/main:" + ghpush._TRACK],
+            git_dir=m, protocols=("file",))
+    _paths, findings = gh._check_only(str(proj), m)
+    assert [(f["path"], f.get("history")) for f in findings] == [("cfg.js", True)]
+
+
+@requires_git
+def test_linking_a_repo_whose_own_history_has_a_secret_is_not_blocked(tmp_path):
+    # What the repository being linked already holds is already on GitHub.
+    gh, existing, _http, _c = _linkable(tmp_path)
+    _repo_with_deleted_secret(tmp_path, existing)
+    proj = _mk_project(tmp_path)
+    gh.link_repo(str(proj), "existing", overwrite_ok=True)
+    assert _raw_git(str(existing), "show", "main:README.md").stdout == "hello\n"
+
+
+@requires_git
+def test_a_history_cleaned_after_a_declined_link_works_on_the_first_try(tmp_path):
+    gh, _existing, _http, _c = _linkable(tmp_path, nonempty=True)
+    proj = _project_with_history(tmp_path, [{"README.md": "hi\n", ".env": _HIST_KEY}])
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")          # imports the history, then declines
+    assert e.value.code == "needs_overwrite_ok"
+    ghpush._rmtree(str(proj / ".git"))
+    (proj / ".env").unlink()
+    _raw_git(str(proj), "init", "-q", "-b", "main")
+    _raw_git(str(proj), "add", "-A")
+    _raw_git(str(proj), "commit", "-q", "-m", "clean start")
+    gh.create_repo(str(proj), "myrepo")              # no failed attempt first
+    bare = tmp_path / "remote.git"
+    assert "\n.env\n" not in "\n" + _raw_git(str(bare), "log", "--all", "--name-only",
+                                              "--format=").stdout
+
+
+@requires_git
+def test_a_secret_named_file_sharing_its_content_is_still_named(tmp_path):
+    proj = _project_with_history(tmp_path, [
+        {"README.md": "same text\n", ".env": "same text\n"},
+        {".env": None}])
+    gh, _c, bare = _gh(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    assert [(f["path"], f["kind"], f.get("history")) for f in e.value.extra["findings"]] \
+        == [(".env", "file", True)]
+    assert _refs(bare) == ""
+
+
+@requires_git
+def test_a_history_only_refusal_does_not_point_at_gitignore(tmp_path):
+    proj = _project_with_history(tmp_path, [{"README.md": "hi\n", ".env": _HIST_KEY},
+                                           {".env": None}])
+    gh, _c, _bare = _gh(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.extra["history"] is True
+    assert "cannot remove it from the history" in e.value.message
+    (proj / ".env.local").write_text("x\n", encoding="utf-8")   # a current file too
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.extra["history"] is True
+    assert ".gitignore" in e.value.message and "history" in e.value.message
+
+
+def test_the_gitignore_button_is_only_for_current_files():
+    html = io.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "templates", "index.html"), encoding="utf-8").read()
+    js = html[html.index("function ghIgnorable"):html.index("function doGitignore")]
+    assert "!f.history" in js
+    body = html[html.index("function doGitignore"):][:300]
+    assert "ghIgnorable(lastFindings)" in body
+    assert "setHidden(gitignoreBtn, !ghIgnorable(findings).length)" in html

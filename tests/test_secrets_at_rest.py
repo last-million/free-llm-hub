@@ -122,8 +122,11 @@ def test_a_truncated_key_file_is_not_silently_replaced(store):
     with open(secretstore.key_path(str(store)), "wb") as f:
         f.write(b"short")
     secretstore.reset_cache()
-    with pytest.raises(ValueError):
-        secretstore.load_or_create_key(str(store))
+    # "No key" (None), not an exception: an exception escaped every config
+    # read and save (2026-10-30 review). The damaged file is left as it is.
+    assert secretstore.load_or_create_key(str(store)) is None
+    with open(secretstore.key_path(str(store)), "rb") as f:
+        assert f.read() == b"short"
 
 
 # --------------------------------------------------------------------------- #

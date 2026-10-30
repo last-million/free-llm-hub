@@ -31,7 +31,7 @@ import re
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 STATUSES = ("proven", "unverified", "false_positive", "needs_review")
 MAX_FINDINGS = 200            # rows per project ledger; the least recently seen go first
@@ -508,9 +508,13 @@ _ERROR_ONLY_RE = re.compile(
 _SCANNER_LINE_RE = re.compile(
     r"(?im)^\s*\[[\w.:/-]+\]\s+\[(?:http|dns|tcp|ssl|network|headless|code|file)\]\s+"
     r"\[(?:critical|high|medium|low|info|unknown)\]")
-_OOB_RE = (r"(?i)interactsh|\boast\.(?:pro|live|site|online|fun|me)\b|burpcollaborator"
-           r"|collaborator\s+(?:interaction|received)|received\s+(?:an?\s+)?(?:http|dns|smtp)\s+interaction"
-           r"|dns\s+interaction\s+(?:from|received)")
+# Only a line that REPORTS an interaction counts. The collaborator domain itself (oast.fun,
+# interactsh, burpcollaborator) is the agent's own payload: it shows up in curl -v's echoed
+# request and in error bodies that reflect the URL, and proves nothing.
+_OOB_RE = (r"(?i)received\s+(?:an?\s+)?(?:http|dns|smtp|ldap|ftp|smb)\s+interaction"
+           r"|collaborator\s+(?:server\s+received|interaction|received)"
+           r"|dns\s+interaction\s+(?:from|received)"
+           r"|\"protocol\"\s*:\s*\"(?:dns|https?|smtp|ldap|ftp|smb)\"(?=[^\n]*\"remote-address\"\s*:)")
 _FILE_CONTENT_RE = (r"root:[x*]:0:0:|daemon:[x*]:1:1:|\[(?:boot loader|extensions|fonts)\]"
                     r"|for 16-bit app support")
 
@@ -578,10 +582,13 @@ _RULES = {
                 "the observed response",
     },
     "info_disclosure": {
-        "proof": (r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|Traceback \(most recent call last\)"
-                  r"|\bat\s+[\w.$]+\([\w]+\.java:\d+\)|repositoryformatversion|ref:\s+refs/heads/"
+        "proof": (r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b"
+                  r"|repositoryformatversion|ref:\s+refs/heads/"
                   r"|<title>Index of /|(?:DB_PASSWORD|SECRET_KEY|API_KEY|AWS_SECRET_ACCESS_KEY)\s*="
                   r"|[\"'](?:password|secret|api_?key|access_?token)[\"']\s*:\s*[\"'][^\"']{6,}",),
+        # A stack trace proves only inside an observed HTTP response (after a status line):
+        # anywhere else it may be the agent's own script crashing (see _evidence).
+        "trace": (r"Traceback \(most recent call last\)|\bat\s+[\w.$]+\([\w]+\.java:\d+\)",),
         "fp": ((r"(?im)^\s*(?:<\s*)?(?:server|x-powered-by|x-aspnet(?:mvc)?-version)\s*:[^\n]*\d"
                 r"|\bversion\b\s*[:=]?\s*v?\d+\.\d+",
                 "a version banner alone is not a vulnerability"),),
@@ -627,6 +634,68 @@ def _status(output):
     return int(m.group(1)) if m else 0
 
 
+def _status_at(output, pos):
+    """The status code of the response a line at `pos` belongs to: the nearest status line
+    before it, else a status field, else 0 (unknown)."""
+    code = 0
+    for m in _STATUS_LINE_RE.finditer(output):
+        if m.start() > pos:
+            break
+        code = int(m.group(1))
+    if not code:
+        m = _STATUS_FIELD_RE.search(output)
+        code = int(m.group(1)) if m else 0
+    return code
+
+
+_REQUEST_ECHO_RE = re.compile(r"[ \t]*>(?:[ \t]|\r?$)")
+
+
+def _response_view(output):
+    """The output without the request lines curl -v echoes ("> GET /x HTTP/1.1",
+    "> Host: ..."): what the agent SENT is never proof of what the target did."""
+    if ">" not in output:
+        return output
+    return "\n".join(ln for ln in output.split("\n") if not _REQUEST_ECHO_RE.match(ln))
+
+
+def _after_status(output):
+    """The text after the first observed HTTP status line ("" when there is none)."""
+    m = _STATUS_LINE_RE.search(output)
+    return output[m.end():] if m else ""
+
+
+def _injected_regs(args, own_reg):
+    """Registrable domains the call's own arguments carry (URL-decoded), other than the
+    target's site: where an open-redirect test pointed the redirect."""
+    text = args or ""
+    for _ in range(2):
+        dec = unquote(text)
+        if dec == text:
+            break
+        text = dec
+    hosts = [m.group(1) for m in re.finditer(
+        r"(?i)//(?:[^\s/?#@\"'`<>\\]*@)?([^\s/?#:@\"'`<>\\]+)", text)]
+    hosts += [m.group(0) for m in _HOST_RE.finditer(text)]
+    regs = set()
+    for h in hosts:
+        h = _clean_host(h)
+        if _valid_host(h):
+            reg = _registrable(h)
+            if reg and reg != own_reg:
+                regs.add(reg)
+    return regs
+
+
+def _sent_origins(args):
+    """The Origin header values the call sent (normalised), e.g. curl -H 'Origin: x'."""
+    out = set()
+    for m in re.finditer(r"(?i)(?<![\w-])origin(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?([^\s\"',;}\\]+)",
+                         args or ""):
+        out.add(m.group(1).rstrip("/").lower())
+    return out
+
+
 def _body(output):
     """The body after the LAST status line's header block, else the whole output."""
     ms = list(_STATUS_LINE_RE.finditer(output))
@@ -645,8 +714,9 @@ def _shows_response(cid, output):
         return True
     if _ERROR_ONLY_RE.search(output) and len(output.strip()) < 400:
         return False
+    view = _response_view(output)
     for rx in _rule(cid).get("proof", ()):
-        if re.search(rx, output):
+        if re.search(rx, view):
             return True
     return len(output.strip()) >= 40 and not _ERROR_ONLY_RE.search(output[:200])
 
@@ -671,19 +741,42 @@ def _special(cid, claim, res):
     """Class checks that need more than a pattern -> (verdict, reason, line) or None."""
     out, args = res.get("output") or "", res.get("args") or ""
     if cid == "open_redirect":
-        locs = re.findall(r"(?im)^\s*(?:<\s*)?location\s*:\s*(\S+)", out)
+        locs = [(m.start(), m.group(1))
+                for m in re.finditer(r"(?im)^\s*(?:<\s*)?location\s*:\s*(\S+)", out)]
         if not locs:
             return None
         base = _registrable(claim.get("host") or "")
-        for loc in locs:
-            if loc.startswith("//"):
-                loc = "http:" + loc
-            if re.match(r"(?i)https?://", loc):
-                h = _clean_host(urlsplit(loc).netloc)
-                if h and base and _registrable(h) != base:
-                    return ("proven", "", "Location: " + loc)
+        injected, review = None, None
+        for pos, loc in locs:
+            full = "http:" + loc if loc.startswith("//") else loc
+            if not re.match(r"(?i)https?://", full):
+                continue
+            try:
+                h = _clean_host(urlsplit(full).netloc.rsplit("@", 1)[-1])
+            except ValueError:
+                continue
+            if not (h and base and _registrable(h) != base):
+                continue
+            # Proof = a 3xx sending the browser to the host the REQUEST injected; a
+            # redirect to the site's own login provider or a 200 that carries a
+            # Location header is not an open redirect.
+            status = _status_at(out, pos)
+            if injected is None:
+                injected = _injected_regs(args, base)
+            if 300 <= status < 400 and _registrable(h) in injected:
+                return ("proven", "", "Location: " + full)
+            if review is None:
+                if not 300 <= status < 400:
+                    why = ("the response carrying the external Location is %s, not a redirect"
+                           % ("HTTP %d" % status if status else "shown with no status line"))
+                else:
+                    why = ("the redirect goes to %s, which the request did not inject (it may be the "
+                           "site's own login or partner redirect)" % h)
+                review = ("needs_review", why, "Location: " + full)
+        if review is not None:
+            return review
         return ("false_positive", "the observed redirect stays on the same site; that is not an open "
-                                  "redirect", "Location: " + locs[-1])
+                                  "redirect", "Location: " + locs[-1][1])
     if cid == "cors":
         acao = re.findall(r"(?im)^\s*(?:<\s*)?access-control-allow-origin\s*:\s*(\S+)", out)
         if not acao:
@@ -698,7 +791,13 @@ def _special(cid, claim, res):
             return ("false_positive", "the allowed origin is the site itself",
                     "Access-Control-Allow-Origin: " + origin)
         if cred:
-            return ("proven", "", "Access-Control-Allow-Origin: %s + credentials" % origin)
+            # Proof = the server allowing the Origin the REQUEST sent (or "null"); a fixed
+            # trusted partner origin is not something an attacker controls.
+            if origin.lower() == "null" or origin.rstrip("/").lower() in _sent_origins(args):
+                return ("proven", "", "Access-Control-Allow-Origin: %s + credentials" % origin)
+            return ("needs_review", "the allowed origin %s is not the Origin the request sent; a fixed "
+                                    "trusted origin is not exploitable unless an attacker controls it"
+                    % origin, "Access-Control-Allow-Origin: %s + credentials" % origin)
         return ("false_positive", "a reflected origin without Access-Control-Allow-Credentials: true is "
                                   "usually not exploitable", "Access-Control-Allow-Origin: " + origin)
     if cid == "ssti":
@@ -766,11 +865,22 @@ def _evidence(claim, results):
         sp = _special(cid, claim, r)
         if sp and sp[0] == "proven":
             return {"proof": "observed", "status": "proven", "pointer": _pointer(r, sp[2]), "reasons": []}
+        view = _response_view(out)
         for rx in rule.get("proof", ()):
-            line = _pattern_line(rx, out)
+            line = _pattern_line(rx, view)
             if line is not None:
                 return {"proof": "observed", "status": "proven", "pointer": _pointer(r, line),
                         "reasons": []}
+        after = _after_status(view)
+        for rx in rule.get("trace", ()):
+            line = _pattern_line(rx, after) if after else None
+            if line is not None:
+                return {"proof": "observed", "status": "proven", "pointer": _pointer(r, line),
+                        "reasons": []}
+            line = _pattern_line(rx, view) if review is None else None
+            if line is not None:
+                review = (r, "a stack trace was observed, but no HTTP status line shows it is %s's "
+                             "response (it may be the tool's own error)" % target, line)
         if sp and sp[0] == "needs_review" and review is None:
             review = (r, sp[1], sp[2])
         elif sp and sp[0] == "false_positive" and fp is None:

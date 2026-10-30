@@ -433,7 +433,15 @@ def encrypt_existing_secrets() -> int:
                 n += sum(1 for k in (prov.get("api_keys") or [])
                          if isinstance(k, str) and k and not secretstore.is_encrypted(k))
         if n:
-            save_config(load_config())
+            # STRICT: a non-strict reload returns {} when this second read
+            # fails (OSError) and save_config would then write that empty
+            # config over the real one -- every key, local_api_key and setting
+            # gone. A failed read skips the migration; the next start retries.
+            try:
+                cfg = load_config(strict=True)
+            except (OSError, ConfigCorruptError):
+                return 0
+            save_config(cfg)
     return n
 
 
@@ -1061,8 +1069,20 @@ def get_setting(name: str, default=None):
         if key is not None and _settings_cache["key"] == key:
             cfg = _settings_cache["cfg"]
         else:
-            cfg = load_config()
-            if key is not None:
+            # A read that FAILED (OSError: a sharing violation, out of file
+            # handles) gives the defaults-only view. Serve it for this call but
+            # never cache it: under the real file's (mtime, size) key it would
+            # be served until the next write, turning blocklists and the
+            # subscription scope back to defaults for hours.
+            cacheable = key is not None
+            try:
+                cfg = load_config(strict=True)
+            except ConfigCorruptError:
+                cfg = load_config()       # corrupt file: same view every read
+            except OSError:
+                cfg = load_config()
+                cacheable = False
+            if cacheable:
                 _settings_cache["key"] = key
                 _settings_cache["cfg"] = cfg
         value = cfg.get(name, default)
@@ -1123,11 +1143,15 @@ def get_control_token() -> Optional[str]:
 def ensure_control_token() -> str:
     """Return the per-install control-plane token, generating + persisting one
     if absent. Required on every /api/* request (see app.py's
-    _local_control_guard). This is what stops a DIFFERENT local OS user who can
-    reach the loopback port from driving the control plane: the token lives in
-    this 0600 config file, so only the owning account can read it, and it is
-    never rendered into the dashboard HTML (any user's browser can load the
-    page, only the owning user's shell sees the token printed at startup)."""
+    _local_control_guard). It stops a cross-site browser request (which cannot
+    read the dashboard page) from driving the control plane.
+
+    It does NOT stop another local OS user or process: GET / embeds the token in
+    the dashboard HTML (templates/index.html, HUB_CONTROL_TOKEN) and that page
+    needs only a loopback Host header, so anything that can reach the loopback
+    port can read the token and then call every /api route. That trade-off is
+    accepted for a single-user local tool (SEC-001); a shared machine needs a
+    local API key and the CLI-Multi approval modes chosen with that in mind."""
     with _LOCK:
         cfg = load_config(strict=True)
         token = cfg.get("control_token")

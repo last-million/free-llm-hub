@@ -231,10 +231,15 @@ class Bandit:
             self._expire_calls_locked(now)
             for cid in ids:
                 old = self._calls.pop(cid, None)
+                # Re-remembering a credited id keeps it credited only when the
+                # SAME model emitted it again; a different model reusing the
+                # id made a new call, and that one is still owed its credit.
+                same = bool(old and old.get("pid") == str(pid)
+                            and old.get("model") == str(model))
                 self._calls[cid] = {
                     "pid": str(pid), "model": str(model), "kind": str(kind),
                     "t": now,
-                    "credited": bool(old and old.get("credited")),
+                    "credited": bool(same and old.get("credited")),
                 }
             while len(self._calls) > TOOL_CALL_MAX:
                 self._calls.popitem(last=False)
@@ -243,7 +248,11 @@ class Bandit:
         """Reward the model behind each remembered, not yet credited tool call
         whose role "tool" result is in ``messages``, with ``grade(message)``
         (0 / 0.5 / 1; None or an invalid value = skip, retried on a later
-        look). Each id is credited at most once. Returns how many were."""
+        look). Each id is credited at most once. Returns how many were.
+
+        When the history holds several results for one id, the LAST one is
+        graded: the remembered record is the id's latest emission, and its
+        result comes after any earlier call that used the same id."""
         if not isinstance(messages, (list, tuple)) or not callable(grade):
             return 0
         pending = []
@@ -251,7 +260,7 @@ class Bandit:
             now = self._now()
             self._expire_calls_locked(now)
             seen = set()
-            for msg in messages:
+            for msg in reversed(messages):
                 if not isinstance(msg, dict) or msg.get("role") != "tool":
                     continue
                 cid = msg.get("tool_call_id")
@@ -262,6 +271,7 @@ class Bandit:
                     continue
                 seen.add(cid)
                 pending.append((cid, msg))
+        pending.reverse()                 # graded in history order, as before
         credited = 0
         for cid, msg in pending:
             try:

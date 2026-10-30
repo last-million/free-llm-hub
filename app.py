@@ -20120,9 +20120,10 @@ def _local_control_guard():
             return jsonify({"error": "missing local control header"}), 403
         # The loopback port itself is not user-isolated: on a shared machine a
         # DIFFERENT local OS account can also connect to 127.0.0.1:PORT. This
-        # per-install token (0600 config file, printed once at startup, never
-        # rendered into the HTML) is what actually gates control of the hub —
-        # Host/Origin only stop a browser-borne cross-site request.
+        # per-install token stops a browser-borne cross-site request (it cannot
+        # read the page). It does NOT stop a co-resident OS user or process:
+        # GET / embeds the token in the dashboard HTML and needs only a loopback
+        # Host header (accepted trade-off, SEC-001; see ensure_control_token).
         if request.method == "GET" and request.path in _CONTROL_TOKEN_EXEMPT_GETS:
             return None
         token = config.get_control_token()
@@ -42812,13 +42813,24 @@ def _looks_like_dangling_lead_in(text):
     return body.endswith(":")
 
 
-def _looks_like_text_tool_call(text):
+def _looks_like_text_tool_call(text, tools=None):
     """True when `text` contains a tool call the model wrote out instead of
     emitting. Requires a real closing/paired marker, not a passing mention, so
-    prose that merely talks about tools does not trip it."""
+    prose that merely talks about tools does not trip it.
+
+    `tools` (the client's tools array): also True for a typed call to an
+    OFFERED tool that tool_rescue refused to promote because the client could
+    not run it (arguments `42`, `["ls"]`, plain text for a tool with no "input"
+    parameter). Without this such a reply, which used to be emitted as a broken
+    call, would have been served as the final prose answer."""
     if not text or not isinstance(text, str):
         return False
-    return any(rx.search(text) for rx in _TEXT_TOOL_CALL_RES)
+    if any(rx.search(text) for rx in _TEXT_TOOL_CALL_RES):
+        return True
+    try:
+        return bool(tools) and tool_rescue.typed_call_unusable(text, tools)
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _chat_json_nonanswer(data, has_tools=False, tools=None):
@@ -42867,7 +42879,7 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
                                          used_tools=_request_used_tools()):
             _set_nonanswer_kind("no_tools_claim")
             return True
-        if has_tools and (_looks_like_text_tool_call(content)
+        if has_tools and (_looks_like_text_tool_call(content, tools)
                           or tool_rescue.has_model_markup(content)
                           or tool_rescue.is_bare_tool_name(content, tools)
                           or _looks_like_dangling_lead_in(content)):
@@ -45911,7 +45923,7 @@ def _swarm_tool_result(body):
             _record_outcome(hop_pid, hop_model, False)
             return _why("claimed it has no tools")
         if not msg.get("tool_calls") and (
-                _looks_like_text_tool_call(msg.get("content"))
+                _looks_like_text_tool_call(msg.get("content"), body.get("tools"))
                 or tool_rescue.has_model_markup(msg.get("content"))
                 or _looks_like_announced_not_acted(msg.get("content"))):
             # MEASURED: the reported dead turn was swarm mode -- three models
@@ -47600,7 +47612,7 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
                     used_tools=_turn_used_tools(body.get("messages"))):
                 _record_outcome(pid, model, False)
                 return fail("prose", "claimed it has no tools", 0)
-            if tools and (_looks_like_text_tool_call(content)
+            if tools and (_looks_like_text_tool_call(content, tools)
                           or tool_rescue.has_model_markup(content)
                           or _looks_like_announced_not_acted(content)):
                 _note_nonanswer(pid, model)

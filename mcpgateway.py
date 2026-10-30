@@ -585,6 +585,8 @@ class _StdioConn:
                 self._write(reply)
             return
         rid = msg.get("id")
+        if not isinstance(rid, (int, str)):
+            return       # not one of ours (and an unhashable id must not end the reader)
         with self._lock:
             slot = self._pending.get(rid)
         if slot is not None:
@@ -1041,6 +1043,10 @@ class Gateway:
                 conn = self._conns.get(name)
                 if conn is not None and conn.alive:
                     return conn
+            if conn is not None:
+                # Its reader ended but the process may still run: stop it (whole
+                # tree) before a new one replaces it, or nothing would track it.
+                self._stop(name)
             if row.get("transport") == "stdio":
                 self._make_room(name)
             with self._lock:

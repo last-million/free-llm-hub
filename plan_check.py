@@ -591,10 +591,26 @@ def check_plan(phases, design, goal_text, project_dir, notes=(), max_phases=None
     except Exception:                                            # noqa: BLE001
         pass
 
-    report = {"findings": findings[:30], "phases": len(out),
+    report = {"findings": _cap_findings(findings), "phases": len(out),
               "start_now": sum(1 for p in out if not p.get("needs")),
               "replanned": False}
     return out, report
+
+
+_MAX_FINDINGS = 30
+
+
+def _cap_findings(findings, cap=_MAX_FINDINGS):
+    """At most `cap` findings, in their order, the "replan" ones always kept:
+    they are what earns the planner its one re-ask, and they come LAST (steps
+    4 and 6), so a plain cut lost them behind 30 fixes or warnings."""
+    if len(findings) <= cap:
+        return list(findings)
+    replan = [i for i, f in enumerate(findings) if f.get("action") == "replan"][:cap]
+    room = cap - len(replan)
+    others = [i for i, f in enumerate(findings) if f.get("action") != "replan"][:room]
+    keep = set(replan) | set(others)
+    return [f for i, f in enumerate(findings) if i in keep]
 
 
 def _clip_items(texts):

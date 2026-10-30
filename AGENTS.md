@@ -3933,7 +3933,11 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   needs only an unauthenticated "go multi" message, "off" needs nothing. That
   applies to the CLI Multi tier on /v1 AND to the MCP tool
   `swarm_windows_start`. Only "dashboard" (the default) puts a token-gated human
-  approval in front of every start. Separately, in every mode the folder the
+  approval in front of every start -- against a REMOTE web page, not against
+  another local OS user or process: GET / embeds the control token in the
+  dashboard HTML and needs only a loopback Host header, so a co-resident
+  process can read it and approve its own request (accepted trade-off, SEC-001).
+  Separately, in every mode the folder the
   owner approves is whatever the CLI's own environment block names: a CLI whose
   system prompt carries injected instruction text with a fake environment block
   could still name a folder -- the approval banner shows it, and two different
@@ -8469,7 +8473,8 @@ self-testing conversation (e.g. `http://localhost:3000`) gets exactly the same c
     own output; a connection error is not one) AND the class's proof signal. Rules as data (`_RULES`):
     XSS = an alert/dialog actually fired (reflection alone = false positive); SQLi = a database error,
     sqlmap's injection point or a measured delay (a 500 alone = false positive); SSRF / RCE / XXE = an
-    out-of-band interaction or internal content / command output / file contents; open redirect = a 3xx
+    out-of-band interaction (a REPORTED interaction, never just the payload domain -- tightened
+    2026-10-30, see "Review fixes, batch 3") or internal content / command output / file contents; open redirect = a 3xx
     Location to an EXTERNAL site (same site = false positive); CORS = a foreign origin WITH
     `Access-Control-Allow-Credentials: true` (`*`, or no credentials = false positive); takeover = the
     service's unclaimed-resource page (a CNAME alone = false positive); info disclosure = the secret /
@@ -9383,3 +9388,210 @@ and he says he will do it but he does nothing and he stops."
   so the CLI itself retries, bounded per conversation.
 
 Release-note: fix: when a slow free model says "I'll do it" and stops without doing anything, the hub now catches it and gives the turn to another model instead of letting your CLI stop.
+
+## Review fixes, batch 3 (2026-10-30)
+
+From the read-only review of 2026-10-29: 33 findings, fixed by one workflow in 10 file-disjoint
+groups, each in its own worktree and checked by an independent verifier (the related tests re-run,
+plus a negative control showing the new tests fail without the fix). 8 groups passed as written;
+swarm and slopcheck failed verification and were finished by hand (their sections below). The
+groups that wrote no section of their own:
+
+- **Verifier verdicts and risky calls** (`verify.py`, `plan_check.py`): the `VERDICT:` line is read
+  before any JSON quoted in the reply; a write disguised behind `&`, a redirect or an inline script
+  counts as risky; dry-run replan findings past the cap are kept. Known softness: a JSON object in
+  prose with only status/result/reason keys now reads as no verdict (fail-open); an `&` inside
+  quotes makes a read-only command count as risky (more verification, never less).
+- **Findings check** (`findings.py`): out-of-band proof needs a REPORTED interaction, not the
+  payload domain; curl's echoed request lines never prove; a stack trace proves only after an
+  observed status line; an open redirect needs a 3xx to the host the request injected; CORS needs
+  the allowed origin to be the one the request sent (or `null`). Open: an error body that reflects
+  the agent's own metadata URL still matches the SSRF "internal content" rule.
+- **Memory, tool rescue, bandit** (`memory.py`, `tool_rescue.py`, `bandit.py`, app): passwords
+  inside URLs and commands are never filed as facts; the tool-call rescue is linear (a runaway
+  reply cannot freeze it) and only returns calls the CLI can run; rescued call ids are unique.
+- **Chain forks and MCP gateway** (`chainkit.py`, `mcpgateway.py`): a fork's port and slot are
+  reserved before anvil starts (two starts cannot take one port); a dead MCP server is stopped
+  before it is replaced.
+- **Preview and Publish** (`workspace.py`, `publish.py`, `frameproxy.py`): foreign and debugger
+  ports are ignored, kills and attachments stay inside their bounds, and the relay closes its
+  socket on a failed upgrade.
+- **Config and secrets** (`config.py`, `secretstore.py`, `migrations.py`): a failed config read is
+  never cached or saved over the file; a wrong-size `secret.key` reads as no key instead of
+  raising out of every config read (while it stays damaged, a newly saved key is stored in plain
+  text -- the same trade-off as "crypto unavailable"); the retire migrations (v3-v7) skip any id
+  listed in `custom_providers`, so a custom provider that reuses a retired id keeps its key.
+
+Release-note: fix: a batch of reliability and safety fixes from a full code review -- verifier verdicts, security-finding proof, memory never keeping passwords from links, tool-call rescue, chain forks, MCP servers, previews, config reads and GitHub push history scanning.
+
+## Observed evidence: chained or skipped test runs no longer clear an earlier failure (2026-10-30)
+
+Covered by `tests/test_evidence_chains_and_exclusions.py` (49, pure: `evidence.py` only, no I/O).
+
+- **A second check after `;` / `||` / a newline / `|` / `&` hid the first one's failure** (`evidence._classify`).
+  The old rule looked for masking only AFTER THE LAST check. So in `pytest a; pytest b` the exit code (b's) was
+  read as the whole line's, a's failure vanished behind b's pass, and the line was a PASS that cleared an
+  earlier FAIL of a. Now:
+  - a ZERO exit after any operator other than `&&` from the FIRST check on is UNDETERMINED (it says nothing
+    about the earlier checks);
+  - a NON-zero exit is still the last check's own failure (unless something after the last check masks it:
+    `; echo done`, `| tail`, `|| true`), so it stays an observed FAIL. Safe because the line is keyed on all
+    its checks (next point). First version of this fix dropped it to UNDETERMINED, which lost a real
+    failure; corrected after review.
+- **A command that runs several checks is credited as a whole** (`command_key`, `covers`,
+  `outstanding_failures`). The old key was its LAST check and its scope its FIRST, so a failed
+  `pytest a && pytest b` was cleared by re-running b alone. Now the key names every check, a passing
+  multi-check line covers each of its checks, and a failed one is covered only when EVERY one of its checks
+  was re-run green after it: by one later PASS (the same line again, the whole suite, an enclosing folder),
+  or by separate later PASSes, one per check (`_covered_later`: `pytest a`, then `pytest b`). The first
+  version of this fix accepted only a single covering PASS, so two separate green re-runs left a bogus
+  outstanding FAIL (label "2 failed (observed)", which would push a Multi phase into a revision); corrected
+  after review. A PASS from before the failure, or a filtered one (`-k`), never counts.
+- **A run that left the failing tests out cleared them** (`_FILTER_FLAGS`, `_check_scope`). `--ignore`,
+  `--ignore-glob`, `--deselect`, jest `--testPathIgnorePatterns`, `--exclude`, `--skip` / go `-skip`,
+  `--shard` and forge's `--match-*` / `--no-match-*` (and short forms) now mark the run filtered, and their
+  value is not read as a test path. So `pytest --ignore=tests/test_a.py` passing no longer clears a failure of
+  `tests/test_a.py`. A filtered run's own failure is still covered by an unfiltered whole-suite pass.
+- No flag: these only stop the hub from calling an unproven run proven.
+- **Limits, said plainly.**
+  - A multi-check line whose checks are the same tool reads the same output twice, so its failed count can be
+    doubled ("4 failed" for 2). The verdict is right; the number in the label can be high. Not changed here.
+  - A FAIL of several checks needs every check re-run green; re-running only the one that really failed is not
+    enough (the hub cannot tell from the line's exit code which one it was).
+  - `scope_of()` still describes the first check only; `covers()` looks at every check.
+  - Not run against a live hub or a real CLI.
+
+Release-note: fix: a test run that skipped or chained the failing tests no longer counts as proof they were fixed, while re-running each test separately and green still clears the failure.
+
+## Prose swarm: negated criteria, plan numbering, dict plans, junk attempts (2026-10-30)
+
+Covered by `tests/test_swarm_negation_plan_search.py` (40, hermetic: stub dispatch, stub
+`answer_check`, no network). Four bugs from a read-only review of `swarm.py`; no flag (pure fixes).
+
+- **A negated acceptance criterion was read as its opposite** (`_mechanical_problems`,
+  `_criterion_proven`). Every quoted literal next to a must-have verb was REQUIRED, negation
+  ignored. So 'Must not include "lorem ipsum"' rejected clean output ("missing required text"),
+  the retry or search prompt told the worker to ADD the text, and output that contained it was
+  "proven" (no manager verdict). Now `_literal_rule` reads the literals as:
+  - "required" when nothing outside the literals is a negation: exactly as before. A negation
+    inside a literal ("Not found") and "no more than N words" do not count.
+  - "forbidden" for the clean negated shapes: the text before the first literal holds exactly
+    one negation, right before the verb ('Must not include', 'Does not contain', 'Never use',
+    "Doesn't mention") or right after it ('Contains no', 'Includes neither ... nor'); the
+    literals are joined only by commas / or / and / nor; nothing after the last literal is
+    negated. A forbidden literal present gives `contains forbidden text "X" -- remove it`, and
+    absent proves the criterion. It is matched as a whole term: a forbidden "eval" is not
+    found in "evaluate", but is found in "eval(x)".
+  - undecided (no problem claimed, `_criterion_proven` None) for any other negation:
+    'Include "A" but not "B"', 'No filler, include "Pricing"', '"eval" is never called',
+    'every section except "FAQ"'. The manager judges; without a manager nothing is checked.
+  - undecided too when the criterion says the text is OPTIONAL, not banned
+    (`_OPTIONAL_CUE_RE`: need / necessary / required / have to / may / might / optional /
+    mandatory ... anywhere in the criterion): 'Does not need to include "FAQ"', 'Need not
+    include', 'Not required to include', "Doesn't have to mention", 'It is not necessary to
+    include', 'May or may not include'. The first version of this fix read those as "forbidden"
+    (two plain words may sit between the negation and the verb), so it rejected valid output and
+    told the retry to remove text it was allowed to keep.
+- **`needs` used the cleaned numbering** (`_clean_phases`). A planner entry with no task (or not
+  an object) was skipped, and later `needs` (the planner's own numbers) were checked against
+  the cleaned positions: a valid need was dropped as a "forward reference" and a need on the
+  dropped entry was pointed at another phase. Now needs are translated from planner positions
+  to kept positions; a need on a dropped or cut phase is dropped; MAX_PHASES counts usable
+  phases (an empty entry no longer takes a slot).
+- **`phases` written as an object crashed `swarm.run`** (KeyError on the slice, after the plan
+  call was paid; app's `_swarm_completion` does not catch it). An object is now read in key
+  order (numbered keys sorted as numbers; a non-numbered key becomes the title when the phase
+  has none); any other non-list shape is an unusable plan (`[]`, then the text scan / retry as
+  for any bad plan).
+- **A degenerate attempt could replace a real one** (`_search_phase`, `_verify_set._rejected`).
+  The search scored an attempt by its problem count, and a degenerate answer counts ONE problem
+  (the check returns early), so junk tied a real attempt with one mechanical problem and
+  replaced it; a real attempt with two problems could not replace a degenerate best. Attempts
+  are now ranked by (degenerate or empty?, problem count): junk never replaces real work, and
+  any real attempt replaces a degenerate best. The search's success flag uses the same rank
+  (unchanged between two real attempts). `_rejected` no longer makes a degenerate retry the
+  fallback over an earlier real attempt, so "ship the last real attempt" ships real text.
+
+Limits, said plainly:
+- The negation reading is English regex. Shapes it does not know stay undecided (never
+  inverted), which also means some criteria that were checked before are now left to the
+  manager: a positive criterion that happens to contain an unrelated negation ("Includes
+  \"Pricing\" with no typos", 'Must include "Pricing" section without placeholder text') is no
+  longer checked mechanically.
+- The optional-wording rule looks at the whole criterion, so 'May include headings but must
+  not include "X"' is undecided as well (never wrong, just not checked mechanically).
+- Two negations in one criterion ('Must not include "A" and never "B"') are undecided, not
+  forbidden.
+- `_QUOTED_RE` still needs 2+ characters inside quotes; a one-character literal is not read
+  (unchanged).
+- `swarm_windows.clean_phases` (Multi) has the same planner-vs-cleaned numbering pattern and the
+  same unguarded slice of `phases`; it was not changed here.
+- **Second pass, same day (found by the independent verifier).** The first negation reader let any two
+  plain words sit between the negation and the verb, so a double negation read as a ban: 'Do not
+  forget to include "Pricing"', "Don't hesitate to use", 'Must not fail to include', 'Never stop
+  using', 'Cannot help but include', 'Should not just/merely include', 'Not including "X" is a
+  failure' all became "forbidden" -- rejecting correct output and telling the retry to REMOVE
+  required text. Now only plain auxiliaries may sit between them (to, be, ever, even, also, any,
+  actually, directly, explicitly, literally), and an inverting word anywhere in the criterion
+  (`_INVERT_CUE_RE`: forget, fail/failure, neglect, hesitate, stop, help but, omit, skip, leave out,
+  miss, just, merely, simply, only, wrong, mistake, error, penalty, lose) leaves the literals
+  undecided (the manager judges). Plain bans ('Must not ever include "X"', 'Never use "eval"',
+  'Do not include "TODO" or "FIXME"') stay bans.
+
+Release-note: fix: multi-model answers no longer reject correct work when a step says what must (or need) NOT appear, keep step dependencies right when the planner writes an empty step, no longer crash on an unusual plan shape, and never swap a real draft for a garbled one.
+
+## Slop check: a "Company Name" field label and a warm design gradient are not slop (2026-10-30)
+
+Covered by `tests/test_slopcheck_label_and_warm_gradient.py` (13, hermetic).
+
+- **"Company Name" as a label.** `check_files` called every bare "Company Name" a placeholder (HIGH), so a contact form's `<label>Company Name</label>` or a table column read as a template left in. Now (`_is_field_label`) it is not a placeholder when:
+  - the nearest tag before it is an OPENING `label`, `th`, `legend`, `option`, `optgroup`, `dt` or `caption` (inline wrappers such as `<span>` / `<b>` are looked through, open or closed). Only the NEAREST element counts, so an unclosed `<option>` or `<dt>` earlier on the page (both legal HTML) never hides a later logo `<a>Company Name</a>`;
+  - it is followed by `:` (or ` *:`) and then nothing on the line, a tag (an `<input>`) or a blank `____`. Words after the colon ("<h1>Company Name: we fix roofs</h1>") are a heading, still flagged. Markdown emphasis (`**Company Name**`, `*Company Name*,`) is still flagged;
+  - in a markdown file it sits in a table cell (`| Company Name |`).
+  "Company Name" standing as the name (a logo, a footer line) and "Your Company Name" are still flagged.
+- **A warm design gradient with a plum accent.** `check_design`'s `default_gradient` (HIGH) fired on any sentence holding the word "gradient" and any violet word, so "a warm gradient from sand to terracotta with plum headings" or "plum palette, no gradients" were called the default AI hero. Now each gradient mention is judged on its OWN clause (`_gradient_clause`: the sentence cut at commas, semicolons, brackets and words that move on, such as "with", "behind", "on", "for", "and a"):
+  - a negated gradient ("no gradients") is skipped;
+  - a warm word (`_WARM_WORD_RE`, incl. "warm", "sunset") or a hex outside the violet/blue/pink band IN THAT CLAUSE excuses it, as `_ai_gradient_stops` does for real CSS stops; a colour named elsewhere in the sentence (gold accents, a red banner, an amber CTA, a teal accent, a green footer) excuses nothing;
+  - a violet word in that clause flags it. A clause that names no colour at all ("a soft gradient") falls back to the whole sentence, as before (so "A purple hero with a soft gradient" is still flagged).
+- **Limits, said plainly.** The clause split is a word list, not a parser: "a gradient from purple on top to coral at the bottom" is cut at "on" and flagged although coral is a stop; "a gradient of coral and purple" is excused (coral is a stop) while "a purple gradient and coral hero" is excused too (no article after "and"). Label detection reads tags as text and only knows the HTML elements listed above (a custom component wrapping the text is not one). A colon label followed by a filled value ("Company Name: Fixli") is flagged.
+- **Second pass, same day (found by the independent verifier).** The first clause split cut at every
+  comma and bracket, so the commonest default gradient was missed: "a purple, blue and pink
+  gradient" and "a deep purple (#6d28d9) to blue gradient" read as "blue and pink gradient" /
+  "to blue gradient". A comma BEFORE the gradient word that is followed by another colour now
+  continues the list of stops (`_clause_view`), and brackets holding only a colour value are not a
+  break; a comma after the gradient word still ends the clause ("a purple gradient, forest green
+  footer" stays flagged). And "warm" / "earthy" were made stops, so "a warm purple-to-blue
+  gradient" was excused; they are adjectives now (`_WARM_ADJ_RE`) and excuse a gradient only when
+  its own clause names no violet-band colour ("a warm gradient with a plum accent" still passes).
+  Not fixed (the verifier's minor note): a "Company Name" label whose nearest tag is an `<input>`,
+  `<svg>`, `<br>` or a markdown `**` table header is flagged again, as on main.
+
+Release-note: fix: the design check no longer calls a form's "Company Name" label or a warm gradient with a purple accent "AI slop", while still catching a real purple-to-blue hero and a placeholder company name.
+
+## GitHub push scans the project's own history, and knows more key formats (2026-10-30)
+
+Covered by 26 new tests at the end of `tests/test_github_push.py` (hermetic: real git in tmp_path, local bare repos stand in for GitHub, fake HTTP). Findings of a read-only review and of the review of the first fix, all real. This follows "GitHub push for Build projects (2026-10-10)".
+
+- **A project's own git history went to GitHub without any secret scan** (`ghpush._ensure_mirror`, `_scan_staged`, `_history_findings`).
+  - What was wrong: when a Build project already had its own `.git`, the hub imported its HEAD and its whole history into the mirror's main. The scan then read only `diff --cached` against that main, so nothing already in the history was ever read: a `.env` still tracked at HEAD (adding it to `.gitignore` later does not untrack it), a key committed and deleted in a later commit. Create & push, or linking an EMPTY existing repo, pushed all of it. Reproduced: a committed `.env` with an OpenAI key went to the remote with no `secrets_found`.
+  - What was also wrong: the import followed a `.git` FILE (`gitdir: <path>`), so a planted one made the hub import and push another repository's whole history.
+  - What changed, part 1: every scan (create's check before the POST, link, preview, every push) now also reads every blob reachable from the mirror's main that GitHub does not have yet. It uses the same rules as the staged scan and fails closed the same way: a missing blob, one over the 20 MB cap, or a git error blocks. Such findings carry `history: true`, and their text says the file is in the project's own git history and that `.gitignore` does not remove it from there.
+  - What changed, part 2: history is imported only when `<project>/.git` is a real folder inside the project. A `.git` file (a git worktree or submodule checkout) or a link is not followed; that project is pushed as a plain snapshot of its files, with no history.
+  - Unchanged: a linked project whose history is already on GitHub pays nothing extra (the walk starts from what GitHub has). Linking a NON-empty repo still moves the imported history aside, so it is never pushed and does not block.
+- **"What GitHub already has" could be another repository** (second review). The walk left out what the mirror's GitHub-tracking ref (`refs/remotes/github/main`) holds. A link attempt fetches the chosen repo's branch into that ref BEFORE it can be refused (`needs_overwrite_ok`, a secret finding, any other error), and nothing removed it. So: try to link repo A, decline, then Create & push a new repo B, and A's history was never scanned. A project cloned from A then pushed A's whole history, a deleted key included, to B. Reproduced in a test.
+  - What changed: the tracking ref is trusted only when it belongs to the push target -- a linked project, or the repo a link has just fetched (non-empty case). Create, an empty-repo link and any unlinked scan read the whole history. A link that ends without storing the link deletes the ref. Before create or link, an unlinked project's mirror drops the ref and imports the project's own history again (`_refresh_unlinked_mirror`).
+  - Linking a repo whose OWN history holds a secret is still allowed: that history is already on GitHub (test pins it).
+- **A cleaned history used to cost one more failed attempt** (second review, part b). The first fix deleted the mirror after a history finding on create or link. A link declined for another reason (`needs_overwrite_ok`) kept the old imported copy, so the next Create & push after the owner cleaned the history failed once more. Now create and link re-import the project's history as it is at that moment (the delete-after-failure step is gone). Preview is unchanged on purpose: it only runs for linked projects, whose history was scanned before linking.
+- **A secret-named file was missed when its content equals another file's** (second review, part c). `rev-list --objects` names each object once, so a `.env` holding the same bytes as `README.md` was listed as `README.md`. The walk now also lists every path each commit added or changed (`git log --root -m --name-only`) and reports a secret-looking name once. Names of files being committed right now are left to the staged scan.
+- **The refusal no longer points at .gitignore for history findings** (second review, part a). The `secrets_found` message says the history must be cleaned when any finding is in the history, and `extra.history` is set. The dashboard offers "Add these to .gitignore" only for findings in the current files, and adds only those paths.
+- **The scan missed key formats this hub's own users hold** (`ghpush._SECRET_CONTENT`). Added: Groq `gsk_` (40+), NVIDIA `nvapi-` (40+), Cerebras `csk-` (30+; the old `\bsk-` rule cannot see it), and GitHub `gho_` / `ghu_` / `ghs_` / `ghr_` tokens (36+; the gh CLI's sign-in stores a `gho_` token).
+- **Deviation from the first review's suggestion.** It also offered "stop importing history and start the mirror from a snapshot". Not done: AGENTS.md documents that a project's history is imported and kept. The history is kept and scanned instead.
+- **Limits, said plainly.**
+  - A history that once held a secret, or a file over 20 MB, blocks Create & push until the owner rewrites that history or deletes the project's `.git`. The hub never rewrites a project's history itself.
+  - The first push of a project with a long history reads every blob in it once (cat-file batches of 64 MB), and create / link now re-fetch the project's history locally on each attempt. That costs time on a big repository.
+  - A crafted `.git` FOLDER whose own files point elsewhere (`commondir`, `objects/info/alternates`) can still bring in other history. That history is secret-scanned before any push, but it would be published.
+  - Projects linked before this fix whose history already reached GitHub are not re-checked.
+  - The new key patterns are length-based. A key shorter than the stated minimum is not matched.
+  - Not run against the real GitHub.
+
+Release-note: fix: pushing a project to GitHub now checks its whole past history for passwords and API keys (even after an earlier link attempt to another repository), recognises Groq, NVIDIA, Cerebras and GitHub sign-in keys, and never copies another folder's history by mistake.

@@ -399,28 +399,41 @@ def detect(command):
 
 
 _FILTER_FLAGS = {"-k", "-m", "-t", "--testnamepattern", "-run", "--run", "--grep", "-g",
-                 "--filter", "--testpathpattern", "-p", "--package", "--exact"}
+                 "--filter", "--testpathpattern", "-p", "--package", "--exact",
+                 # Flags that LEAVE tests out (2026-10-30): a run that skipped the
+                 # failing tests must never clear their failure. Each takes a
+                 # value (`--ignore x` or `--ignore=x`): pytest --ignore /
+                 # --ignore-glob / --deselect, jest --testPathIgnorePatterns,
+                 # vitest / mocha / cargo --exclude, mocha --ignore, go -skip,
+                 # cargo --skip, jest / vitest --shard, forge's (no-)match flags.
+                 "--ignore", "--ignore-glob", "--deselect", "--testpathignorepatterns",
+                 "--exclude", "-skip", "--skip", "--shard",
+                 "--match-test", "--match-contract", "--match-path", "--mt", "--mc", "--mp",
+                 "--no-match-test", "--no-match-contract", "--no-match-path",
+                 "--nmt", "--nmc", "--nmp"}
 
 
-def command_key(command):
-    """One spelling per check: `python -m pytest -q` and `pytest -q` are the
-    same run, so a later PASS of either clears a FAIL of the other."""
-    found, segs = _check_segments(command)
-    if not found:
-        return " ".join(str(command or "").lower().split())[:200]
-    i, d = found[-1]
+def _check_key(d):
+    """The key of ONE check descriptor (see command_key)."""
     if d.get("wrapper"):
         return "%s %s" % (d["wrapper"], d.get("script") or "")
     args = [a for a in d.get("args") or () if a]
     return " ".join([d["tool"]] + args).lower()[:200]
 
 
-def scope_of(command):
-    """(tool, positional paths, filtered?) of a check -- what part of the
-    suite it ran. A run with no paths and no filter is the WHOLE suite."""
-    d = detect(command)
-    if not d:
-        return None, (), False
+def command_key(command):
+    """One spelling per check: `python -m pytest -q` and `pytest -q` are the
+    same run, so a later PASS of either clears a FAIL of the other. A command
+    that runs several checks keys on ALL of them, in order: its result is about
+    the whole line, never about one of its checks alone."""
+    found, _segs = _check_segments(command)
+    if not found:
+        return " ".join(str(command or "").lower().split())[:200]
+    return " && ".join(_check_key(d) for _i, d in found)
+
+
+def _check_scope(d):
+    """(tool, positional paths, filtered?) of ONE check descriptor."""
     paths, filtered, skip = [], False, False
     for a in d.get("args") or ():
         if skip:
@@ -437,22 +450,49 @@ def scope_of(command):
     return d["tool"], tuple(paths), filtered
 
 
-def covers(pass_command, fail_command):
-    """True when a PASS of `pass_command` also re-ran what `fail_command` ran:
-    the same check, or the same tool over the whole suite / a folder that
-    contains the failing path."""
-    if command_key(pass_command) == command_key(fail_command):
+def scope_of(command):
+    """(tool, positional paths, filtered?) of a check -- what part of the
+    suite it ran. A run with no paths and no filter is the WHOLE suite.
+    (The first check of the command; covers() looks at every check.)"""
+    d = detect(command)
+    if not d:
+        return None, (), False
+    return _check_scope(d)
+
+
+def _check_covers(p, f):
+    """True when the passing check `p` re-ran what the failing check `f` ran."""
+    if _check_key(p) == _check_key(f):
         return True
-    tp, pp, fp = scope_of(pass_command)
-    tf, pf, ff = scope_of(fail_command)
+    tp, pp, fp = _check_scope(p)
+    tf, pf, _ff = _check_scope(f)
     if not tp or tp != tf or fp:
         return False
     if not pp:
         return True                         # the whole suite, unfiltered
     if not pf:
         return False                        # a part does not cover the whole
-    return all(any(f == p or f.startswith(p + "/") or f.startswith(p + "::")
-                   for p in pp) for f in pf)
+    return all(any(x == y or x.startswith(y + "/") or x.startswith(y + "::")
+                   for y in pp) for x in pf)
+
+
+def covers(pass_command, fail_command):
+    """True when a PASS of `pass_command` also re-ran what `fail_command` ran:
+    the same check, or the same tool over the whole suite / a folder that
+    contains the failing path.
+
+    A command that runs several checks (only ever readable when `&&` joins
+    them) is credited as a whole: its PASS means every check in it passed, so
+    each of them can cover a failure; its FAIL cannot say which check failed,
+    so this one PASS covers it only when it re-ran EVERY one of its checks
+    (outstanding_failures also accepts separate later PASSes, one per check)."""
+    if command_key(pass_command) == command_key(fail_command):
+        return True
+    passed = [d for _i, d in _check_segments(pass_command)[0]]
+    failed = [d for _i, d in _check_segments(fail_command)[0]]
+    if not passed or not failed:
+        return False
+    return all(any(_check_covers(p, f) for p in passed) for f in failed)
 
 
 # --------------------------------------------------------------------------- #
@@ -986,8 +1026,15 @@ def _classify(command, exit_code, output, is_error):
     # WHOSE EXIT CODE IS IT? Only the check's own when nothing after it can
     # replace it: `pytest | tail`, `pytest; echo done`, `pytest || true` all
     # end with someone else's status. `cd x && pytest && echo ok` keeps it.
-    last = found[-1][0]
-    masked = any(op not in ("&&", None) for _seg, op in segs[last:])
+    # Several checks: from the FIRST one on, only `&&` keeps every check's
+    # status in the line's exit code. `pytest a; pytest b` (or `||`) ends with
+    # b's status only, so a ZERO says nothing about a (its failure would
+    # vanish behind b's pass). A NON-zero one is still b's own failure, and
+    # the line is keyed on all its checks, so it is kept: an observed FAIL.
+    last, first = found[-1][0], found[0][0]
+    masked_last = any(op not in ("&&", None) for _seg, op in segs[last:])
+    masked_first = any(op not in ("&&", None) for _seg, op in segs[first:])
+    masked = masked_last or (masked_first and exit_code == 0)
     if masked:
         exit_code = None
     nonzero = (exit_code is not None and exit_code != 0) or \
@@ -1027,17 +1074,33 @@ def from_event(ev):
 # Reading a list of observed results
 # --------------------------------------------------------------------------- #
 
+def _covered_later(fail_command, pass_commands):
+    """True when the later PASSes re-ran what `fail_command` ran. One PASS
+    that covers it is enough; a FAIL of several checks is also covered when
+    each of its checks was re-run green by SOME later PASS (separate re-runs:
+    `pytest a`, then `pytest b`, after a failed `pytest a && pytest b`)."""
+    if any(covers(p, fail_command) for p in pass_commands):
+        return True
+    failed = [d for _i, d in _check_segments(fail_command)[0]]
+    if len(failed) < 2:
+        return False
+    passed = [d for p in pass_commands for _i, d in _check_segments(p)[0]]
+    return bool(passed) and all(any(_check_covers(p, f) for p in passed) for f in failed)
+
+
 def outstanding_failures(results):
     """The FAILs nothing later re-ran green: the latest run of each check that
-    failed, unless a later PASS covers it (same check, or the same tool over
-    the whole suite / an enclosing folder). Oldest first."""
+    failed, unless later PASSes cover it (same check, or the same tool over
+    the whole suite / an enclosing folder; for a FAIL of several checks, each
+    check re-run green by some later PASS). Oldest first."""
     out = []
     items = [r for r in (results or ()) if isinstance(r, dict) and r.get("command")]
     for i, r in enumerate(items):
         if r.get("verdict") != FAIL:
             continue
         later = items[i + 1:]
-        if any(x.get("verdict") == PASS and covers(x["command"], r["command"]) for x in later):
+        if _covered_later(r["command"],
+                          [x["command"] for x in later if x.get("verdict") == PASS]):
             continue
         key = command_key(r["command"])
         if any(x.get("verdict") == FAIL and command_key(x["command"]) == key for x in later):

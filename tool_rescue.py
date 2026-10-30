@@ -18,7 +18,9 @@ SAFETY: a rescued call is only ever emitted when its name is one the CLIENT
 offered in this request. A model that invents a tool name has NOT produced a
 usable call -- handing it back would make the agent loop fail on an unknown
 tool, which is worse than retrying elsewhere -- so those still fall through to
-the old path.
+the old path. The same goes for a call whose arguments are not a JSON object
+(a typed `42` or `["ls"]`), or are only the {"input": text} stand-in on a tool
+that has no "input" parameter (see _usable, typed_call_unusable).
 
 Dialects handled, all observed in the wild:
 
@@ -57,6 +59,7 @@ import uuid
 _log = logging.getLogger("free-llm-hub")
 
 _TOOL_CALL_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.I | re.S)
+_TOOL_CALL_CLOSE = re.compile(r"</tool_call>", re.I)
 # An UNCLOSED block still gets a chance: models truncated by max_tokens open the
 # tag, write a complete JSON object, and never close it.
 _TOOL_CALL_OPEN = re.compile(r"<tool_call>(.*)$", re.I | re.S)
@@ -74,44 +77,77 @@ _ARG_KEYS = ("arguments", "args", "parameters", "params", "input", "tool_input")
 # Finding JSON inside prose
 # --------------------------------------------------------------------------- #
 
+# Work cap for _json_objects, in characters stepped: a looping model's reply
+# of unbalanced braces must not hold the request thread. Normal text costs
+# about one step per character.
+_SCAN_BUDGET_MIN = 200000
+_SCAN_BUDGET_PER_CHAR = 8
+
+
 def _json_objects(text):
     """Yield every balanced {...} in `text`, outermost first.
 
     A regex cannot do this: tool arguments nest, and they contain braces inside
     strings. Scanning with a depth counter that knows about strings and escapes
     can, and it is the difference between rescuing a nested argument object and
-    truncating it at the first inner brace."""
-    i, n = 0, len(text or "")
+    truncating it at the first inner brace.
+
+    Each '{' is a fresh start (outside any string), as before. Linear in
+    practice: a brace met OUTSIDE a string while scanning from an earlier start
+    behaves exactly as a fresh start there, so where it closes (or that it never
+    does) is remembered instead of rescanned. A looping reply of unbalanced
+    braces ('{"a": {"a": ...') used to rescan to the end from every brace --
+    seconds of CPU on the request thread. A step budget bounds the rest (braces
+    seen only inside strings); past it nothing more is yielded."""
+    text = text or ""
+    n = len(text)
+    close = {}                 # '{' position -> its '}' position, or -1: never closes
+    budget = _SCAN_BUDGET_MIN + _SCAN_BUDGET_PER_CHAR * n
+    i = 0
     while i < n:
-        if text[i] != "{":
-            i += 1
-            continue
-        depth, j, in_str, esc = 0, i, False, False
-        while j < n:
-            ch = text[j]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
+        i = text.find("{", i)
+        if i < 0:
+            return
+        if i not in close:
+            stack, j, in_str, esc = [], i, False, False
+            while j < n:
+                budget -= 1
+                if budget < 0:
+                    return
+                ch = text[j]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
                 elif ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if j < n and depth == 0:
-            chunk = text[i:j + 1]
+                    in_str = True
+                elif ch == "{":
+                    known = close.get(j) if j != i else None
+                    if known is not None:
+                        if known < 0:
+                            break      # it never closes, so nothing around it can
+                        j = known + 1  # its object was already scanned: skip it
+                        continue
+                    stack.append(j)
+                elif ch == "}" and stack:
+                    close[stack.pop()] = j
+                    if not stack:
+                        break
+                j += 1
+            for k in stack:
+                close[k] = -1
+        end = close[i]
+        if end >= 0:
             try:
-                yield json.loads(chunk), i, j + 1
-            except ValueError:
+                obj = json.loads(text[i:end + 1])
+            except (ValueError, RecursionError):
                 pass
-            i = j + 1
+            else:
+                yield obj, i, end + 1
+            i = end + 1
         else:
             i += 1                     # unbalanced: keep looking past this brace
 
@@ -138,6 +174,26 @@ def _as_arg_string(value):
 
 def _call(name, args):
     return {"name": str(name), "arguments": _as_arg_string(args)}
+
+
+def _usable(call, schemas=None):
+    """True when the client can run this rescued call: its arguments are a JSON
+    OBJECT (a typed `42`, `["ls"]` or `"text"` fails every tool schema), and they
+    are not the {"input": text} stand-in for non-JSON text on a tool whose
+    schema declares its parameters and no "input". Such a call goes back to the
+    non-answer / failover path instead, like an invented tool name."""
+    try:
+        args = json.loads(call.get("arguments") or "{}")
+    except (TypeError, ValueError, RecursionError, AttributeError):
+        return False
+    if not isinstance(args, dict):
+        return False
+    if list(args) == ["input"] and isinstance(schemas, dict):
+        props = (schemas.get(call.get("name")) or {})
+        props = props.get("properties") if isinstance(props, dict) else None
+        if isinstance(props, dict) and props and "input" not in props:
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -228,12 +284,19 @@ _TC_END = _special("tool", "call", "end")
 _TCS_END = _special("tool", "calls", "end")
 _TC_SEP = "(?:" + _special("tool", "sep") + "|" + _special("tool", "call", "argument", "begin") + ")"
 
+# An opening tag's attributes, BOUNDED: an unbounded [^>]* rescanned to the end
+# of the text from every opener a looping reply leaves unclosed ("<invoke "
+# x 8000 took seconds). Real attributes are a name and a hint or two.
+_TAG_ATTRS = r"[^>]{0,1024}"
+# What may precede `name=` inside an <invoke ...> opener (lazy, short).
+_BEFORE_NAME = r"[^>]{0,200}?"
+
 _DSML_INVOKE_RE = re.compile(
-    _DSML_OPEN + r"invoke\b([^>]*)>(.*?)(?=" + _DSML_CLOSE + r"invoke\s*>|" + _DSML_OPEN
-    + r"invoke\b|" + _DSML_CLOSE + r"function_calls\s*>|\Z)", re.I | re.S)
+    _DSML_OPEN + r"invoke\b(" + _TAG_ATTRS + r")>(.*?)(?=" + _DSML_CLOSE + r"invoke\s*>|"
+    + _DSML_OPEN + r"invoke\b|" + _DSML_CLOSE + r"function_calls\s*>|\Z)", re.I | re.S)
 _DSML_PARAM_RE = re.compile(
-    _DSML_OPEN + r"parameter\b([^>]*)>(.*?)(?:" + _DSML_CLOSE + r"parameter\s*>|(?="
-    + _DSML_OPEN + r"parameter\b)|\Z)", re.I | re.S)
+    _DSML_OPEN + r"parameter\b(" + _TAG_ATTRS + r")>(.*?)(?:" + _DSML_CLOSE
+    + r"parameter\s*>|(?=" + _DSML_OPEN + r"parameter\b)|\Z)", re.I | re.S)
 _ATTR_RE = re.compile(r"([\w-]+)\s*=\s*([\"'])(.*?)\2", re.S)
 _SPECIAL_CALL_RE = re.compile(
     _TC_BEGIN + r"(.*?)" + _TC_SEP + r"(.*?)(?=" + _TC_END + "|" + _TC_BEGIN + "|" + _TCS_END
@@ -253,13 +316,13 @@ _MARKUP_START_RE = re.compile(
     # shape was known; this plain one was not, so the call reached the CLI as
     # prose and nothing ran. `name=` is required so bare <invoke> prose is not
     # an opener.
-    + r"|<\s*" + _NS + r"invoke\b[^>]*\bname\s*="
+    + r"|<\s*" + _NS + r"invoke\b" + _BEFORE_NAME + r"\bname\s*="
     + r"|<\s*" + _NS + r"function_calls\s*>", re.I)
 # Every tag of that markup, to find where it ENDS.
 _MARKUP_TAG_RE = re.compile(
-    r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR + r"[^>]*>"
+    r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR + _TAG_ATTRS + r">"
     r"|<\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>"
-    r"|<\s*/?\s*" + _NS + r"(?:invoke|parameter|function_calls)\b[^>]*>", re.I)
+    r"|<\s*/?\s*" + _NS + r"(?:invoke|parameter|function_calls)\b" + _TAG_ATTRS + r">", re.I)
 # The openers, normalised (see _norm_marker), for the streaming prefix hold.
 _MARKERS = ("<|dsml|", "<|tool_calls_begin|>", "<|tool_call_begin|>",
             "<|tool_calls_section_begin|>", "<invoke", "<function_calls>")
@@ -365,12 +428,12 @@ _FENCE_MARKS = re.compile(r"```(?:json)?", re.I)
 # _MARKUP_START_RE). Values carry no string="true|false" hint, so the schema
 # decides their type via _dsml_value, exactly like a DSML parameter would.
 _XML_INVOKE_RE = re.compile(
-    r"<\s*" + _NS + r"invoke\b([^>]*)>(.*?)(?:<\s*/\s*" + _NS + r"invoke\s*>|(?=<\s*"
-    + _NS + r"invoke\b[^>]*\bname\s*=)|(?=<\s*/\s*" + _NS + r"function_calls\s*>)|\Z)",
-    re.I | re.S)
+    r"<\s*" + _NS + r"invoke\b(" + _TAG_ATTRS + r")>(.*?)(?:<\s*/\s*" + _NS
+    + r"invoke\s*>|(?=<\s*" + _NS + r"invoke\b" + _BEFORE_NAME + r"\bname\s*=)|(?=<\s*/\s*"
+    + _NS + r"function_calls\s*>)|\Z)", re.I | re.S)
 _XML_PARAM_RE = re.compile(
-    r"<\s*" + _NS + r"parameter\b([^>]*)>(.*?)(?:<\s*/\s*" + _NS + r"parameter\s*>|(?=<\s*"
-    + _NS + r"parameter\b)|\Z)", re.I | re.S)
+    r"<\s*" + _NS + r"parameter\b(" + _TAG_ATTRS + r")>(.*?)(?:<\s*/\s*" + _NS
+    + r"parameter\s*>|(?=<\s*" + _NS + r"parameter\b)|\Z)", re.I | re.S)
 
 
 def _xml_calls(text, schemas=None):
@@ -420,12 +483,68 @@ def tool_schemas(tools):
     return out
 
 
+# Qwen3-Coder's text dialect: <function=NAME><parameter=KEY>value</parameter>
+# ...</function> (some models write <parameter name="KEY"> instead). Without
+# this the parameter tags became {"input": "<parameter=...>"}, a call no
+# client can run.
+_FUNCTION_PARAM_RE = re.compile(
+    r"<\s*parameter\s*(?:=|\s+name\s*=)\s*[\"']?([A-Za-z0-9_.-]+)[\"']?\s*>(.*?)"
+    r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\b)|\Z)", re.I | re.S)
+
+
+_PARAM_FIRST_RE = re.compile(r"\s*<\s*parameter\b", re.I)
+
+
+def _function_params(name, body, schemas=None):
+    """The <parameter=KEY> pairs of a <function=NAME> body as an arguments
+    object (values typed by the tool's schema, like DSML), or None. Only when
+    the body OPENS with a parameter tag: a JSON body whose string values
+    mention <parameter=...> is still read as that JSON."""
+    if not _PARAM_FIRST_RE.match(body or ""):
+        return None
+    pairs = _FUNCTION_PARAM_RE.findall(body)
+    if not pairs:
+        return None
+    return {k: _dsml_value(raw, {}, _schema_type(schemas, name, k)) for k, raw in pairs}
+
+
+def _upto_last_close(text):
+    """`text` up to its last </tool_call>: an opener after it can never close,
+    and the lazy block regex rescanned to the end from each one -- quadratic on
+    a looping reply of bare <tool_call> openers."""
+    end = 0
+    for m in _TOOL_CALL_CLOSE.finditer(text):
+        end = m.end()
+    return text[:end]
+
+
 def parse(text, allowed_names=None, schemas=None):
     """Every rescuable call in `text`, as OpenAI function dicts.
 
     `allowed_names`: the tool names the client offered. When given, a call to
     anything else is dropped -- an invented name is not a usable call.
-    `schemas` ({name: parameters}) only refines DSML value typing."""
+    `schemas` ({name: parameters}) refines value typing (DSML, <parameter=>)
+    and lets an {"input": text} stand-in be dropped for a tool that declares
+    other parameters. A call whose arguments are not a JSON object is never
+    returned (see _usable)."""
+    return [c for c in _parse_all(text, allowed_names, schemas) if _usable(c, schemas)]
+
+
+def typed_call_unusable(text, tools):
+    """True when `text` types a call to a tool the client OFFERED that parse()
+    refuses because the client could not run it (see _usable). rescue() then
+    leaves the reply alone, and it must still read as a typed call -- a
+    non-answer that goes to the next model -- not as prose to serve."""
+    names = tool_names(tools)
+    if not names or not isinstance(text, str) or not text:
+        return False
+    schemas = tool_schemas(tools)
+    found = _parse_all(text, names, schemas)
+    return bool(found) and not any(_usable(c, schemas) for c in found)
+
+
+def _parse_all(text, allowed_names=None, schemas=None):
+    """parse() before the _usable filter."""
     if not text or not isinstance(text, str):
         return []
     found = []
@@ -440,7 +559,7 @@ def parse(text, allowed_names=None, schemas=None):
         # An exact repeat is one call typed twice, as on the generic path below.
         return dedupe_calls(found)[0]
 
-    for block in _TOOL_CALL_BLOCK.findall(text):
+    for block in _TOOL_CALL_BLOCK.findall(_upto_last_close(text)):
         found.extend(_from_tool_call_block(block))
     if not found:
         m = _TOOL_CALL_OPEN.search(text)
@@ -448,10 +567,11 @@ def parse(text, allowed_names=None, schemas=None):
             found.extend(_from_tool_call_block(m.group(1)))
 
     for name, body in _FUNCTION_TAG.findall(text):
-        args = None
-        for obj, _s, _e in _json_objects(body):
-            args = obj
-            break
+        args = _function_params(name, body, schemas)
+        if args is None:
+            for obj, _s, _e in _json_objects(body):
+                args = obj
+                break
         found.append(_call(name, args if args is not None else body.strip()))
 
     if not found:
@@ -516,7 +636,9 @@ def _strip_calls(text):
     next to the real call it now has."""
     if has_model_markup(text):
         return strip_model_markup(text)
-    out = _TOOL_CALL_BLOCK.sub("", text or "")
+    out = text or ""
+    head = _upto_last_close(out)
+    out = _TOOL_CALL_BLOCK.sub("", head) + out[len(head):]
     out = _FUNCTION_TAG.sub("", out)
     if "<tool_call>" in out.lower():
         out = _TOOL_CALL_OPEN.sub("", out)
@@ -547,8 +669,12 @@ def rescue(data, tools):
     if not calls:
         return False
 
-    msg["tool_calls"] = [{"id": "call_rescued_%d" % i, "type": "function",
-                          "function": c} for i, c in enumerate(calls)]
+    # A unique id per call. A fixed "call_rescued_0" repeated across turns and
+    # conversations, and the bandit keys its delayed tool-call credit on the id:
+    # a later call was never credited, or another conversation's result was
+    # credited to it.
+    msg["tool_calls"] = [{"id": "call_rescued_" + uuid.uuid4().hex[:20], "type": "function",
+                          "function": c} for c in calls]
     left = _strip_calls(content)
     # A model that typed a call and nothing else leaves no prose behind; content
     # must then be None, not "", or strict clients reject the message.

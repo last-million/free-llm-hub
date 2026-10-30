@@ -588,17 +588,41 @@ def _clean_phases(plan):
     `needs` is sanitised hard because a bad dependency graph is worse than none:
     a self-reference or a forward reference would deadlock the wave scheduler,
     and a supervisor that lists every phase as a dependency silently turns the
-    swarm back into the sequential pipeline this replaced."""
+    swarm back into the sequential pipeline this replaced.
+
+    `needs` are the PLANNER's numbers (its own list positions): they are
+    translated to the kept phases' numbers, so a dropped entry (no task, not
+    an object) neither erases a valid dependency nor re-points one at another
+    phase. A need on a dropped phase is dropped. A planner that writes
+    `phases` as an object ({"1": {...}, "2": {...}}) is read in key order."""
     if not isinstance(plan, dict):
         return []
-    out = []
-    for p in (plan.get("phases") or [])[:MAX_PHASES]:
+    raw_phases = plan.get("phases")
+    if isinstance(raw_phases, dict):
+        items = list(raw_phases.items())
+        try:
+            items.sort(key=lambda kv: int(str(kv[0]).strip()))
+        except (TypeError, ValueError):
+            pass                     # not all numbered: keep the planner's order
+        raw_phases = []
+        for key, p in items:
+            if isinstance(p, dict) and not p.get("title") and \
+                    not str(key).strip().isdigit():
+                p = dict(p, title=str(key))
+            raw_phases.append(p)
+    if not isinstance(raw_phases, list):
+        return []
+    kept = []                        # (the planner's 1-based position, phase, task)
+    for pos, p in enumerate(raw_phases, 1):
         if not isinstance(p, dict):
             continue
         task = str(p.get("task") or "").strip()
-        if not task:
-            continue
-        idx = len(out) + 1
+        if task:
+            kept.append((pos, p, task))
+    kept = kept[:MAX_PHASES]
+    new_of = {pos: i for i, (pos, _p, _t) in enumerate(kept, 1)}
+    out = []
+    for idx, (pos, p, task) in enumerate(kept, 1):
         needs = []
         raw = p.get("needs")
         if isinstance(raw, list):
@@ -607,10 +631,12 @@ def _clean_phases(plan):
                     n = int(n)
                 except (TypeError, ValueError):
                     continue
-                # Only strictly-earlier phases: anything else is a cycle or a
-                # reference to work that does not exist yet.
-                if 1 <= n < idx and n not in needs:
-                    needs.append(n)
+                # Only strictly-earlier phases that were kept: anything else
+                # is a cycle, a reference to work that does not exist yet, or
+                # a phase that was dropped.
+                m = new_of.get(n) if n < pos else None
+                if m and m not in needs:
+                    needs.append(m)
         cleaned = {
             "title": str(p.get("title") or "Phase %d" % idx).strip()[:80],
             "task": task[:PHASE_TASK_CHARS],
@@ -681,6 +707,126 @@ _MUST_HAVE_RE = re.compile(r"\b(include|includes|including|contain|contains|"
 _MIN_WORDS_RE = re.compile(r"\bat\s+least\s+(\d{1,5})\s+words?\b", re.I)
 _MAX_WORDS_RE = re.compile(r"\b(?:at\s+most|under|no\s+more\s+than|maximum(?:\s+of)?|"
                            r"max\.?|fewer\s+than)\s+(\d{1,5})\s+words?\b", re.I)
+# A NEGATED criterion forbids its quoted text: 'Must not include "lorem ipsum"',
+# 'Does not contain "TODO"', 'Never use "eval"'. Until 2026-10-30 every quoted
+# literal next to a must-have verb was read as REQUIRED, negation ignored: clean
+# output was rejected (and its retry told to ADD the forbidden text) while
+# output containing it counted as "proven". A negation the clean form below
+# does not explain ('Include "A" but not "B"', '"eval" is never called') leaves
+# the literals undecided -- the manager judges, the string test claims nothing.
+_NEGATION_RE = re.compile(
+    r"\b(?:not(?!\s+(?:only|more|less|fewer|longer|shorter)\b)|never|nor|none|nothing|"
+    r"nowhere|neither|no(?!\s+(?:more|less|fewer|longer|shorter)\b)|without|cannot|"
+    r"avoid(?:s|ing)?|exclud(?:e|es|ed|ing)|except|forbid(?:s|den)?|prohibit(?:s|ed)?|"
+    r"instead|rather)\b|n['’]t\b", re.I)
+_LIT_VERBS = (r"include|includes|including|contain|contains|containing|mention|mentions|"
+              r"mentioning|name|names|naming|named|use|uses|using|show|shows|showing|"
+              r"titled|heading|have|has|having|define|defines|defining|expose|exposes|"
+              r"exposing|export|exports|exporting|provide|provides|providing|call|calls|"
+              r"calling|called")
+# The words allowed between them are plain auxiliaries only ("must not ever
+# include", "never even use"): any other word may be the negation's real
+# object ("do not FORGET to include"), which turns the meaning around.
+# The negation right before its verb: at most two plain words between them and
+# no punctuation, so "No filler; include \"Pricing\"" is NOT a negated include.
+_NEG_VERB_RE = re.compile(
+    r"(?:\b(?:not|never|no|nor|without|cannot|avoid|avoids|avoiding)\b|n['’]t\b)"
+    r"(?:\s+(?:to|be|ever|even|also|any|actually|directly|explicitly|literally)){0,2}"
+    r"\s+(?:%s)\b" % _LIT_VERBS, re.I)
+# A positive action verb after the negated one ("must not use emojis but must
+# include \"X\"") means the literal is not the negated object.
+_ACT_VERB_RE = re.compile(r"\b(?:include|includes|including|contain|contains|containing|"
+                          r"mention|mentions|use|uses|using|show|shows|have|has|define|"
+                          r"defines|expose|exposes|export|exports|provide|provides|call|"
+                          r"calls)\b", re.I)
+_LIT_SEPARATOR_RE = re.compile(r"^[\s,/]*(?:(?:or|and|nor)\b[\s,/]*)*$", re.I)
+# The verb, then the negation, right before the first literal: 'Contains no
+# "TODO"', 'Includes neither "A" nor "B"', 'Uses none of "eval", "exec"'.
+_VERB_NO_RE = re.compile(r"\b(?:%s)\s+(?:no|none\s+of|neither)\s*$" % _LIT_VERBS, re.I)
+# A negated NEED or a modal makes the text optional, not banned: 'Does not
+# need to include "FAQ"', 'Need not include', 'Not required to include',
+# "Doesn't have to mention", 'It is not necessary to include', 'May or may
+# not include', 'Requires no "FAQ"'. Reading those as "forbidden" would reject
+# valid output and tell its retry to REMOVE allowed text, so a criterion with
+# any of these words leaves its literals undecided.
+_OPTIONAL_CUE_RE = re.compile(
+    r"\b(?:need|needs|needed|needn['’]?t|necessary|necessarily|require|requires|"
+    r"required|requirement|have\s+to|has\s+to|had\s+to|got\s+to|may|might|"
+    r"optional|optionally|obligat\w*|oblig\w*|mandatory|compulsory|essential|"
+    r"a\s+must)\b", re.I)
+# A negated verb that INVERTS the negation, or a "not just" reading, makes the
+# literal required, not banned: 'Do not forget to include "X"', 'Never fail to
+# mention', "Don't hesitate to use", 'Never stop using', 'Cannot help but
+# include', 'Should not just/merely include', 'Not including "X" is a
+# failure'. Reading those as "forbidden" rejects correct output and tells the
+# retry to REMOVE required text, so such a criterion leaves its literals
+# undecided (the manager judges).
+_INVERT_CUE_RE = re.compile(
+    r"\b(?:forget\w*|forgot\w*|fail|fails|failed|failing|failure\w*|neglect\w*|"
+    r"hesitat\w*|stop|stops|stopped|stopping|help\s+but|omit\w*|skip\w*|"
+    r"leave\s+out|left\s+out|miss|misses|missed|missing|just|merely|simply|only|"
+    r"wrong|mistake\w*|error\w*|penalt\w*|lose|loses|losing)\b", re.I)
+
+
+def _literal_rule(crit, spans):
+    """How the literals of acceptance criterion `crit` (their (start, end)
+    `spans`) are checked: "required" (each must appear), "forbidden" (none may
+    appear) or None (a negation makes the reading unclear: undecided).
+
+    No negation outside the literals -> "required", exactly as before. The
+    negated shapes read mechanically: the text before the first literal holds
+    exactly one negation, either right before the must-have verb with no
+    positive verb after it ('Must not include "X"') or right after the verb
+    ('Contains no "X"'); the literals are joined only by commas/or/and/nor;
+    nothing after the last literal is negated. Anything else -> None."""
+    segs, pos = [], 0
+    for s, e in sorted(spans):
+        segs.append(crit[pos:max(pos, s)])
+        pos = max(pos, e)
+    segs.append(crit[pos:])
+    clean = []
+    for seg in segs:
+        for rx in (_MIN_WORDS_RE, _MAX_WORDS_RE, _AT_LEAST_TESTS_RE):
+            seg = rx.sub(" ", seg)
+        clean.append(seg)
+    if not any(_NEGATION_RE.search(seg) for seg in clean):
+        return "required"
+    pre, between, post = clean[0], clean[1:-1], clean[-1]
+    if len(clean) < 2 or _NEGATION_RE.search(post) \
+            or not all(_LIT_SEPARATOR_RE.match(b) for b in between) \
+            or len(_NEGATION_RE.findall(pre)) != 1 \
+            or any(_OPTIONAL_CUE_RE.search(seg) or _INVERT_CUE_RE.search(seg)
+                   for seg in clean):
+        return None
+    last = None
+    for last in _NEG_VERB_RE.finditer(pre):
+        pass
+    if last is not None and _NEGATION_RE.search(last.group(0)) \
+            and not _ACT_VERB_RE.search(pre[last.end():]):
+        return "forbidden"
+    if _VERB_NO_RE.search(pre):
+        return "forbidden"
+    return None
+
+
+def _has_term(low, key):
+    """`key` (lower-case) occurs in `low` as a whole term: a forbidden "eval"
+    is not found inside "evaluate" (a false hit would make a retry rewrite
+    correct text), but is found in "eval(x)"."""
+    if not key:
+        return False
+    pat = re.escape(key)
+    if re.match(r"\w", key[0]):
+        pat = r"(?<!\w)" + pat
+    if re.match(r"\w", key[-1]):
+        pat += r"(?!\w)"
+    return re.search(pat, low) is not None
+
+
+def _literal_spans(crit):
+    """(start, end) of every quoted or backticked literal in `crit`."""
+    return ([m.span() for m in _QUOTED_RE.finditer(crit)]
+            + [m.span() for m in _BACKTICK_RE.finditer(crit)])
 
 
 def _looks_like_json(text):
@@ -697,17 +843,26 @@ def _looks_like_json(text):
 
 def _mechanical_problems(ph, text):
     """Problems a string test can prove, most conservative reading only: a
-    quoted literal an acceptance criterion says must appear, word-count bounds,
-    and a JSON/HTML output format. A criterion this cannot read mechanically is
+    quoted literal an acceptance criterion says must appear (or, negated, must
+    not -- see _literal_rule), word-count bounds, and a JSON/HTML output
+    format. A criterion this cannot read mechanically is
     left to the manager's verdict — never guessed at here."""
     problems = []
     low = (text or "").lower()
     for crit in ph.get("acceptance") or []:
-        if _MUST_HAVE_RE.search(crit):
-            for lit in _QUOTED_RE.findall(crit):
-                if lit.strip().lower() not in low:
+        lits = _QUOTED_RE.findall(crit)
+        if lits and _MUST_HAVE_RE.search(crit):
+            # "required" / "forbidden" / None (a negation this cannot read
+            # with certainty: no problem claimed, the manager judges).
+            rule = _literal_rule(crit, _literal_spans(crit))
+            for lit in lits:
+                key = lit.strip().lower()
+                if rule == "required" and key not in low:
                     problems.append('missing required text "%s" (criterion: %s)'
                                     % (lit.strip(), crit))
+                elif rule == "forbidden" and _has_term(low, key):
+                    problems.append('contains forbidden text "%s" -- remove it '
+                                    '(criterion: %s)' % (lit.strip(), crit))
         words = len(re.findall(r"\w+", text or ""))
         m = _MIN_WORDS_RE.search(crit)
         if m and words < int(m.group(1)):
@@ -1027,21 +1182,34 @@ def _code_problems(ph, text, deps=None, request=""):
 
 def _criterion_proven(crit, text):
     """True when string tests DECIDE acceptance criterion `crit` and it holds
-    (every quoted/backticked literal it requires is present, word/test counts,
+    (every quoted/backticked literal it requires is present -- or absent, when
+    the criterion forbids it, see _literal_rule -- word/test counts,
     a markdown table, valid JSON) and nothing in it is left unchecked. None =
     a string test cannot decide it (the manager judges); False = it fails."""
     low = (text or "").lower()
     rest = " %s " % crit.lower()
     decided = False
+    undecided = False
     lits = _QUOTED_RE.findall(crit) + _BACKTICK_RE.findall(crit)
     if lits and (_MUST_HAVE_RE.search(crit) or _DEFINES_RE.search(crit)):
-        for lit in lits:
-            key = lit.strip().lower()
-            key = key[:-2] if key.endswith("()") else key
-            if key and key not in low:
-                return False
-            rest = rest.replace(lit.lower(), " ")
-        decided = True
+        rule = _literal_rule(crit, _literal_spans(crit))
+        if rule is None:
+            # A negation string tests cannot read with certainty: the
+            # literals are not decided (a count below can still fail it).
+            undecided = True
+        else:
+            for lit in lits:
+                key = lit.strip().lower()
+                key = key[:-2] if key.endswith("()") else key
+                if rule == "required" and key and key not in low:
+                    return False
+                if rule == "forbidden" and _has_term(low, key):
+                    return False
+                rest = rest.replace(lit.lower(), " ")
+            if rule == "forbidden":
+                # Its one negation is part of the check, not something left.
+                rest = _NEGATION_RE.sub(" ", rest)
+            decided = True
     words = len(re.findall(r"\w+", text or ""))
     for rx, ok in ((_MIN_WORDS_RE, lambda n: words >= n),
                    (_MAX_WORDS_RE, lambda n: words <= int(n * 1.5))):
@@ -1065,7 +1233,7 @@ def _criterion_proven(crit, text):
         if not _looks_like_json(text):
             return False
         decided = True
-    if not decided:
+    if not decided or undecided:
         return None
     left = [w for w in _part_keywords(rest)
             if w not in _CHECK_WORDS and _norm_word(w) not in _CHECK_WORDS]
@@ -1529,6 +1697,12 @@ _SEVERITY_TAG_RE = re.compile(
     r"[:\-–—]?|(high|critical|blocker|severe|medium|low|minor)\s*"
     r"[:\-–—])\s*", re.I)
 _BROKEN_PREFIXES = ("the output degenerated", "the output was empty")
+
+
+def _broken(probs):
+    """True when the free checks found the output empty or degenerate (not
+    merely short of a criterion): such an attempt ranks below any real one."""
+    return any(str(p).startswith(_BROKEN_PREFIXES) for p in probs or ())
 
 
 def default_family(model_id):
@@ -2585,7 +2759,14 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 tried.add(w.split("/", 1)[0])
             before = len(best["probs"])
             after = len(p) if t.strip() else None
-            better = after is not None and after < before
+            # Ranked by (degenerate?, problem count): a degenerate answer
+            # carries ONE problem (the check returns early), so by count alone
+            # it tied a real attempt with one mechanical problem and replaced
+            # it. It now ranks below every real attempt, and a real attempt
+            # replaces a degenerate best whatever its count.
+            rank_new = (_broken(p), after) if after is not None else None
+            rank_best = (_broken(best["probs"]) or not best["text"].strip(), before)
+            better = rank_new is not None and rank_new < rank_best
             policy.note(choice, better, phase=idx, title=title[:80], attempt=n,
                         score_before=before, score_after=after,
                         accepted=after == 0, forced=forced, who=w)
@@ -2593,7 +2774,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                  % (title[:30], choice, n, "accepted" if after == 0 else
                     "no answer" if after is None else
                     "%d problem%s" % (after, "" if after == 1 else "s")))
-            if after is not None and after <= before:
+            if rank_new is not None and rank_new <= rank_best:
                 best = {"text": t, "who": w, "probs": p}
         return best["text"], best["who"], trail, best["probs"]
 
@@ -2620,12 +2801,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
         def _rejected(probs):
             """Note a rejection: its provider excluded next time, its text
-            kept as the fallback when it has any."""
+            kept as the fallback when it has any -- unless the free checks
+            found it degenerate: junk never replaces a real earlier attempt
+            as what ships when nothing passes."""
             for i, p in sorted(probs.items()):
                 emit("verify", "%s: %s" % (phases[i - 1]["title"][:30], p[0][:44]))
                 if st[i]["who"]:
                     st[i]["failed"].add(st[i]["who"].split("/", 1)[0])
-                if st[i]["text"].strip():
+                if st[i]["text"].strip() and not (
+                        _broken(p) and st[i]["fallback"].strip()
+                        and st[i]["fallback"] != st[i]["text"]):
                     st[i]["fallback"] = st[i]["text"]
 
         def _retry(probs):

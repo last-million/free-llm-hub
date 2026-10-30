@@ -424,7 +424,17 @@ def _kill_tree(popen, sig=None):
     Windows is a launcher with the real interpreter as its child -- killing
     only the top process leaves those running. Windows: `taskkill /T` walks the
     tree by parent PID. POSIX: the process was started in its own session, so
-    its group id is its pid and killpg takes every member. Never raises."""
+    its group id is its pid and killpg takes every member.
+
+    POSIX, like publish._kill_tree: once the leader has EXITED (and been reaped
+    by _pump / the start loop's poll()), its pid may already belong to another
+    process, so getpgid(pid) would name THAT process's group. The group id is
+    then taken to be the pid itself (its own session), never looked up; and the
+    hub's own group is never signalled. Never raises."""
+    try:
+        exited = popen.poll() is not None
+    except Exception:                                            # noqa: BLE001
+        exited = False
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(popen.pid)],
@@ -433,12 +443,25 @@ def _kill_tree(popen, sig=None):
         else:
             import signal
             sig = signal.SIGKILL if sig is None else sig
+            pgid = popen.pid        # its own session: the group id is the pid
+            if not exited:
+                try:
+                    pgid = os.getpgid(popen.pid)
+                except OSError:
+                    pgid = popen.pid    # leader gone; the group outlives it
+            if pgid == os.getpgrp():
+                # Never the hub's own group. Only the process itself, and
+                # only while it is still ours to signal.
+                if not exited:
+                    popen.kill()
+                return
             try:
-                pgid = os.getpgid(popen.pid)
-            except OSError:
-                pgid = popen.pid    # leader gone; the group outlives it
-            os.killpg(pgid, sig)
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass                    # the whole group is gone already
     except Exception:                                            # noqa: BLE001
+        if exited:
+            return
         try:
             popen.kill()
         except Exception:                                        # noqa: BLE001
@@ -660,6 +683,46 @@ def _env_for(project_dir, port):
     return env
 
 
+# Debugger / devtools ports a dev server may open next to the app (Node and
+# Deno `--inspect` 9229, its cluster children 9230-9231, Chrome remote debugging
+# 9222, Bun `--inspect` 6499). They answer HTTP, so they look like a server, but
+# they are a remote-code-execution debugger: never the preview, never published.
+_DEBUGGER_PORTS = frozenset({6499, 9222, 9229, 9230, 9231})
+
+
+def _not_the_app(port):
+    """A port the preview must never follow: the hub's own, its preview range
+    (another preview), or a debugger port."""
+    return (port == _hub_port() or PORT_RANGE[0] <= port <= PORT_RANGE[1]
+            or port in _DEBUGGER_PORTS)
+
+
+def _tree_listen_ports(pid):
+    """Every port `pid` or one of its children listens on, or None when that
+    cannot be read (no psutil, the process is gone, or no process in the tree
+    let us see its sockets)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        proc = psutil.Process(pid)
+        procs = [proc] + proc.children(recursive=True)
+    except Exception:                                            # noqa: BLE001
+        return None
+    ports, readable = set(), False
+    for p in procs:
+        try:
+            conns = p.net_connections(kind="inet")
+        except Exception:                                        # noqa: BLE001
+            continue
+        readable = True
+        for c in conns:
+            if c.status == psutil.CONN_LISTEN and c.laddr:
+                ports.add(c.laddr.port)
+    return ports if readable else None
+
+
 def _child_listen_port(pid):
     """A port the process we launched (or one of its children) is LISTENING on.
 
@@ -670,7 +733,8 @@ def _child_listen_port(pid):
     Children matter: npm and a shell wrapper both hold the socket one level
     down. The hub's own port and its preview range are excluded: the first is
     never the project's, and the second would let a stale preview elsewhere in
-    the range be mistaken for this one."""
+    the range be mistaken for this one. Debugger ports (`node --inspect` binds
+    9229 before the app binds its own) are skipped too."""
     try:
         import psutil
     except ImportError:
@@ -690,7 +754,7 @@ def _child_listen_port(pid):
             if c.status != psutil.CONN_LISTEN or not c.laddr:
                 continue
             found = c.laddr.port
-            if found == hub or PORT_RANGE[0] <= found <= PORT_RANGE[1]:
+            if found == hub or _not_the_app(found):
                 continue
             return found
     return None
@@ -712,8 +776,20 @@ def _logged_listen_port(proc):
     ignores PORT -- `app.run()` binds 5000 -- the hub sat on its own port for
     90s and answered "no response on port 5800" about a server that had
     printed "Running on http://127.0.0.1:5000" in its second line. The line
-    is the server's own word; only a port that actually answers is taken."""
-    hub = _hub_port()
+    is the server's own word; only a port that actually answers is taken.
+
+    A printed port is only a claim, though: a project can print the address of
+    some OTHER local service (or of another preview in PORT_RANGE). So the
+    preview range, debugger ports and the hub's port are never taken, and when
+    the hub CAN read the process tree's sockets, a printed port that nothing in
+    that tree listens on is not taken either. Only when the sockets cannot be
+    read (no psutil -- the case above -- or a project running inside WSL, whose
+    Linux sockets are not visible from Windows) does the line alone decide."""
+    owned = None
+    popen = getattr(proc, "popen", None)
+    pid = getattr(popen, "pid", None)
+    if pid and not _wsl(getattr(proc, "project_dir", None) or ""):
+        owned = _tree_listen_ports(pid)
     for line in reversed(proc.tail(200)):
         if line.startswith("[hub]"):
             continue
@@ -722,7 +798,9 @@ def _logged_listen_port(proc):
                 found = int(m.group(1))
             except ValueError:
                 continue
-            if found == hub or found == proc.port:
+            if found == proc.port or _not_the_app(found):
+                continue
+            if owned is not None and found not in owned:
                 continue
             if _port_open(found):
                 return found
@@ -1390,6 +1468,15 @@ ATTACH_DIR = ".hub-attachments"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _is_link(path):
+    """A symlink, junction or other link (deploy_perfect.is_link). Never raises."""
+    try:
+        import deploy_perfect
+        return bool(deploy_perfect.is_link(path))
+    except Exception:                                            # noqa: BLE001
+        return os.path.islink(path)
+
+
 def save_attachment(project_dir, raw, ext, name=None):
     """Write a pasted/dropped image INTO the project and return its relative path.
 
@@ -1404,6 +1491,9 @@ def save_attachment(project_dir, raw, ext, name=None):
     writes to the user's disk."""
     project_dir = os.path.abspath(project_dir)
     out_dir = os.path.join(project_dir, ATTACH_DIR)
+    if _is_link(out_dir):
+        # A junction or symlink here would carry the image out of the project.
+        raise WorkspaceError("refusing to write outside the project")
     os.makedirs(out_dir, exist_ok=True)
     ext = _SAFE_NAME_RE.sub("", (ext or "png").lower())[:5] or "png"
     stem = _SAFE_NAME_RE.sub("-", os.path.splitext(name or "")[0])[:40].strip("-")
@@ -1411,12 +1501,14 @@ def save_attachment(project_dir, raw, ext, name=None):
     while True:
         fname = "%s-%d.%s" % (stem or "shot", n, ext)
         path = os.path.join(out_dir, fname)
-        if not os.path.exists(path):
+        if not os.path.lexists(path):     # a dangling link counts as taken
             break
         n += 1
-    if os.path.commonpath([os.path.abspath(path), project_dir]) != project_dir:
+    # Real paths, not abspath: abspath does not resolve a link, so a folder
+    # swapped for a link after the check above would still pass commonpath.
+    if _is_link(out_dir) or not _inside(project_dir, path):
         raise WorkspaceError("refusing to write outside the project")
-    with open(path, "wb") as fh:
+    with open(path, "xb") as fh:
         fh.write(raw)
     return os.path.join(ATTACH_DIR, fname).replace("\\", "/")
 
@@ -1934,10 +2026,28 @@ def sweep_own_range():
 
 
 # What a preview the hub spawned looks like from the outside, for a leak left by
-# a PREVIOUS hub that predates the marker. Deliberately the launcher shapes
-# _detect_at produces and nothing wider.
-_PREVIEW_CMDLINE_HINTS = ("http.server", "vite", "npm", "npx",
-                          ".venv", "manage.py", "uvicorn")
+# a PREVIOUS hub that predates the marker. Only the two launcher shapes
+# _detect_at produces that carry the port on the command line in a form a user
+# rarely types: `python -m http.server --bind 127.0.0.1 <port>` and
+# `vite --host 127.0.0.1 --port <port>`. A substring test over the whole
+# command line ("npm", ".venv", "uvicorn"...) also matched any global npm tool
+# and any venv server the user ran in this range, and killed it.
+def _launcher_shape(argv, port):
+    """True when `argv` is one of the hub's own launcher shapes on `port`."""
+    toks = [str(a).strip().lower() for a in argv or ()]
+    p = str(port)
+    for i in range(len(toks) - 4):
+        if (toks[i] == "-m" and toks[i + 1] == "http.server"
+                and toks[i + 2] == "--bind" and toks[i + 3] == "127.0.0.1"
+                and toks[i + 4] == p):
+            return True
+    names = [os.path.basename(t.replace("\\", "/")) for t in toks]
+    if any(n in ("vite", "vite.js", "vite.cmd", "vite.mjs") for n in names):
+        for i in range(len(toks) - 3):
+            if (toks[i] == "--host" and toks[i + 1] == "127.0.0.1"
+                    and toks[i + 2] == "--port" and toks[i + 3] == p):
+                return True
+    return False
 
 
 def _is_hub_preview(port):
@@ -1968,10 +2078,10 @@ def _is_hub_preview(port):
         except Exception:                                        # noqa: BLE001
             pass                      # AccessDenied is routine; fall through
         try:
-            cmd = " ".join(proc.cmdline()).lower()
+            argv = proc.cmdline()
         except Exception:                                        # noqa: BLE001
             continue
-        if any(h in cmd for h in _PREVIEW_CMDLINE_HINTS):
+        if _launcher_shape(argv, port):
             return True
     return False
 

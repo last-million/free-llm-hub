@@ -644,15 +644,21 @@ class FrameProxy:
         return ("\r\n".join(out) + "\r\n\r\n").encode("latin-1")
 
     def _tunnel(self, client, creader, up, upr):
-        """Raw bytes both ways until either side closes."""
-        client.settimeout(None)
-        up.settimeout(None)
-        pending = creader.take()
-        if pending:
-            up.sendall(pending)
-        pending = upr.take()
-        if pending:
-            client.sendall(pending)
+        """Raw bytes both ways until either side closes. `up` is untracked
+        and closed on EVERY way out, including a failed first write (the
+        caller has already handed `up` over and will not close it)."""
+        try:
+            client.settimeout(None)
+            up.settimeout(None)
+            pending = creader.take()
+            if pending:
+                up.sendall(pending)
+            pending = upr.take()
+            if pending:
+                client.sendall(pending)
+        except BaseException:
+            self._untrack(up)
+            raise
 
         def pump(src, dst):
             try:

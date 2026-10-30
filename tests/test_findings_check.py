@@ -361,6 +361,177 @@ def test_a_scanner_template_match_needs_review():
     assert ev["status"] == "needs_review" and "template match" in ev["reasons"][0]
 
 
+# --- the agent's own payload is never proof (2026-10-30 review) -------------------------- #
+
+SSRF_CLAIM = "Confirmed SSRF at https://api.example.com/fetch."
+OOB_URL = "http://abc123.oast.fun/"
+
+
+def test_the_payload_domain_echoed_in_the_request_is_not_an_interaction():
+    out = ("* Connected to api.example.com\n> GET /fetch?url=%s HTTP/1.1\n> Host: api.example.com\n"
+           ">\n< HTTP/1.1 403 Forbidden\n< content-type: text/html\n<\n<h1>Forbidden</h1>" % OOB_URL)
+    ev = F.evidence(_claim(SSRF_CLAIM), [_res("c0", "curl -v 'https://api.example.com/fetch?url=%s'"
+                                                     % OOB_URL, out)])
+    assert ev["status"] != "proven" and ev["proof"] == "none"
+
+
+def test_an_error_body_reflecting_the_payload_url_is_not_an_interaction():
+    out = 'HTTP/1.1 400 Bad Request\ncontent-type: application/json\n\n{"error":"url not allowed: %s"}' % OOB_URL
+    ev = F.evidence(_claim(SSRF_CLAIM), [_res("c0", "curl -si 'https://api.example.com/fetch?url=%s'"
+                                                     % OOB_URL, out)])
+    assert ev["status"] != "proven"
+
+
+def test_an_rce_payload_domain_in_the_request_is_not_command_output():
+    claim = _claim("Confirmed remote code execution at https://api.example.com/ping.")
+    assert claim["class"] == "rce"
+    out = ("> GET /ping?host=127.0.0.1;nslookup+abc.oast.fun HTTP/1.1\n> Host: api.example.com\n>\n"
+           "< HTTP/1.1 200 OK\n<\nPING 127.0.0.1: 56 data bytes")
+    ev = F.evidence(claim, [_res("c0", "curl -v 'https://api.example.com/ping?host=127.0.0.1;nslookup+abc.oast.fun'",
+                                 out)])
+    assert ev["status"] != "proven"
+
+
+@pytest.mark.parametrize("log", [
+    "[abc123] Received HTTP interaction from 203.0.113.9 at 2026-10-30 10:00:00",
+    "[abc123] Received DNS interaction (A) from 203.0.113.9 at 2026-10-30 10:00:00",
+    '{"protocol":"dns","unique-id":"abc123","full-id":"abc123","q-type":"A",'
+    '"remote-address":"203.0.113.9","timestamp":"2026-10-30T10:00:00Z"}',
+    "The Collaborator server received a DNS lookup of type A for the domain name abc123.example.net.",
+])
+def test_a_reported_interaction_is_still_proof(log):
+    cmd = "curl -s 'https://api.example.com/fetch?url=%s' && sleep 5 && cat oob.log" % OOB_URL
+    ev = F.evidence(_claim(SSRF_CLAIM), [_res("c0", cmd, "HTTP/1.1 200 OK\n\nok\n" + log)])
+    assert ev["status"] == "proven" and ev["proof"] == "observed"
+
+
+def test_a_secret_in_the_echoed_request_is_not_a_disclosure():
+    claim = _claim("Information disclosure confirmed on https://www.example.com/api/info.")
+    out = ("> GET /api/info?API_KEY=mykey123 HTTP/1.1\n> Host: www.example.com\n>\n"
+           "< HTTP/1.1 200 OK\n< content-type: application/json\n<\n{\"ok\": true}")
+    ev = F.evidence(claim, [_res("c0", "curl -v 'https://www.example.com/api/info?API_KEY=mykey123'", out)])
+    assert ev["status"] != "proven"
+
+
+# --- a stack trace proves only inside the target's response -------------------------------- #
+
+DISC_CLAIM = "Confirmed information disclosure at https://target.example.com/api/debug."
+LOCAL_CRASH = (
+    "Traceback (most recent call last):\n"
+    '  File "/usr/lib/python3/dist-packages/urllib3/connection.py", line 169, in _new_conn\n'
+    "    conn = connection.create_connection(\n"
+    '  File "/usr/lib/python3/dist-packages/urllib3/util/connection.py", line 96, in create_connection\n'
+    "    raise err\n"
+    "ConnectionRefusedError: [Errno 111] Connection refused\n\n"
+    "During handling of the above exception, another exception occurred:\n\n"
+    "Traceback (most recent call last):\n"
+    '  File "/home/user/poc.py", line 7, in <module>\n'
+    "    r = requests.get(sys.argv[1])\n"
+    '  File "/usr/lib/python3/dist-packages/requests/adapters.py", line 519, in send\n'
+    "    raise ConnectionError(e, request=request)\n"
+    "requests.exceptions.ConnectionError: HTTPConnectionPool(host='target.example.com', port=443): "
+    "Max retries exceeded with url: /api/debug (Caused by NewConnectionError('<urllib3.connection."
+    "HTTPConnection object at 0x7f>: Failed to establish a new connection: [Errno 111] Connection refused'))")
+
+
+def test_the_agents_own_crash_is_not_the_targets_disclosure():
+    assert len(LOCAL_CRASH) > 400
+    ev = F.evidence(_claim(DISC_CLAIM), [_res("c0", "python3 poc.py https://target.example.com/api/debug",
+                                              LOCAL_CRASH)])
+    assert ev["status"] == "needs_review" and ev["proof"] == "observed"
+    assert "stack trace" in ev["reasons"][0] and "tool's own error" in ev["reasons"][0]
+
+
+def test_a_local_parse_error_traceback_is_not_a_disclosure_either():
+    crash = ("Traceback (most recent call last):\n  File \"/home/user/poc.py\", line 9, in <module>\n"
+             "    print(r.json()['data']['users'])\nKeyError: 'data'")
+    ev = F.evidence(_claim(DISC_CLAIM), [_res("c0", "python3 poc.py https://target.example.com/api/debug",
+                                              crash)])
+    assert ev["status"] != "proven"
+
+
+@pytest.mark.parametrize("out", [
+    "HTTP/1.1 500 Internal Server Error\ncontent-type: text/plain\n\nTraceback (most recent call last):\n"
+    '  File "/app/views.py", line 41, in debug\n    raise ValueError(settings.DATABASES)\nValueError: x',
+    "< HTTP/1.1 500 Internal Server Error\n< content-type: text/plain\n<\nTraceback (most recent call "
+    'last):\n  File "/app/views.py", line 41, in debug\nValueError: x',
+    "HTTP/1.1 500 Internal Server Error\n\njava.lang.NullPointerException\n"
+    "\tat com.example.api.DebugController.show(DebugController.java:57)",
+])
+def test_a_stack_trace_in_the_targets_response_is_still_proof(out):
+    ev = F.evidence(_claim(DISC_CLAIM), [_res("c0", "curl -si https://target.example.com/api/debug", out)])
+    assert ev["status"] == "proven" and ev["proof"] == "observed"
+
+
+# --- open redirect and CORS: the response must follow what the request injected ----------- #
+
+REDIR_CLAIM = "Found an open redirect at https://app.example.com/login."
+
+
+def test_a_redirect_to_the_sites_login_provider_is_not_an_open_redirect():
+    ev = F.evidence(_claim(REDIR_CLAIM), [_res(
+        "c0", "curl -si 'https://app.example.com/login?next=https://evil.example.org'",
+        "HTTP/1.1 302 Found\nLocation: https://accounts.google.com/o/oauth2/v2/auth?client_id=1&"
+        "redirect_uri=https://app.example.com/cb\n")])
+    assert ev["status"] == "needs_review"
+    assert "did not inject" in ev["reasons"][0] and "accounts.google.com" in ev["reasons"][0]
+
+
+def test_an_external_location_on_a_200_is_not_a_redirect():
+    ev = F.evidence(_claim(REDIR_CLAIM), [_res(
+        "c0", "curl -si 'https://app.example.com/login?next=https://cdn.other.net/x'",
+        "HTTP/1.1 200 OK\nLocation: https://cdn.other.net/x\n\n<html>login</html>")])
+    assert ev["status"] == "needs_review" and "HTTP 200" in ev["reasons"][0]
+
+
+@pytest.mark.parametrize("cmd, out", [
+    ("curl -si 'https://app.example.com/login?next=https%3A%2F%2Fevil.example.org%2F'",
+     "HTTP/1.1 302 Found\nLocation: https://evil.example.org/\n"),
+    ("curl -si 'https://app.example.com/login?next=//evil.example.org'",
+     "HTTP/1.1 301 Moved Permanently\nLocation: //evil.example.org\n"),
+    ("curl -siL 'https://app.example.com/login?next=https://evil.example.net'",
+     "HTTP/1.1 302 Found\nLocation: https://evil.example.net/\n\nHTTP/2 200\ncontent-type: text/html\n\n<html>"),
+    ("curl -v 'https://app.example.com/login?next=evil.example.org'",
+     "> GET /login?next=evil.example.org HTTP/1.1\n>\n< HTTP/1.1 302 Found\n"
+     "< Location: https://evil.example.org/\n<\n"),
+])
+def test_a_3xx_to_the_injected_host_is_still_proof(cmd, out):
+    ev = F.evidence(_claim(REDIR_CLAIM), [_res("c0", cmd, out)])
+    assert ev["status"] == "proven" and ev["proof"] == "observed"
+
+
+CORS_CLAIM = "Confirmed CORS misconfiguration on https://api.example.com/me."
+
+
+def test_a_fixed_partner_origin_with_credentials_is_not_a_cors_bug():
+    ev = F.evidence(_claim(CORS_CLAIM), [_res(
+        "c0", "curl -si -H 'Origin: https://evil.example.org' https://api.example.com/me",
+        "HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: https://app.partner-site.com\n"
+        "Access-Control-Allow-Credentials: true\n")])
+    assert ev["status"] == "needs_review" and "not the Origin the request sent" in ev["reasons"][0]
+
+
+def test_a_foreign_origin_with_no_origin_sent_needs_review():
+    ev = F.evidence(_claim(CORS_CLAIM), [_res(
+        "c0", "curl -si https://api.example.com/me",
+        "HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: https://app.partner-site.com\n"
+        "Access-Control-Allow-Credentials: true\n")])
+    assert ev["status"] == "needs_review"
+
+
+@pytest.mark.parametrize("cmd, acao", [
+    ("curl -si -H 'Origin: https://evil.example.org/' https://api.example.com/me", "https://Evil.example.org"),
+    ("curl -si -H 'Origin: null' https://api.example.com/me", "null"),
+    ("python3 -c \"import requests; print(requests.get('https://api.example.com/me', "
+     "headers={'Origin': 'https://evil.example.org'}).headers)\"", "https://evil.example.org"),
+])
+def test_the_sent_origin_reflected_with_credentials_is_still_proof(cmd, acao):
+    ev = F.evidence(_claim(CORS_CLAIM), [_res(
+        "c0", cmd, "HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: %s\n"
+                   "Access-Control-Allow-Credentials: true\n" % acao)])
+    assert ev["status"] == "proven" and ev["proof"] == "observed"
+
+
 def test_pointers_and_excerpts_never_carry_credentials():
     claim = _claim("Information disclosure confirmed on https://www.example.com/.env.")
     out = ("HTTP/1.1 200 OK\n\nAWS_SECRET_ACCESS_KEY=abcd1234secretvalue\nAuthorization: Bearer "

@@ -13062,7 +13062,10 @@
         var s = stateOf();
         var findings = (s === 'create' || s === 'linked') ? (lastFindings || []) : [];
         setHidden(findingsBox, !findings.length);
-        var sig = findings.map(function(f){ return f.path + '|' + f.kind; }).join('\n');
+        /* .gitignore cannot remove a file from the project's own git history,
+           so the button is only offered for findings in the current files. */
+        setHidden(gitignoreBtn, !ghIgnorable(findings).length);
+        var sig = findings.map(function(f){ return f.path + '|' + f.kind + '|' + (f.history ? 'h' : ''); }).join('\n');
         if (findingsList.getAttribute('data-sig') === sig) return;
         findingsList.setAttribute('data-sig', sig);
         findingsList.innerHTML = '';
@@ -13433,9 +13436,17 @@
           .catch(function(err){ fail(err); })
           .then(function(){ busy = ''; render(); });
       }
+      function ghIgnorable(list){
+        var seen = {}, out = [];
+        (list || []).forEach(function(f){
+          if (f && !f.history && !seen[f.path]){ seen[f.path] = 1; out.push(f.path); }
+        });
+        return out;
+      }
+
       function doGitignore(){
-        if (busy || !dir || !lastFindings.length) return;
-        var add = lastFindings.map(function(f){ return f.path; });
+        var add = ghIgnorable(lastFindings);
+        if (busy || !dir || !add.length) return;
         busy = 'gitignore'; seq++; clearErrs(); render();
         api('/api/github/gitignore', { method:'POST', body:{ project_dir: dir, add: add, confirm: true } })
           .then(function(){ announce('Added to .gitignore.'); lastFindings = [];

@@ -1209,6 +1209,10 @@ _PREF_USE_RE = re.compile(r"^(?:please\s+)?use\s+(?!(?:this|that|these|those|my|
 # to free providers and into the brief written inside the project. A candidate
 # that carries a credential is dropped whole; a harvested command has secret
 # env assignments stripped first (see _strip_secret_env).
+# A password inside a URL (postgres://user:pw@host, https://user:pw@host,
+# redis://:pw@host). "host:port/path" never matches: the part after ':' must
+# reach an '@' before any '/'.
+_URL_CRED = r"\b[a-z][a-z0-9+.-]*://[^\s/:@\"'`]*:[^\s/@\"'`]+@"
 _SECRET_RE = re.compile(
     r"\b(?:sk|pk|rk)[-_](?:[A-Za-z]+[-_])?[A-Za-z0-9]{6,}"          # sk-..., sk-proj-...
     r"|\bgh[pousr]_[A-Za-z0-9]{10,}|\bgithub_pat_[A-Za-z0-9_]{10,}"
@@ -1216,11 +1220,24 @@ _SECRET_RE = re.compile(
     r"|\bAIza[0-9A-Za-z_-]{20,}|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
     r"|\b[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)\s*=\s*\S+"
     r"|\b(?:password|passwd|passphrase|api[\s_-]?key|secret|token|access[\s_-]?key"
-    r"|credentials?)\b\s*(?:is|was|=|:)?\s*[\"'`]?[^\s\"'`]{4,}", re.I)
+    r"|credentials?)\b\s*(?:is|was|=|:)?\s*[\"'`]?[^\s\"'`]{4,}"
+    r"|" + _URL_CRED +
+    # mysql / mariadb take the password glued to -p ("-pS3cret"; a bare "-p"
+    # prompts). Case-sensitive: "-P3306" is the port.
+    r"|(?-i:\b(?:mysql\w*|mariadb\w*)\b[^\n|;&]*?\s-p[^\s\"'`]+)"
+    # curl -u user:pass / --user user:pass
+    r"|\bcurl\b[^\n|;&]*?\s(?:-u\s*|--user[\s=]+)[\"']?[^\s:\"']+:[^\s\"']+"
+    # Authorization: Bearer|Basic|Token <value>, and a bare "Bearer <value>"
+    # that carries a digit (prose "bearer of bad news" does not)
+    r"|\bauthorization\b\s*[:=]\s*[\"']?(?:bearer|basic|token|digest)\s+[^\s\"']{4,}"
+    r"|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{8,}", re.I)
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
 _SECRET_ENV_RE = re.compile(
     r"(?:^|(?<=\s))[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)"
     r"=\S*\s*", re.I)
+# Any VAR=value whose value carries a URL password (DATABASE_URL=postgres://u:pw@h).
+_URL_CRED_ENV_RE = re.compile(
+    r"(?:^|(?<=\s))[A-Za-z_][A-Za-z0-9_]*=[\"']?[^\s\"']*?" + _URL_CRED + r"\S*\s*", re.I)
 
 
 def _looks_secret(text):
@@ -1237,8 +1254,10 @@ def _looks_secret(text):
 
 
 def _strip_secret_env(cmd):
-    """A command minus its secret env assignments (OPENAI_API_KEY=... pytest)."""
-    return " ".join(_SECRET_ENV_RE.sub(" ", cmd or "").split())
+    """A command minus its secret env assignments (OPENAI_API_KEY=... pytest,
+    DATABASE_URL=postgres://user:pw@host/db pytest)."""
+    s = _SECRET_ENV_RE.sub(" ", cmd or "")
+    return " ".join(_URL_CRED_ENV_RE.sub(" ", s).split())
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
 _WRITE_TOOL_RE = re.compile(
     r"^\s*(write|edit|create|multiedit|multi_edit|str_replace\w*|apply_patch|"

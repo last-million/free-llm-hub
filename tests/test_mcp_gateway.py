@@ -10,6 +10,7 @@ import http.server
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -385,6 +386,107 @@ def test_shutdown_stops_every_process(gw, script):
     gw.shutdown()
     gw.spawner.procs[0].wait(timeout=10)
     assert gw.running() == []
+
+
+# ---- a reader that ends while its process runs on (2026-10-30) -------------
+
+class _MemOut:
+    """The server's stdout: lines the test queues; b"" is end of file."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+
+    def readline(self, _limit=-1):
+        return self.q.get(timeout=10)
+
+
+class _MemIn:
+    def __init__(self, proc):
+        self.proc = proc
+
+    def write(self, data):
+        for line in data.decode("utf-8").splitlines():
+            self.proc.on_message(json.loads(line))
+
+    def flush(self):
+        pass
+
+
+class MemServer:
+    """An in-memory stdio MCP server process: answers initialize, tools/list and
+    an echo tool. Its 'process' runs until killed, whatever its stdout does."""
+
+    def __init__(self, pid):
+        self.pid, self.rc = pid, None
+        self.stdout, self.stdin = _MemOut(), _MemIn(self)
+
+    def poll(self):
+        return self.rc
+
+    def send(self, obj):
+        self.stdout.q.put((json.dumps(obj) + "\n").encode("utf-8"))
+
+    def on_message(self, m):
+        meth, mid = m.get("method"), m.get("id")
+        if meth is None or mid is None:
+            return
+        if meth == "initialize":
+            self.send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2025-03-26"}})
+        elif meth == "tools/list":
+            self.send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+                {"name": "echo", "inputSchema": {"type": "object"}}]}})
+        elif meth == "tools/call":
+            text = "echo: " + str(((m.get("params") or {}).get("arguments") or {}).get("text"))
+            self.send({"jsonrpc": "2.0", "id": mid,
+                       "result": {"content": [{"type": "text", "text": text}]}})
+
+
+def test_a_reply_with_an_odd_id_does_not_end_the_reader():
+    """`{"id": [7]}` cannot be looked up (unhashable); it is not ours, so it is
+    skipped and the connection keeps working."""
+    proc, killed = MemServer(1), []
+    conn = mcpgateway._StdioConn(proc, killed.append)
+    try:
+        proc.send({"jsonrpc": "2.0", "id": [7], "result": {}})
+        proc.send({"jsonrpc": "2.0", "id": {"x": 1}, "result": {}})
+        msg = conn.request("tools/list", {}, 5)
+        assert msg["result"]["tools"][0]["name"] == "echo"
+        assert conn.alive is True and killed == []
+    finally:
+        proc.stdout.q.put(b"")
+        conn._reader.join(5)
+
+
+def test_a_server_whose_reader_ended_is_stopped_before_it_is_replaced(cfg, tmp_path):
+    procs, killed = [], []
+
+    def spawn(argv, env, cwd):
+        p = MemServer(500 + len(procs))
+        procs.append(p)
+        return p
+
+    def kill(p):
+        killed.append(p.pid)
+        p.rc = -9
+        p.stdout.q.put(b"")
+
+    g = mcpgateway.Gateway(store=mcpgateway.ConfigStore(), spawn=spawn, kill=kill,
+                           which=lambda c: c, clock=Clock(), start_reaper=False,
+                           cache_path=str(tmp_path / "cache.json"), cwd=str(tmp_path))
+    try:
+        g.register("srv", command=sys.executable, args=["server.py"])
+        g.refresh("srv")
+        first = g._conns["srv"]
+        procs[0].stdout.q.put(b"")              # its stdout ends; the process runs on
+        first._reader.join(5)
+        assert first.alive is False and procs[0].poll() is None
+        res = g.call_tool("srv__echo", {"text": "hi"})
+        assert text_of(res) == "echo: hi"
+        assert procs[0].pid in killed           # stopped, not left running untracked
+        assert len(procs) == 2 and g._conns["srv"].proc is procs[1]
+    finally:
+        g.shutdown()
+    assert sorted(killed) == [500, 501]
 
 
 def test_the_tool_cache_survives_a_restart_and_a_changed_server_drops_it(gw, script, tmp_path):

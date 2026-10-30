@@ -242,7 +242,16 @@ _READ_ONLY_GIT_LISTING = frozenset(("-a", "-r", "-v", "-vv", "--all", "--remotes
                                     "--show-current", "--verbose", "show", "get-url"))
 _SHELLS = frozenset(("bash", "sh", "zsh", "dash", "pwsh", "powershell", "cmd"))
 _HARMLESS_REDIRECT_RE = re.compile(r"\d?>&\d|\d?>>?\s*(?:/dev/null|\$null|nul)\b", re.I)
-_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
+# A lone '&' (run in the background) starts a new command too; '>&' / '&>'
+# are redirects, not separators.
+_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]|(?<![>&])&(?![&>])")
+# Read-only commands that write a file with one of their options or commands:
+# `sort -o out`, `tree -o out`, a sed script's w / W (write) or e (execute).
+_SED_WRITE_RE = re.compile(
+    r"(?:^|[\s;{}0-9$,!/'\"])[wWe](?:\s|$|['\"])"
+    r"|\bs(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*[we]")
+_UNIQ_VALUE_OPTS = frozenset(("-f", "-s", "-w", "--skip-fields", "--skip-chars",
+                              "--check-chars"))
 _SHELL_WRAP_RE = re.compile(
     r"^\s*(?:bash|sh|zsh)\s+-l?c\s+(['\"])(.*)\1\s*$|"
     r"^\s*(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+(['\"])(.*)\3\s*$",
@@ -313,7 +322,7 @@ def _command_is_read_only(cmd):
     cmd = _command_text(cmd).strip()
     if not cmd:
         return True
-    if "`" in cmd or "$(" in cmd:
+    if "`" in cmd or "$(" in cmd or "<(" in cmd:     # <(...) runs a command too
         return False
     if ">" in _HARMLESS_REDIRECT_RE.sub("", cmd):
         return False
@@ -339,13 +348,57 @@ def _command_is_read_only(cmd):
                 if any(w not in _READ_ONLY_GIT_LISTING for w in after):
                     return False
         elif exe == "find":
-            if any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf")
+            if any(w in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf",
+                         "-fprint0", "-fls")
                    for w in rest):
                 return False
         elif exe == "sed":
             if any(w == "-i" or w.startswith("-i") or w.startswith("--in-place") for w in rest):
                 return False
+            if _SED_WRITE_RE.search(" ".join(words[1:])):
+                return False
+        elif exe == "sort":
+            if any(_sort_writes(w) for w in words[1:]):               # case matters: -s vs -S
+                return False
+        elif exe == "tree":
+            if any(w.startswith("-o") or w == "-R" for w in words[1:]):  # -o F; -R writes 00Tree.html
+                return False
+        elif exe == "uniq":
+            if _uniq_positionals(rest) >= 2:                          # uniq IN OUT writes OUT
+                return False
     return True
+
+
+def _sort_writes(word):
+    """True for sort's output option: --output[=F], -o F, or -o inside a
+    short-option cluster (-uo F); the letters after k / t / S / T are their
+    own values, not options."""
+    if word.startswith("--output"):
+        return True
+    if not word.startswith("-") or word.startswith("--"):
+        return False
+    for ch in word[1:]:
+        if ch == "o":
+            return True
+        if ch in "ktST":      # the rest of the word is this option's value
+            return False
+    return False
+
+
+def _uniq_positionals(words):
+    """How many INPUT / OUTPUT file names a uniq command names."""
+    n, skip, only_files = 0, False, False
+    for w in words:
+        if skip:
+            skip = False
+            continue
+        if only_files or w == "-" or not w.startswith("-"):
+            n += 1
+        elif w == "--":
+            only_files = True
+        elif w in _UNIQ_VALUE_OPTS:
+            skip = True
+    return n
 
 
 def _string_values(obj, depth=0):
@@ -946,11 +999,45 @@ def _prose_verdict(text):
             "inferred": True}
 
 
+# Keys only a verdict object carries. An object found INSIDE prose (not a code
+# fence's body, not the whole reply) must have one: a reviewer quoting a tool
+# result such as {"status": "ok"} or {"result": "pass"} is not giving its
+# verdict.
+_VERDICT_SHAPE_KEYS = frozenset(_OK_KEYS + ("verdict", "decision", "severity",
+                                            "problems", "issues"))
+
+
+def _shape_score(obj):
+    return len({str(k).lower() for k in obj} & _VERDICT_SHAPE_KEYS)
+
+
+def _verdict_object(t):
+    """The reply's JSON verdict object, or None: a code fence's body first,
+    then the reply when it IS one object, then an object inside prose -- only
+    a verdict-shaped one there, the one with the most verdict keys (the first
+    of equals)."""
+    for m in _FENCE_RE.finditer(t):
+        hit = next((o for o in _objects_in(m.group(1)) if _has_contract_keys(o)), None)
+        if hit is not None:
+            return hit
+    s = t.strip()
+    if s.startswith("{") and _brace_end(s, 0) == len(s):
+        obj = _loads_lenient(s)
+        if obj is not None and _has_contract_keys(obj):
+            return obj
+    shaped = [o for o in _objects_in(t) if _shape_score(o)]
+    return max(shaped, key=_shape_score) if shaped else None
+
+
 def parse_verdict(text):
     """{"ok": bool, "problems": [str], "severity": "low"|"high"} from the
     verifier's reply. Tolerant: reasoning blocks dropped, the JSON may sit in a
     code fence or in prose, trailing commas / Python literals are accepted, a
     "verdict": "ACCEPT"/"REVISE" field or a bare ACCEPT / REVISE reply count.
+    The contract's 'VERDICT:' line is read FIRST when there is one, so JSON a
+    reviewer quotes in its PROBLEMS ('expects {"status": "ok"}') is never
+    taken for its verdict; a bare 'VERDICT: REVISE' line still takes its
+    problems from a JSON verdict object when it lists none itself.
     Missing fields default (ok inferred from problems, severity "low").
     Unparseable -> ACCEPT with "unparsed": True (fail open)."""
     if not isinstance(text, str) or not text.strip():
@@ -958,12 +1045,19 @@ def parse_verdict(text):
     t = _THINK_RE.sub("", text[:DIGEST_MAX_CHARS])
     if re.search(r"</(?:think|thinking|reasoning)>", t, re.I):
         t = _THINK_OPEN_END_RE.sub("", t)
-    for chunk in [m.group(1) for m in _FENCE_RE.finditer(t)] + [t]:
-        objs = _objects_in(chunk)
-        hit = next((o for o in objs if _has_contract_keys(o)), None)
-        if hit is not None:
-            return _normalize_verdict(hit)
-    return _line_verdict(t) or _keyword_verdict(t) or _prose_verdict(t) or _unparsed()
+    line = _line_verdict(t)
+    if line is not None:
+        if not line["ok"] and not line["problems"]:
+            obj = _verdict_object(t)
+            v = _normalize_verdict(obj) if obj is not None else None
+            if v is not None and not v["ok"] and v["problems"]:
+                high = "high" in (v["severity"], line["severity"])
+                return dict(v, severity="high" if high else "low")
+        return line
+    obj = _verdict_object(t)
+    if obj is not None:
+        return _normalize_verdict(obj)
+    return _keyword_verdict(t) or _prose_verdict(t) or _unparsed()
 
 
 # --------------------------------------------------------------------------- #
@@ -1046,7 +1140,9 @@ def corrector_messages(messages, proposed, verdict):
 WEB_FILE_EXTS = (".html", ".htm", ".css", ".jsx", ".tsx", ".vue", ".svelte")
 SLOP_MAX_FILES = 40
 SLOP_MAX_BYTES = 1_000_000
-_FENCE_RE = re.compile(r"```[ \t]*([\w+-]*)[^\n]*\n(.*?)```", re.S)
+# Its own name: it used to be called _FENCE_RE too, and as the later
+# definition it replaced the verdict parser's fence regex at import.
+_WEB_FENCE_RE = re.compile(r"```[ \t]*([\w+-]*)[^\n]*\n(.*?)```", re.S)
 _WEB_FENCE_LANGS = {"html", "htm", "css", "jsx", "tsx", "vue", "svelte", "svg"}
 _MARKUP_RE = re.compile(r"<(?:!doctype|html|body|div|section|main)\b", re.I)
 
@@ -1059,7 +1155,7 @@ def html_blocks(text):
     """[(name, text)] for the web code fences in a prose answer (a fence with
     no language counts when it looks like markup). At most SLOP_MAX_FILES."""
     out = []
-    for m in _FENCE_RE.finditer(text or ""):
+    for m in _WEB_FENCE_RE.finditer(text or ""):
         lang, body = m.group(1).lower(), m.group(2)
         if lang in _WEB_FENCE_LANGS or (not lang and _MARKUP_RE.search(body)):
             if len(body) <= SLOP_MAX_BYTES:

@@ -76,11 +76,17 @@ MIN_PORT, MAX_PORT = 1024, 65535
 # databases, caches, brokers, container/cluster control planes, remote desktop
 # and file sharing. (22/445/139 are below 1024 and refused by the range rule
 # too; they are listed so the message says what the port is.)
+# Debugger / devtools ports too: Node and Deno `--inspect` 9229 (cluster
+# children 9230-9231), Chrome remote debugging 9222, Bun `--inspect` 6499. They
+# answer HTTP, and the tunnel's loopback Host header is exactly what their
+# DNS-rebinding check accepts, so a link would hand out a debugger, i.e. code
+# execution as the user.
+DEBUGGER_PORTS = frozenset({6499, 9222, 9229, 9230, 9231})
 DENY_PORTS = frozenset({
     22, 139, 445, 1433, 1521, 2181, 2375, 2376, 2379, 2380, 3306, 3389, 5432,
     5672, 5900, 5901, 5902, 5903, 5984, 5985, 5986, 6379, 6443, 9092, 9200,
     9300, 10250, 11211, 15672, 27017, 27018,
-})
+}) | DEBUGGER_PORTS
 
 # --- the installer ---------------------------------------------------------
 RELEASE_API = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
@@ -208,8 +214,9 @@ def check_port(port, hub_ports=()):
                            "would put the control panel on the internet.")
     if port in DENY_PORTS:
         raise PublishError("forbidden_port",
-                           "Port %d belongs to a database, remote-access or "
-                           "infrastructure service and is never published." % port)
+                           "Port %d belongs to a database, remote-access, "
+                           "debugger or infrastructure service and is never "
+                           "published." % port)
     if port < MIN_PORT or port > MAX_PORT:
         raise PublishError("forbidden_port",
                            "Only ports %d-%d can be published." % (MIN_PORT, MAX_PORT))

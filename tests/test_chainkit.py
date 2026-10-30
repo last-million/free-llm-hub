@@ -7,6 +7,7 @@ aderyn is needed.
 """
 import json
 import os
+import shlex
 import threading
 
 import pytest
@@ -514,13 +515,34 @@ def test_status_is_cached_and_refreshable(wired):
 # forks
 # --------------------------------------------------------------------------- #
 
+def _anvil_words(argv):
+    """The anvil arguments of a spawn, native or through `wsl.exe ... -lic 'exec anvil ...'`."""
+    return shlex.split(argv[-1])[1:] if argv[0] == "wsl.exe" else list(argv)
+
+
+def _anvil_answers(spawn, ids=None):
+    """Loopback as real anvils answer it: the live fake anvil started on that port
+    gives the chain id of the chain it forks (anvil keeps the upstream's id)."""
+    def answer(method, url, body):
+        port = int(url.split("127.0.0.1:", 1)[1].split("/")[0])
+        for (argv, _log), proc in zip(reversed(spawn.calls), reversed(spawn.procs)):
+            words = _anvil_words(argv)
+            if proc.rc is None and int(words[words.index("--port") + 1]) == port:
+                upstream = words[words.index("--fork-url") + 1]
+                cid = (ids or {}).get(upstream) or next(
+                    c["id"] for c in chainkit.CHAINS.values() if c["rpc"] == upstream)
+                return 200, {"jsonrpc": "2.0", "id": 1, "result": hex(cid)}
+        return ConnectionRefusedError("nothing listens on %d" % port)
+    return answer
+
+
 def _fork_kit(wired, *, native=True, ready=True, wsl=False, clock=None, logs=None,
               hub_ports=None):
     spawn, kill = Spawner(), Killer()
     calls = []
     table = {("C:/f/anvil.exe", "--version"): (0, "anvil Version: 1.3.5-stable\n"),
              "wsl": (0, "@@anvil\tanvil Version: 1.3.5-stable\n")}
-    routes = {"127.0.0.1": rpc_ok("0x1") if ready else ConnectionRefusedError("no"),
+    routes = {"127.0.0.1": _anvil_answers(spawn) if ready else ConnectionRefusedError("no"),
               "publicnode": rpc_ok("0x1")}
     http = Http(routes)
     kit = wired(which=(lambda n: "C:/f/anvil.exe" if (native and n == "anvil") else None),
@@ -627,6 +649,177 @@ def test_fork_without_anvil_says_how_to_install_it(wired):
     wired()
     body = tool_json(rpc("chain_fork_start", {"chain": "base"}))
     assert body["code"] == "not_installed" and "foundryup" in body["install"]
+
+
+# ---- several starts at once (2026-10-30) -----------------------------------
+
+class _LateProc(Proc):
+    """A fake anvil whose port was taken: alive while it fetches, then it exits."""
+
+    def __init__(self, pid):
+        super().__init__(pid)
+        self.lives = None
+
+    def poll(self):
+        if self.rc is None and self.lives is not None:
+            self.lives -= 1
+            if self.lives < 0:
+                self.rc = 1
+        return self.rc
+
+
+class AnvilNet:
+    """Fake loopback with real port ownership. A fake anvil binds its port only
+    when it is up -- after `before_bind`, which stands for the seconds anvil
+    spends fetching the upstream state -- and only when no live anvil holds it;
+    one whose port was taken stays alive a moment, then exits, as anvil does."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.bound = {}           # port -> (proc, chain id)
+        self.procs = []
+        self.before_bind = None
+
+    def _holder(self, port):
+        held = self.bound.get(port)
+        return held if held and held[0].rc is None else None
+
+    def port_free(self, port):
+        with self.lock:
+            return self._holder(port) is None
+
+    def spawn(self, argv, log_path):
+        words = _anvil_words(argv)
+        port = int(words[words.index("--port") + 1])
+        upstream = words[words.index("--fork-url") + 1]
+        cid = next(c["id"] for c in chainkit.CHAINS.values() if c["rpc"] == upstream)
+        with self.lock:
+            proc = _LateProc(6000 + len(self.procs))
+            self.procs.append(proc)
+        if self.before_bind:
+            self.before_bind(argv)
+        with self.lock:
+            if self._holder(port) is None:
+                self.bound[port] = (proc, cid)
+            else:
+                proc.lives = 3            # "address already in use", a moment later
+        return proc
+
+    def answer(self, method, url, body):
+        port = int(url.split("127.0.0.1:", 1)[1].split("/")[0])
+        with self.lock:
+            held = self._holder(port)
+        if held is None:
+            return ConnectionRefusedError("nothing listens on %d" % port)
+        return 200, {"jsonrpc": "2.0", "id": 1, "result": hex(held[1])}
+
+    def serving(self, port):
+        """The chain the anvil really listening on `port` forks (None: nothing)."""
+        with self.lock:
+            held = self._holder(port)
+        return held and next(n for n, c in chainkit.CHAINS.items() if c["id"] == held[1])
+
+
+def _net_kit(wired, net):
+    table = {("C:/f/anvil.exe", "--version"): (0, "anvil Version: 1.3.5-stable\n")}
+    kill = Killer()
+    kit = wired(which=lambda n: "C:/f/anvil.exe" if n == "anvil" else None,
+                run=_runner(table, []), spawn=net.spawn, kill=kill,
+                http=Http({"127.0.0.1": net.answer}), port_free=net.port_free)
+    return kit, kill
+
+
+def test_two_forks_started_at_once_never_share_a_port(wired):
+    """Two parallel chain_fork_start calls both find 18545 free (anvil binds only
+    once it has fetched the upstream state); each fork must get its own port and
+    be checked against its own chain."""
+    net = AnvilNet()
+    kit, _ = _net_kit(wired, net)
+    gate, passed = threading.Barrier(2, timeout=5), set()
+
+    def port_free(port):
+        me = threading.get_ident()
+        if port == 18545 and me not in passed:
+            passed.add(me)
+            try:
+                gate.wait()               # both starts test the same port together
+            except threading.BrokenBarrierError:
+                pass
+        return net.port_free(port)
+    kit._port_free_fn = port_free
+    out = {}
+
+    def start(chain):
+        out[chain] = kit.call("chain_fork_start", {"chain": chain})
+    threads = [threading.Thread(target=start, args=(c,)) for c in ("ethereum", "base")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    ports = {chain: body.get("port") for chain, body in out.items()}
+    assert sorted(ports.values()) == [18545, 18546], out
+    for chain, port in ports.items():
+        assert net.serving(port) == chain
+        assert out[chain]["chain_id"] == chainkit.CHAINS[chain]["id"]
+    assert sorted((f["chain"], f["port"]) for f in kit._forks.values()) == \
+        sorted(ports.items())
+    assert kit._pending == {}
+
+
+def test_a_start_still_coming_up_holds_its_port_and_its_slot(wired):
+    """While one fork is still fetching, other starts must not take its port,
+    must count it against FORK_MAX, and a start of the same chain must not run a
+    second anvil."""
+    net = AnvilNet()
+    kit, _ = _net_kit(wired, net)
+    seen = {}
+
+    def while_ethereum_fetches(argv):
+        if seen:
+            return
+        seen["busy"] = True
+        seen["base"] = kit.call("chain_fork_start", {"chain": "base"})
+        seen["polygon"] = kit.call("chain_fork_start", {"chain": "polygon"})
+        seen["ethereum"] = kit.call("chain_fork_start", {"chain": "ethereum"})
+    net.before_bind = while_ethereum_fetches
+    eth = kit.call("chain_fork_start", {"chain": "ethereum"})
+    assert eth.get("port") and seen["base"].get("port") and eth["port"] != seen["base"]["port"]
+    assert net.serving(eth["port"]) == "ethereum"
+    assert net.serving(seen["base"]["port"]) == "base"
+    assert seen["polygon"]["code"] == "too_many" and seen["polygon"]["starting"] == 1
+    assert seen["ethereum"]["code"] == "starting"
+    assert len(kit._forks) == chainkit.FORK_MAX and kit._pending == {}
+    assert len(net.procs) == 2                       # no anvil for the refused starts
+
+
+def test_a_failed_start_gives_its_slot_and_port_back(wired):
+    kit, spawn, kill, _ = _fork_kit(wired, ready=False)
+    assert tool_json(rpc("chain_fork_start", {"chain": "base"}))["code"] == "fork_failed"
+    assert kit._pending == {}
+    kit._http_fn.routes["127.0.0.1"] = _anvil_answers(spawn)
+    a = tool_json(rpc("chain_fork_start", {"chain": "base"}))
+    b = tool_json(rpc("chain_fork_start", {"chain": "arbitrum"}))
+    assert a["port"] == 18545 and b["port"] == 18546 and len(kit._forks) == 2
+
+
+def test_a_port_that_answers_as_another_chain_is_not_taken_for_the_fork(wired):
+    kit, spawn, kill, http = _fork_kit(wired)
+    http.routes["127.0.0.1"] = rpc_ok("0x1")         # some other program: an Ethereum node
+    body = tool_json(rpc("chain_fork_start", {"chain": "base"}))
+    assert body["code"] == "wrong_chain" and "8453" in body["error"]
+    assert spawn.procs[0].pid in kill.killed
+    assert kit._forks == {} and kit._pending == {}
+    assert tool_json(rpc("chain_fork_list"))["forks"] == []
+
+
+def test_a_chain_only_the_owners_setting_names_takes_the_id_it_answers(wired):
+    kit, spawn, kill, http = _fork_kit(wired)
+    kit._settings = lambda k: ({"mychain": "https://rpc.example.com/x"}
+                               if k == chainkit.RPC_SETTING else None)
+    http.routes["127.0.0.1"] = rpc_ok("0x539")
+    body = tool_json(rpc("chain_fork_start", {"chain": "mychain"}))
+    assert body["chain"] == "mychain" and body["port"] == 18545 and body["chain_id"] is None
+    assert kill.killed == []
 
 
 # --------------------------------------------------------------------------- #

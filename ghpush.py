@@ -119,7 +119,13 @@ _SECRET_FILE_RE = re.compile(
 _SECRET_CONTENT = [
     ("github_token", re.compile(r"\bghp_[A-Za-z0-9]{36,}\b")),
     ("github_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{50,}\b")),
+    # GitHub OAuth / user-to-server / server-to-server / refresh tokens (the gh
+    # CLI's sign-in stores a gho_ token).
+    ("github_token", re.compile(r"\bgh[ousr]_[A-Za-z0-9]{36,}\b")),
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b")),
+    ("groq_key", re.compile(r"\bgsk_[A-Za-z0-9]{40,}\b")),
+    ("nvidia_key", re.compile(r"\bnvapi-[A-Za-z0-9_\-]{40,}")),
+    ("cerebras_key", re.compile(r"\bcsk-[A-Za-z0-9]{30,}\b")),
     ("stripe_live_key", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{10,}\b")),
     ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b")),
     ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
@@ -548,6 +554,7 @@ _API = "https://api.github.com"
 _COMMIT_MESSAGE = "Update from Calvoun Build"
 _MAIN = "refs/heads/main"
 _TRACK = "refs/remotes/github/main"
+_OBJ_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")   # SHA-1 or SHA-256 object id
 
 # On EVERY git call (command-line -c is the highest-precedence config).
 _SAFE_CONFIG = (
@@ -1400,6 +1407,21 @@ class GitHub:
         rc, _o, _e = self._git(["rev-parse", "--verify", "--quiet", _MAIN], git_dir=m)
         return rc == 0
 
+    @staticmethod
+    def _own_git_dir(folder):
+        """True only when ``<folder>/.git`` is a real DIRECTORY inside the
+        folder. A ``.git`` FILE (``gitdir: <path>``, as a worktree or a
+        submodule has) or a link can point at any repository on the disk, so its
+        history is never imported: the project is then pushed as a plain
+        snapshot of its files."""
+        gd = os.path.join(folder, ".git")
+        try:
+            if _is_link(gd) or not os.path.isdir(gd) or os.path.islink(gd):
+                return False
+            return deploy_perfect.inside(_real(gd), _real(folder))
+        except (OSError, ValueError):
+            return False
+
     def _ensure_mirror(self, folder):
         """Create the hub-owned bare mirror (once) and import the project's own
         history ONCE when it has some. The project's .git is only READ, by that
@@ -1418,9 +1440,11 @@ class GitHub:
                                ("core.fsmonitor", "false"),
                                ("gc.autoDetach", "false")):
                 self._git(["config", key, value], git_dir=m)
-            if os.path.lexists(os.path.join(folder, ".git")):
+            if self._own_git_dir(folder):
                 # Tokenless, local transport only. A failure (no commits yet,
                 # not a repo, another owner) just means no history to import.
+                # Everything imported is secret-scanned before it can be
+                # pushed (_history_findings).
                 self._git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
                            folder, "HEAD:" + _MAIN], git_dir=m, protocols=("file",))
         if not os.path.exists(os.path.join(m, "index")) and self._has_main(m):
@@ -1536,55 +1560,138 @@ class GitHub:
                 pos += size + 1                    # the blob, then a newline
         return result
 
-    def _scan_staged(self, folder, m):
+    def _scan_objects(self, m, items, info):
+        """Findings for ``[(path, sha)]`` mirror objects that must each be a
+        readable blob (``info`` = their ``--batch-check`` answers). Fails
+        CLOSED: a missing / non-blob / unreadable object, or one over
+        scan_cap, is itself a finding."""
+        findings, readable = [], []
+        for path, sha in items:
+            t = info.get(sha)
+            if not t or t[0] != "blob":
+                findings.append(_finding(path, "unchecked",
+                                         "This file could not be checked; add it to .gitignore."))
+                if is_secret_name(path.rsplit("/", 1)[-1]):
+                    findings.append(_finding(path, "file", "This looks like a secret "
+                                             "file and should not be committed."))
+            elif t[1] > self.scan_cap:
+                findings.append(_finding(path, "too_large",
+                                         "Too large to check (over %d MB); add it to "
+                                         ".gitignore." % (self.scan_cap // (1024 * 1024) or 1)))
+                if is_secret_name(path.rsplit("/", 1)[-1]):
+                    findings.append(_finding(path, "file", "This looks like a secret "
+                                             "file and should not be committed."))
+            else:
+                readable.append((path, sha, t[1]))
+        batch, size = [], 0
+        for item in readable + [None]:
+            if item is not None and (not batch or size + item[2] <= _BATCH_BYTES):
+                batch.append(item)
+                size += item[2]
+                continue
+            if batch:
+                data = self._cat(m, sorted({b[1] for b in batch}), "content")
+                for path, sha, _n in batch:
+                    blob = data.get(sha)
+                    if blob is None:
+                        findings.append(_finding(path, "unchecked", "This file could not "
+                                                 "be checked; add it to .gitignore."))
+                    else:
+                        findings.extend(scan_blob(path, blob))
+            if item is not None:
+                batch, size = [item], item[2]
+            else:
+                batch = []
+        return findings
+
+    def _history_findings(self, m, skip=(), skip_paths=(), trust_track=False):
+        """Findings for every blob reachable from the mirror's main that GitHub
+        does not have yet: the history a push would send, e.g. a project's own
+        imported commits (a committed .env, a key deleted in a later commit).
+        ``trust_track`` = the mirror's GitHub-tracking ref belongs to the repo
+        this push goes to (a linked project, or the repo a link just fetched);
+        only then is what it holds left out. Otherwise the whole of main is
+        scanned: a ref left by an earlier attempt can name ANOTHER repository.
+        Every path a commit added or changed is also checked by NAME, so a
+        secret-named file (.env) whose content equals another file's is still
+        reported. Each finding is marked ``history`` and says that .gitignore
+        does not remove it. Raises on any git error (fails CLOSED)."""
+        if not self._has_main(m):
+            return []
+        base = ["--not", _TRACK] if trust_track and self._rev(m, _TRACK) else []
+        rc, out, err = self._git(["rev-list", "--objects", _MAIN] + base, git_dir=m)
+        if rc != 0:
+            raise GhError("scan_failed", "Could not list the project's history. %s" % _tail(err))
+        paths = {}
+        for line in (out or "").split("\n"):
+            sha, _sp, path = line.strip("\r").partition(" ")
+            if path and _OBJ_ID_RE.match(sha) and sha not in skip:
+                paths.setdefault(sha, path)       # commits and the root tree carry no path
+        # rev-list names each object once; the log names every path of every
+        # commit (a blob shared by README.md and .env shows under one name).
+        rc, names, err = self._git(["log", "--root", "-m", "--no-renames", "--name-only",
+                                    "--diff-filter=ACMRT", "-z", "--format=", _MAIN] + base,
+                                   git_dir=m)
+        if rc != 0:
+            raise GhError("scan_failed", "Could not list the project's history. %s" % _tail(err))
+        findings = []
+        if paths:
+            info = self._cat(m, sorted(paths), "check")
+            items = [(p, s) for s, p in paths.items()
+                     if info.get(s) is None or info[s][0] == "blob"]   # trees are walked, not scanned
+            findings = self._scan_objects(m, sorted(items), info)
+        named = {f["path"] for f in findings if f["kind"] == "file"}
+        for path in sorted({n.strip("\r\n") for n in (names or "").split("\0")}):
+            if (path and path not in named and path not in skip_paths
+                    and is_secret_name(path.rsplit("/", 1)[-1])):
+                findings.append(_finding(path, "file", "This looks like a secret file and "
+                                         "should not be committed."))
+                named.add(path)
+        for f in findings:
+            f["history"] = True
+            f["detail"] += (" It is in this project's own git history, which would be "
+                            "published too; .gitignore does not remove it from the history.")
+        return findings
+
+    def _refresh_unlinked_mirror(self, folder, m):
+        """An UNLINKED project's mirror holds nothing that was ever pushed.
+        Before create / link, forget the GitHub-tracking ref an earlier attempt
+        may have left (it can name another repository) and import the
+        project's own history again as it is NOW -- cleaned, rewritten or gone
+        -- instead of the copy taken the first time."""
+        self._git(["update-ref", "-d", _TRACK], git_dir=m)
+        rc = 1
+        if self._own_git_dir(folder):
+            rc, _o, _e = self._git(["fetch", "--quiet", "--force", "--no-tags",
+                                    "--no-recurse-submodules", folder, "+HEAD:" + _MAIN],
+                                   git_dir=m, protocols=("file",))
+        if rc != 0 and self._has_main(m):
+            self._git(["update-ref", "-d", _MAIN], git_dir=m)    # no history to import
+        self._reset_index(folder, m)
+
+    def _scan_staged(self, folder, m, trust_track=None):
         """Stage everything into the mirror index (no token in the environment)
         and scan the staged blobs. Returns ``(paths, findings)`` with the index
-        STAGED; on any error the index is reset and the error raised."""
+        STAGED; on any error the index is reset and the error raised.
+        ``trust_track`` None = trust the tracking ref only for a linked
+        project (see _history_findings)."""
+        if trust_track is None:
+            trust_track = bool((self.store.get_project(self._key(folder)) or {}).get("url"))
         rc, _o, err = self._git(["add", "-A"], git_dir=m, work_tree=folder)
         if rc != 0:
             self._reset_index(folder, m)
             raise GhError("git_error", "Could not stage the files. %s" % _tail(err))
         try:
             entries = self._staged_entries(folder, m)
-            findings, readable = [], []
-            blobs = [e for e in entries if e[1] != "160000"]   # a gitlink is a pointer, no content
-            info = self._cat(m, sorted({e[2] for e in blobs}), "check") if blobs else {}
-            for path, _mode, sha in blobs:
-                t = info.get(sha)
-                if not t or t[0] != "blob":
-                    findings.append(_finding(path, "unchecked",
-                                             "This file could not be checked; add it to .gitignore."))
-                    if is_secret_name(path.rsplit("/", 1)[-1]):
-                        findings.append(_finding(path, "file", "This looks like a secret "
-                                                 "file and should not be committed."))
-                elif t[1] > self.scan_cap:
-                    findings.append(_finding(path, "too_large",
-                                             "Too large to check (over %d MB); add it to "
-                                             ".gitignore." % (self.scan_cap // (1024 * 1024) or 1)))
-                    if is_secret_name(path.rsplit("/", 1)[-1]):
-                        findings.append(_finding(path, "file", "This looks like a secret "
-                                                 "file and should not be committed."))
-                else:
-                    readable.append((path, sha, t[1]))
-            batch, size = [], 0
-            for item in readable + [None]:
-                if item is not None and (not batch or size + item[2] <= _BATCH_BYTES):
-                    batch.append(item)
-                    size += item[2]
-                    continue
-                if batch:
-                    data = self._cat(m, sorted({b[1] for b in batch}), "content")
-                    for path, sha, _n in batch:
-                        blob = data.get(sha)
-                        if blob is None:
-                            findings.append(_finding(path, "unchecked", "This file could not "
-                                                     "be checked; add it to .gitignore."))
-                        else:
-                            findings.extend(scan_blob(path, blob))
-                if item is not None:
-                    batch, size = [item], item[2]
-                else:
-                    batch = []
+            blobs = [(e[0], e[2]) for e in entries if e[1] != "160000"]   # a gitlink is a pointer, no content
+            info = self._cat(m, sorted({sha for _p, sha in blobs}), "check") if blobs else {}
+            findings = self._scan_objects(m, blobs, info)
+            # The commit that gets pushed also carries main's history: every
+            # blob GitHub does not have yet is scanned too (a project's own
+            # imported history is otherwise never read).
+            staged = {sha for _p, sha in blobs}
+            findings.extend(self._history_findings(
+                m, skip=staged, skip_paths={e[0] for e in entries}, trust_track=trust_track))
             return [e[0] for e in entries], findings
         except GhError:
             self._reset_index(folder, m)
@@ -1595,17 +1702,28 @@ class GitHub:
                                          "pushed." % type(exc).__name__)
 
     def _secrets_error(self, folder, findings):
-        return GhError("secrets_found",
-                       "Found something that should not be published. "
-                       "Add these to .gitignore, or remove them, then try again.",
-                       extra={"findings": findings,
+        in_history = any(f.get("history") for f in findings)
+        in_files = any(not f.get("history") for f in findings)
+        if in_history and not in_files:
+            msg = ("Found something that should not be published in this project's own "
+                   "git history. .gitignore cannot remove it from the history: remove it "
+                   "from the history (or start the history again), then try again.")
+        elif in_history:
+            msg = ("Found something that should not be published. Add the files to "
+                   ".gitignore, or remove them; the ones in this project's own git history "
+                   "must be removed from the history. Then try again.")
+        else:
+            msg = ("Found something that should not be published. "
+                   "Add these to .gitignore, or remove them, then try again.")
+        return GhError("secrets_found", msg,
+                       extra={"findings": findings, "history": in_history,
                               "has_gitignore": os.path.isfile(os.path.join(folder, ".gitignore"))})
 
-    def _check_only(self, folder, m):
+    def _check_only(self, folder, m, trust_track=None):
         """Scan what a snapshot WOULD commit, then put the index back. Returns
         ``(paths, findings)``."""
         try:
-            return self._scan_staged(folder, m)
+            return self._scan_staged(folder, m, trust_track=trust_track)
         finally:
             self._reset_index(folder, m)
 
@@ -1745,9 +1863,13 @@ class GitHub:
 
     def _create_locked(self, project_dir, folder, token, login, repo, private, desc):
         self._refuse_if_linked(folder)
+        existed = self._mirror_ready(self.mirror_path(folder))
         m = self._ensure_mirror(folder)
-        # The staged-blob scan BEFORE anything is created on GitHub.
-        _paths, findings = self._check_only(folder, m)
+        if existed:
+            self._refresh_unlinked_mirror(folder, m)
+        # The staged-blob scan BEFORE anything is created on GitHub. A new repo
+        # has nothing yet, so the whole history is scanned.
+        _paths, findings = self._check_only(folder, m, trust_track=False)
         if findings:
             raise self._secrets_error(folder, findings)
         body = {"name": repo, "private": private, "auto_init": False}
@@ -1845,7 +1967,26 @@ class GitHub:
         if not _REPO_NAME_RE.match(real) or not valid_url(url, login) or not _valid_branch(branch):
             raise GhError("github_error", "GitHub described that repository in an unexpected way; "
                                           "nothing was linked.")
+        existed = self._mirror_ready(self.mirror_path(folder))
         m = self._ensure_mirror(folder)
+        if existed:
+            self._refresh_unlinked_mirror(folder, m)
+        try:
+            self._link_prepare(folder, m, url, branch, overwrite_ok)
+        except BaseException:
+            # Not linked: the tracking ref now names a repository this project
+            # is NOT linked to; a later create must never trust it.
+            self._git(["update-ref", "-d", _TRACK], git_dir=m)
+            raise
+        self._store_link(folder, url, login, real, bool(data.get("private")), branch)
+        self._snapshot(folder, m)                   # on top of GitHub's branch
+        self._push_mirror(folder, m, url)           # a fast-forward: never forced
+        return self.status(project_dir)
+
+    def _link_prepare(self, folder, m, url, branch, overwrite_ok):
+        """Fetch the repository's branch into the tracking ref, put the mirror's
+        main on it when it has files, and run the secret scan. Returns whether
+        the repository had files. On any refusal the mirror's main is put back."""
         frc, _o, ferr = self._git(
             ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
              self.transport_url(url), "+refs/heads/%s:%s" % (branch, _TRACK)],
@@ -1869,7 +2010,9 @@ class GitHub:
             self._git(["update-ref", _MAIN, _TRACK], git_dir=m)
             self._reset_index(folder, m)            # index = GitHub's tree; work tree untouched
         try:
-            _paths, findings = self._check_only(folder, m)
+            # The tracking ref was JUST fetched from the repo being linked
+            # (non-empty case), so what it holds is already on GitHub.
+            _paths, findings = self._check_only(folder, m, trust_track=nonempty)
             if findings:
                 raise self._secrets_error(folder, findings)
         except GhError:
@@ -1880,10 +2023,7 @@ class GitHub:
                     self._git(["update-ref", "-d", _MAIN], git_dir=m)
                 self._reset_index(folder, m)
             raise
-        self._store_link(folder, url, login, real, bool(data.get("private")), branch)
-        self._snapshot(folder, m)                   # on top of GitHub's branch
-        self._push_mirror(folder, m, url)           # a fast-forward: never forced
-        return self.status(project_dir)
+        return nonempty
 
     def set_visibility(self, project_dir, private, public_ok=False):
         """Make the linked repository private or public (PATCH /repos/...).

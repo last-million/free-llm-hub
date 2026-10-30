@@ -109,7 +109,13 @@ def _retire_removed_providers(raw: dict, pids=None) -> dict:
     providers = raw.get("providers")
     if not isinstance(providers, dict):
         return raw
-    present = [p for p in (RETIRED_PROVIDERS if pids is None else pids) if p in providers]
+    # A custom provider the user added under a retired id (e.g. re-adding
+    # Hyperbolic with a paid key) owns that providers[pid] row now: moving it
+    # would leave the custom definition with no key.
+    custom = raw.get("custom_providers")
+    custom = custom if isinstance(custom, dict) else {}
+    present = [p for p in (RETIRED_PROVIDERS if pids is None else pids)
+               if p in providers and p not in custom]
     if not present:
         return raw
     raw = dict(raw)

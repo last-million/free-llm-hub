@@ -479,11 +479,13 @@ _WELCOME_RE = re.compile(r"\bwelcome to\b", re.I)
 
 # (pattern, label, flags). "Your Company" is matched only where it stands
 # as a NAME (a copyright line, alone on a line, "... Name") -- "grow your
-# business" is ordinary copy.
+# business" is ordinary copy. A bare "Company Name" is checked on its own
+# (_COMPANY_NAME_RE): it is also the ordinary label of a form field or a
+# table column, which is not a placeholder.
 _PLACEHOLDER = [
     (r"\blorem ipsum\b|\bdolor sit amet\b|\bconsectetur adipiscing\b", "lorem ipsum", re.I),
     (r"(?:©|&copy;|\(c\)|copyright)\s*(?:\d{4}\s*)?Your (?:Company|Business|Brand)\b"
-     r"|\bYour (?:Company|Business|Brand) Name\b|\bCompany Name\b|\bYourCompany\b|\bYour Logo\b"
+     r"|\bYour (?:Company|Business|Brand) Name\b|\bYourCompany\b|\bYour Logo\b"
      r"|^[ \t]*Your (?:Company|Business|Brand)[ \t]*$|\byour name here\b", "Your Company", re.M),
     (r"\b(?:insert|add|your) (?:text|content|title|headline|tagline|image) here\b"
      r"|\b(?:text|content|title|headline|tagline|image|copy|description|logo|name) goes here\b",
@@ -498,6 +500,39 @@ _PLACEHOLDER = [
     (r"\[(?:your|insert|company|placeholder|client)[^\]\n]{0,30}\]", "[Your ...] bracket", re.I),
 ]
 _PLACEHOLDER_RE = [(re.compile(p, fl), label) for p, label, fl in _PLACEHOLDER]
+_COMPANY_NAME_RE = re.compile(r"\bCompany Name\b")
+# Elements whose text names a field or a column, never the company itself.
+_FIELD_LABEL_TAGS = {"label", "th", "legend", "option", "optgroup", "dt", "caption"}
+# Inline wrappers that may sit between a label element and its text
+# ("<label><span>Company Name</span> *</label>"): looked through, open or closed.
+_INLINE_TAGS = {"span", "b", "strong", "em", "i", "small", "abbr", "u", "mark", "font"}
+_OPEN_CLOSE_RE = re.compile(r"<(/?)([A-Za-z][\w-]*)\b[^<>]*>")
+# "Company Name:" followed by nothing on the line, a tag (an <input>) or a
+# blank to fill in ("____"): a field label. Words after the colon ("Company
+# Name: we fix roofs") are a heading or a sentence, not a label.
+_LABEL_COLON_RE = re.compile(r"[ \t]*\*?[ \t]*:[ \t]*(?:$|\r?\n|<|_{2,})")
+
+
+def _is_field_label(doc, start, end):
+    """Is the text at start..end the label of a form field or a table
+    heading ("<label>Company Name</label>", "Company Name: <input>",
+    "| Company Name |")? The element that holds the text is the nearest tag
+    before it (inline wrappers looked through), so an unclosed <option> or
+    <dt> earlier on the page (both legal HTML) never covers later text."""
+    before = doc.code[max(0, start - 2000):start]
+    for m in reversed(list(_OPEN_CLOSE_RE.finditer(before))):
+        name = m.group(2).lower()
+        if name in _INLINE_TAGS:
+            continue
+        if not m.group(1) and name in _FIELD_LABEL_TAGS:
+            return True
+        break
+    if _LABEL_COLON_RE.match(doc.code, end):
+        return True
+    line_before = before.rsplit("\n", 1)[-1].rstrip(" \t")
+    return doc.kind == "md" and line_before.endswith("|")
+
+
 _NUMBERED_RE = re.compile(
     r"\b(feature|service|item|product|benefit|card|title|heading|testimonial|client|member|"
     r"category)\s+(?:#\s?)?([1-9])\b", re.I)
@@ -547,6 +582,10 @@ def _copy_rules(doc):
         m = rx.search(v)
         if m:
             ph.append((m.start(), label))
+    for m in _COMPANY_NAME_RE.finditer(v):
+        if not _is_field_label(doc, m.start(), m.end()):
+            ph.append((m.start(), "Your Company"))
+            break
     for m in re.finditer(r"\b(?:href|src)\s*=\s*[\"'](?:mailto:|tel:)?([^\"']+)[\"']", doc.code if
                          doc.kind in _MARKUP_KINDS else ""):
         val = m.group(1)
@@ -1175,6 +1214,66 @@ _COPY_SRC_RE = re.compile(
 _GRAD_WORD_RE = re.compile(r"\bgradients?\b|\b(?:purple|violet|indigo)[- ]?(?:to|->|→|-)[- ]?"
                            r"(?:blue|indigo|violet|purple|pink)\b", re.I)
 _VIOLET_WORD_RE = re.compile(r"\b(?:purple|violet|indigo|lavender|lilac|fuchsia|magenta|plum)\b", re.I)
+# A colour outside the violet/blue/pink band. Named AMONG THE GRADIENT'S OWN
+# STOPS it means the gradient is not the default AI one, as _ai_gradient_stops
+# rules for real CSS stops; named elsewhere (an accent, a footer) it excuses
+# nothing.
+_WARM_WORD_RE = re.compile(
+    r"\b(?:red|crimson|scarlet|burgundy|orange|amber|yellow|gold(?:en)?|mustard|ochre|saffron|"
+    r"coral|peach|salmon|apricot|terracotta|rust|brick|copper|bronze|brown|tan|caramel|"
+    r"green|sage|olive|emerald|forest|mint|lime|teal|sunset|sunrise)\b", re.I)
+# "warm" / "earthy" describe a gradient, they are not a stop: they excuse it only
+# when its own clause names no violet-band colour ("a warm gradient with a plum
+# accent" is fine, "a warm purple-to-blue gradient" is still the default one).
+_WARM_ADJ_RE = re.compile(r"\b(?:warm|earthy)\b", re.I)
+# Colours inside the cool band or neutral: they name stops without excusing them.
+_COOL_WORD_RE = re.compile(
+    r"\b(?:blue|navy|cobalt|azure|sky|cyan|turquoise|pink|rose|white|black|gr[ae]y|cream|sand|"
+    r"beige|ivory|charcoal|slate|neutral|cool|pastel)\b", re.I)
+# Where a gradient's description ends inside a sentence: a comma or semicolon,
+# brackets, or a word that moves on to something else ("... gradient WITH gold
+# accents", "... gradient BEHIND the headline AND A red banner").
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;()]|\s(?:with|behind|beneath|against|on|over|under|across|for|while|but|plus)\b"
+    r"|\sand\s(?=(?:a|an|the|its|their|some)\b)", re.I)
+
+
+# A colour word, optionally behind a shade adjective: a comma before one
+# ("purple, blue and pink") continues the list of stops, it ends nothing.
+_COLOUR_NEXT_RE = re.compile(
+    r"\s*(?:(?:and|or|then|to)\s+)?(?:(?:deep|dark|light|soft|bright|pale|vivid|rich|muted|"
+    r"electric|hot|warm|cool|neon|dusty)\s+)?(?:#[0-9a-f]{3,8}\b|"
+    + _VIOLET_WORD_RE.pattern[5:-3] + "|"
+    + _COOL_WORD_RE.pattern[5:-3] + "|"
+    + _WARM_WORD_RE.pattern[5:-3] + r")\b", re.I)
+# Brackets that hold only a colour value ("deep purple (#6d28d9) to blue").
+_BRACKET_COLOUR_RE = re.compile(r"\(\s*(?:#[0-9a-f]{3,8}|(?:rgb|hsl|oklch)a?\([^()]*\))\s*\)", re.I)
+
+
+def _clause_view(s, pos):
+    """`s` with the commas inside a list of stops and the bracketed colour
+    values blanked (same length), so the clause bounds read the stops as one.
+    Only commas BEFORE the gradient word at `pos` join stops ("purple, blue and
+    pink gradient"); one after it ends the clause ("a purple gradient, forest
+    green footer")."""
+    t = _BRACKET_COLOUR_RE.sub(lambda m: " " * len(m.group(0)), s)
+    out = list(t)
+    for i, ch in enumerate(t):
+        if ch == "," and i < pos and _COLOUR_NEXT_RE.match(t, i + 1):
+            out[i] = " "
+    return "".join(out)
+
+
+def _gradient_clause(s, pos):
+    """The part of sentence `s` that describes the gradient whose word sits at `pos`."""
+    lo, hi = 0, len(s)
+    for m in _CLAUSE_SPLIT_RE.finditer(_clause_view(s, pos)):
+        if m.end() <= pos:
+            lo = m.end()
+        elif m.start() >= pos:
+            hi = m.start()
+            break
+    return s[lo:hi]
 
 
 def _sentences(text):
@@ -1226,9 +1325,24 @@ def _design_gradient(text, request):
     for s in _sentences(text):
         if _gradient_is_ai(s) or _tailwind_ai_gradient(s):
             return s
-        if _GRAD_WORD_RE.search(s):
-            for m in _VIOLET_WORD_RE.finditer(s):
-                if not _negated(s, m.start()):
+        for g in _GRAD_WORD_RE.finditer(s):
+            if _negated(s, g.start()):
+                continue                    # "no gradients"
+            clause = _gradient_clause(s, g.start())
+            hexes = [c for c in (parse_color(h.group(0)) for h in _HEX_RE.finditer(clause)) if c]
+            violet_here = any(not _negated(clause, w.start())
+                              for w in _VIOLET_WORD_RE.finditer(clause))
+            if any(_family(c) == "other" for c in hexes) or any(
+                    not _negated(clause, w.start()) for w in _WARM_WORD_RE.finditer(clause)) or (
+                    not violet_here and any(not _negated(clause, w.start())
+                                            for w in _WARM_ADJ_RE.finditer(clause))):
+                continue                    # a warm / outside-the-band stop of THIS gradient
+            if hexes or _VIOLET_WORD_RE.search(clause) or _COOL_WORD_RE.search(clause):
+                where = clause              # the gradient names its own colours
+            else:
+                where = s                   # "a soft gradient" names none: read the sentence
+            for m in _VIOLET_WORD_RE.finditer(where):
+                if not _negated(where, m.start()):
                     return s
     return None
 

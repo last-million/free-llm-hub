@@ -29,6 +29,7 @@ start because an encryption library is absent has traded a small risk for a
 total outage.
 """
 import base64
+import logging
 import os
 import time
 import stat
@@ -49,6 +50,8 @@ _KEY_BYTES = 32                                 # AES-256
 _NONCE_BYTES = 12                               # GCM standard
 
 _cached_key = [None]
+_warned_bad_size = [False]
+log = logging.getLogger(__name__)
 
 
 def available():
@@ -97,8 +100,17 @@ def load_or_create_key(config_path):
             # A truncated or padded key file cannot decrypt anything that was
             # written with the real one. Refuse rather than generate a new key
             # over the top of it, which would silently destroy every stored
-            # secret.
-            raise ValueError("secret.key is %d bytes, expected %d" % (len(raw), _KEY_BYTES))
+            # secret. "No key" (None), not an exception: an exception here
+            # escaped every load_config and save_config and the hub could not
+            # read or write its config at all. With None, encrypt() keeps the
+            # value as it is and decrypt() parks the ciphertext, as for any
+            # unreadable key.
+            if not _warned_bad_size[0]:
+                _warned_bad_size[0] = True
+                log.error("secret.key is %d bytes, expected %d: stored keys cannot "
+                          "be decrypted until it is restored (it is left as it is)",
+                          len(raw), _KEY_BYTES)
+            return None
         except FileNotFoundError:
             _last = None
             break                      # genuinely absent -- fall through and create
@@ -131,6 +143,13 @@ def load_or_create_key(config_path):
             f.flush()
             os.fsync(f.fileno())
     except OSError:
+        # This process created the file (O_EXCL) and nothing was ever encrypted
+        # with this key: remove the partial file so a later start can create a
+        # whole one instead of finding a short key file forever.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return None
     _restrict(path)
     _cached_key[0] = raw

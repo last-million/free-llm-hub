@@ -643,6 +643,7 @@ class Kit:
         self._tmp_dir = tmp_dir
         self._lock = threading.RLock()
         self._forks = {}
+        self._pending = {}      # fork id -> {"chain", "block", "port"}: starts not up yet
         self._jobs = {}
         self._reads = {}
         self._status = None
@@ -1168,17 +1169,35 @@ class Kit:
             ports = set()
         return ports | {8787}
 
-    def _pick_port(self):
+    def _taken_ports(self):
+        """Ports of running forks and of starts still coming up (call under the lock)."""
+        return {f["port"] for f in self._forks.values()} | \
+            {p["port"] for p in self._pending.values() if p.get("port") is not None}
+
+    def _pick_port(self, fid=None):
+        """A free port, reserved for the start `fid`. The socket test runs outside
+        the lock; the reservation is checked again under it, so two starts at
+        once never take the same port (anvil only binds once it has fetched the
+        upstream state, so the socket test alone cannot see the first one)."""
         avoid = self._hub_port_set()
-        with self._lock:
-            avoid |= {f["port"] for f in self._forks.values()}
-        for port in FORK_PORTS:
-            if port not in avoid and self._port_free(port):
-                return port
-        return None
+        while True:
+            with self._lock:
+                taken = self._taken_ports()
+            cand = next((p for p in FORK_PORTS
+                         if p not in avoid and p not in taken and self._port_free(p)), None)
+            if cand is None:
+                return None
+            with self._lock:
+                if cand not in self._taken_ports():
+                    pend = self._pending.get(fid)
+                    if pend is not None:
+                        pend["port"] = cand
+                    return cand
+            avoid.add(cand)
 
     def fork_start(self, chain, block=None):
         self.sweep()
+        fid = "fork-" + uuid.uuid4().hex[:8]
         with self._lock:
             for f in self._forks.values():
                 if f["chain"] == chain and f.get("block") == block:
@@ -1186,15 +1205,32 @@ class Kit:
                     view = self._fork_view(f)
                     view["note"] = "This fork was already running; reusing it."
                     return view
-            if len(self._forks) >= FORK_MAX:
-                return {"error": "At most %d local forks run at once; stop one with "
-                                 "chain_fork_stop." % FORK_MAX, "code": "too_many",
-                        "forks": [self._fork_view(f) for f in self._forks.values()]}
+            for p in self._pending.values():
+                if p["chain"] == chain and p.get("block") == block:
+                    return {"error": "A fork of %s is already starting; call chain_fork_start "
+                                     "again in a few seconds to reuse it." % chain,
+                            "code": "starting"}
+            if len(self._forks) + len(self._pending) >= FORK_MAX:
+                out = {"error": "At most %d local forks run at once; stop one with "
+                                "chain_fork_stop." % FORK_MAX, "code": "too_many",
+                       "forks": [self._fork_view(f) for f in self._forks.values()]}
+                if self._pending:
+                    out["starting"] = len(self._pending)
+                return out
+            # The slot is held from here until the fork is registered or has failed.
+            self._pending[fid] = {"chain": chain, "block": block, "port": None}
+        try:
+            return self._fork_start(fid, chain, block)
+        finally:
+            with self._lock:
+                self._pending.pop(fid, None)
+
+    def _fork_start(self, fid, chain, block):
         loc = self._locate("anvil")
         if loc is None:
             return {"error": "anvil (Foundry) is not installed here, natively or in WSL.",
                     "code": "not_installed", "install": INSTALL["foundry"]}
-        port = self._pick_port()
+        port = self._pick_port(fid)
         if port is None:
             return {"error": "No free local port for a fork.", "code": "no_port"}
         upstream, _via = self._rpc_for(chain)
@@ -1206,21 +1242,34 @@ class Kit:
         else:
             argv = ["wsl.exe"] + (["-d", loc[1]] if loc[1] else []) + \
                 ["-e", "bash", "-lic", "exec " + shlex.join(words)]
-        fid = "fork-" + uuid.uuid4().hex[:8]
         log_path = os.path.join(self._tmp_dir or tempfile.gettempdir(), "chainkit-%s.log" % fid)
         try:
             proc = self._spawn(argv, log_path)
         except Exception as exc:                                 # noqa: BLE001
             return {"error": "anvil could not start (%s)." % type(exc).__name__, "code": "failed"}
         local = "http://127.0.0.1:%d" % port
-        ready, deadline = False, self._clock() + FORK_READY_SECONDS
+        want = CHAINS.get(chain, {}).get("id")      # None: a chain only the owner's setting names
+        ready, wrong = False, None
+        deadline = self._clock() + FORK_READY_SECONDS
         while self._clock() < deadline:
             if proc.poll() is not None:
                 break
-            if self._local_chain_id(local):
-                ready = True
+            got = self._local_chain_id(local)
+            if got is not None:
+                if want is None or got == want:
+                    ready = True
+                else:
+                    wrong = got         # not our anvil, or the RPC is another chain
                 break
             self._sleep(0.5)
+        if wrong is not None:
+            self._kill(proc)
+            self._unlink(log_path)
+            return {"error": "The local port answered as chain id %s, not %s (%s): another "
+                             "program is listening there, or the RPC set for %s in the hub "
+                             "setting %s is another chain." % (wrong, want, chain, chain,
+                                                               RPC_SETTING),
+                    "code": "wrong_chain"}
         if not ready:
             self._kill(proc)
             tail = ""
@@ -1240,6 +1289,7 @@ class Kit:
                "block": block, "port": port, "rpc_url": local, "where": loc[0],
                "proc": proc, "log": log_path, "started": now, "last_used": now}
         with self._lock:
+            self._pending.pop(fid, None)          # the slot moves to the running fork
             self._forks[fid] = rec
         self._ensure_reaper()
         self._log("[chain] fork %s of %s started on port %d (%s)" % (fid, chain, port, loc[0]))
@@ -1249,13 +1299,24 @@ class Kit:
         return view
 
     def _local_chain_id(self, url):
+        """The chain id `url` answers eth_chainId with (an int; the raw result when
+        it is not a hex quantity), or None when nothing answered."""
         try:
             status, body = self._http("POST", url, json.dumps(
                 {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}).encode(),
                 {"Content-Type": "application/json"}, 3.0, 65536)
-            return status == 200 and "result" in json.loads((body or b"{}").decode("utf-8", "replace"))
+            data = json.loads((body or b"{}").decode("utf-8", "replace"))
         except Exception:                                        # noqa: BLE001
-            return False
+            return None
+        if status != 200 or not isinstance(data, dict) or "result" not in data:
+            return None
+        result = data["result"]
+        if isinstance(result, str) and result[:2].lower() == "0x":
+            try:
+                return int(result[2:], 16)
+            except ValueError:
+                pass
+        return scrub(str(result), 40)
 
     @staticmethod
     def _unlink(path):
