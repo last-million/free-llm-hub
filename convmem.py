@@ -801,7 +801,10 @@ class Archive:
                         continue
                     k = rule_key(t)
                     sig = (conv, k, hash(t))
-                    if sig in self._seen_rules:
+                    # A kv ("NAME = value") rule must reach the DB check so newest-
+                    # wins holds even when an EARLIER value is re-asserted; only a
+                    # verbatim ("t:") line uses the in-memory skip (identical = no-op).
+                    if not k.startswith("kv:") and sig in self._seen_rules:
                         self._seen_rules.move_to_end(sig)
                         continue
                     fresh.append((k, t, sig))
@@ -823,8 +826,13 @@ class Archive:
                         db.execute("INSERT OR REPLACE INTO rules(conv, rkey, text, seq, ts) "
                                    "VALUES(?,?,?,?,?)", (conv, k, t, seq, now))
                         changed += 1
-                    db.execute("DELETE FROM rules WHERE conv=? AND seq <= "
-                               "(SELECT MAX(seq) FROM rules WHERE conv=?) - ?",
+                    # keep the newest MAX_RULES ROWS -- NOT a seq-distance window:
+                    # seq bumps on every change, so many updates to one kv rule would
+                    # otherwise push an old standing rule past MAX(seq)-MAX_RULES while
+                    # only a handful of rows exist ("standing rules never erode").
+                    db.execute("DELETE FROM rules WHERE conv=? AND seq NOT IN "
+                               "(SELECT seq FROM rules WHERE conv=? "
+                               "ORDER BY seq DESC LIMIT ?)",
                                (conv, conv, MAX_RULES))
                     db.execute("COMMIT")
                 except Exception:                                # noqa: BLE001
@@ -834,7 +842,8 @@ class Archive:
                         pass
                     return 0
                 for _k, _t, sig in fresh:
-                    self._seen_rules[sig] = True
+                    if not _k.startswith("kv:"):     # a kv rule always re-checks the DB
+                        self._seen_rules[sig] = True
                 while len(self._seen_rules) > SEEN_MAX:
                     self._seen_rules.popitem(last=False)
                 return changed

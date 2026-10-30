@@ -1524,7 +1524,7 @@ _ANY_SPECIAL_TOKEN_RE = re.compile(r"<[|｜][\w.:\-▁]{1,40}[|｜]>")
 _TOKEN_WORD_RUN_RE = re.compile(r"^\s*\w{1,16}\s*([^\w\s])\1{7,}\s*$")
 
 
-def _special_token_junk(text, prompt_text):
+def _special_token_junk(text, prompt_text, partial=False):
     if prompt_text and ("<|" in prompt_text or "<｜" in prompt_text):
         return None             # the user is asking ABOUT these tokens
     if not _ANY_SPECIAL_TOKEN_RE.search(text):
@@ -1534,9 +1534,12 @@ def _special_token_junk(text, prompt_text):
         return 0                # "<|close|>think!!!!!!!!" (same turn, next try)
     if re.search(r"\w", rest):
         return None
-    # A stream head that so far holds only "<|x|>" may still turn into an
-    # answer; junk is the token PLUS a run of punctuation after it.
-    return 0 if len(re.sub(r"\s", "", rest)) >= 8 else None
+    if len(re.sub(r"\s", "", rest)) >= 8:
+        return 0                # the token PLUS a run of punctuation after it
+    # Only the special token(s), nothing else: junk once the reply is FINISHED
+    # (a content-free stop-token leak like "<|im_end|>"); a stream head of just
+    # the token may still turn into a real answer, so wait while it is partial.
+    return None if partial else 0
 
 
 def _clip(text):
@@ -1707,6 +1710,12 @@ def reads_as_answer(text, *, last_prompt=None, relay=False):
         # release it, and inspect() judges the held text once it is whole.
         if is_empty_claim_opening(text, last_prompt):
             return False
+        # A capability refusal ("I can't see the image") reads as clean prose but
+        # is a failed hop: hold it so inspect() can fail it over to a model that
+        # can see, instead of the stream committing it. inspect gates this to
+        # relay / tool turns; the early gate mirrors is_idle_greeting (unconditional).
+        if is_cannot_do_capability(text, last_prompt):
+            return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
             return False
@@ -1767,7 +1776,7 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
             ("reasoning_leak", lambda: _reasoning_leak(masked, prompt_text)),
             ("template_junk", lambda: (None if offset else
-                                       _special_token_junk(body, prompt_text))),
+                                       _special_token_junk(body, prompt_text, partial))),
             ("metadata_leak", lambda: _meta_leak(masked, body, prompt_text,
                                                  at_start=offset == 0)),
             # RELAY hops only (`relay`): a direct provider reports its quota

@@ -1328,3 +1328,22 @@ def test_a_failure_inside_the_tools_reads_like_an_empty_archive(req, monkeypatch
     monkeypatch.setattr(convmem.Archive, "get_text", boom)
     assert _text_of(_rpc("memory_search", memory_key=key, query="x")) == convmem.NOTHING
     assert _text_of(_rpc("memory_get", memory_key=key, id="a" * 12)) == convmem.NOTHING
+
+# ---- rules never erode: fixes 2026-10-30 ------------------------------------ #
+
+def test_a_reasserted_kv_value_is_not_swallowed(arch):
+    # newest-wins must hold even when an earlier value comes back in the same process
+    assert arch.add_rules(CONV, ["Decision: port = 1"]) == 1
+    assert arch.add_rules(CONV, ["Decision: port = 2"]) == 1
+    assert arch.add_rules(CONV, ["Decision: port = 1"]) == 1     # applied, not cache-skipped
+    rules = arch.rules(CONV)
+    assert "Decision: port = 1" in rules and "Decision: port = 2" not in rules
+
+
+def test_many_updates_to_one_rule_do_not_erode_a_standing_rule(arch):
+    arch.add_rules(CONV, ["Keep this standing rule forever."])
+    for i in range(convmem.MAX_RULES + 20):
+        arch.add_rules(CONV, ["Decision: counter = %d" % i])
+    rules = arch.rules(CONV)
+    assert "Keep this standing rule forever." in rules          # only 2 distinct rules exist
+    assert len([r for r in rules if r.startswith("Decision: counter")]) == 1

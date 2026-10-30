@@ -488,3 +488,19 @@ def test_plain_punctuation_answers_are_untouched():
 def test_template_token_with_a_stray_word_then_punctuation_is_junk():
     v = answer_check.inspect("<|close|>think" + "!" * 32)
     assert not v["ok"] and v["salvage"] is None
+
+# ---- answer-gate fixes 2026-10-30 ------------------------------------------- #
+
+def test_reads_as_answer_holds_a_capability_refusal():
+    # a vision refusal reads as clean prose; the stream gate must NOT release it, so
+    # inspect() can fail the hop over to a model that can see.
+    refusal = "Sorry, I cannot see the screenshot you attached, so I can't describe what it shows."
+    assert answer_check.reads_as_answer(
+        refusal, last_prompt="look at this screenshot and fix the bug", relay=True) is False
+
+
+def test_a_finished_reply_of_only_a_template_token_is_junk():
+    v = answer_check.inspect("<|im_end|>", prompt_text="add a login form", finish_reason="stop")
+    assert not v["ok"] and "template_junk" in v["reasons"]
+    # a partial stream head of just the token may still grow into an answer -> not cut yet
+    assert answer_check.inspect("<|im_end|>", partial=True)["ok"]

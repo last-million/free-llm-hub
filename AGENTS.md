@@ -9190,3 +9190,41 @@ and the heartbeat-only items (a closed goal still feeds runs, an unsatisfiable d
 dependents silently) -- heartbeats are off by default.
 
 Release-note: fix: authorized-testing scope parsing no longer misreads an excluded host as in-scope, the task board survives a corrupt row instead of wiping itself, and the RAM governor stops throttling its own multi-agent runs.
+
+## Bug-fix batch 2: convmem rules erosion, stream answer-gate (2026-10-30)
+
+The rest of the read-only review from 2026-10-29 (the batch-1 note lists what was still open).
+Each fix has a test; the happy path is unchanged.
+
+- **A standing rule no longer erodes when another rule is updated many times**
+  (`convmem.py` `add_rules`). Retention deleted by seq DISTANCE
+  (`seq <= MAX(seq) - MAX_RULES`), but `seq` bumps on every CHANGE, so updating one
+  `NAME = value` decision ~MAX_RULES+ times pushed an old standing rule past the threshold
+  while only a couple of rows existed. It now keeps the newest MAX_RULES ROWS
+  (`seq NOT IN (... ORDER BY seq DESC LIMIT MAX_RULES)`), which matches the all-distinct case
+  exactly and stops the erosion. Covered by `tests/test_conversation_memory.py`.
+- **A re-asserted `NAME = value` is no longer swallowed** (`convmem.py` `add_rules`). The
+  in-memory `_seen_rules` dedup is keyed by text hash, so `A = 1` -> `A = 2` -> `A = 1` dropped
+  the third (the DB already does newest-wins, so the cache was both redundant and wrong for kv
+  rules). A kv rule now always reaches the DB check (which dedups a true no-op and applies a
+  real change); only verbatim ("t:") lines use the cache skip.
+- **A streamed capability refusal is held so the chain fails it over** (`answer_check.py`
+  `reads_as_answer`). The early-release gate mirrored every "whole reply is junk" check
+  (provider notice, tool-deadend, idle greeting, empty-claim) EXCEPT `is_cannot_do_capability`
+  (added 2026-10-24), so a streamed "I can't see the image" was released and committed before
+  `inspect` could flag it -- defeating the switch-to-a-vision-model purpose. The gate now holds
+  it too (inspect still gates the actual cut to relay / tool turns). Covered by
+  `tests/test_answer_check.py`.
+- **A reply that is ONLY a chat-template token reads as junk, not an answer** (`answer_check.py`
+  `_special_token_junk`, now threaded `partial`). A bare `<|im_end|>` left no word content after
+  stripping the token and under 8 trailing punctuation chars, so the check returned None and the
+  stop-token leak was served as a clean answer, keeping that model winning the hop. A FINISHED
+  reply of only the token(s) is now `template_junk`; a partial stream head of just the token is
+  still left to grow (the existing stream-head test stays green).
+
+Still open from the review (not shipped, lower value): the JPEG SOF off-by-one in
+`ctxwin._image_dims` (estimate only, negligible); and the heartbeat-only items (a closed goal
+still feeds scheduled runs; an unsatisfiable dependency stalls dependents silently) -- heartbeats
+are off by default.
+
+Release-note: fix: the hub no longer forgets a standing rule when another is updated often, and a model that streams "I can't see the image" or only a stop-token now hands the turn to another model instead of ending it.
