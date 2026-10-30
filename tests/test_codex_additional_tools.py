@@ -327,3 +327,46 @@ def test_with_the_lift_off_the_models_get_no_tools(upstream, monkeypatch):
     r = A.app.test_client().post("/v1/responses", json=_codex_body())
     assert r.status_code == 200
     assert not upstream["payloads"][0].get("tools")
+
+
+# --------------------------------------------------------------------------- #
+# pipeline tiers (swarm / multi / crews) replay their actor's call to codex
+# --------------------------------------------------------------------------- #
+
+def _swarm_reply(monkeypatch, name, args):
+    monkeypatch.setattr(A, "_swarm_for", lambda *a, **k: (_chat(name, args), {}))
+    monkeypatch.setattr(A, "_pipeline_usage", lambda *a, **k: None)
+
+
+def _swarm_items(stream):
+    body = _codex_body(stream=stream)
+    A._lift_additional_tools(body)
+    tools = A._responses_tools_to_chat(body["tools"])
+    with A.app.test_request_context():
+        resp = A._swarm_as_responses(body, [], tools, 100)
+    if not stream:
+        return resp[0].get_json()["output"]
+    evs = []
+    for ln in b"".join(resp.response).splitlines():
+        if ln.startswith(b"data: "):
+            try:
+                evs.append(json.loads(ln[6:]))
+            except ValueError:
+                pass
+    return [e["item"] for e in evs if e["type"] == "response.output_item.done"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_swarm_tier_hands_apply_patch_back_as_a_custom_call(monkeypatch, stream):
+    _swarm_reply(monkeypatch, "apply_patch", json.dumps({"input": PATCH_TEXT}))
+    item = _swarm_items(stream)[0]
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "apply_patch" and item["input"] == PATCH_TEXT
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_swarm_tier_keeps_a_commands_namespace(monkeypatch, stream):
+    _swarm_reply(monkeypatch, "exec_command", json.dumps({"cmd": "wsl -e ls"}))
+    item = _swarm_items(stream)[0]
+    assert item["type"] == "function_call"
+    assert item["name"] == "exec_command" and item["namespace"] == "functions"

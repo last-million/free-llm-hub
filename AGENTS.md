@@ -9668,8 +9668,14 @@ the hub's `--dangerously-bypass-approvals-and-sandbox` launch was involved.
   (exec_command, write_stdin, apply_patch, view_image, ...), namespace "clock", namespace
   "collaboration" (spawn_agent, ...)]}`. The hub read only `body["tools"]` and `_responses_to_chat`
   drops unknown item types, so the models never saw a tool. The catalog field `tool_mode`
-  (`code_mode_only` / `direct`, inherited from codex's own models_cache) was tested and is NOT the
-  switch: both values send the tools the same way.
+  (`code_mode_only` / `direct`, inherited from codex's own models_cache) does NOT change WHERE the
+  tools ride (both send an `additional_tools` item, MEASURED for each) but WHICH tools: `direct`
+  -> namespace `functions` = exec_command, write_stdin, apply_patch (custom), view_image, ...;
+  `code_mode_only` (the value the hub's own catalog carries, cloned from codex's bundled entry) ->
+  `functions` = `exec` (a CUSTOM tool: raw JavaScript, `await tools.exec_command(...)`) and `wait`,
+  with the commands nested inside `exec` where the hub never sees them. So in code mode a free model
+  has to WRITE JAVASCRIPT to run a command. An earlier version of this note said both modes send
+  the same tools; it had dumped only `direct`.
 - **Fix 1** (`_lift_additional_tools`, first line of `v1_responses`; flag `responses_additional_tools`,
   default on): the tools of every `additional_tools` input item are moved into `body["tools"]` (a later
   definition of the same (type, name) wins) and the items are removed, in the SAME parsed dict
@@ -9686,11 +9692,36 @@ the hub's `--dangerously-bypass-approvals-and-sandbox` launch was involved.
   raw text; no argument deltas are streamed for it). `_responses_to_chat` now translates
   `custom_tool_call` / `custom_tool_call_output` history items (a nameless one is dropped with its
   output), so the model sees its own patches and their results.
-- **Limits.** The pipeline-tier replays (`_swarm_as_responses`, `_cm_emit`) do not pass the custom map
-  (as for the namespace map). codex's other freeform tools, if any appear later, go through the same
-  path. Older codex builds (top-level `tools`) are unaffected.
+- **Pipeline tiers** (swarm / multi / crews, `_swarm_as_responses`) now build both maps from the
+  request's own tools and pass them to `_chat_to_responses` / `_responses_stream`, so a pipeline
+  actor's `apply_patch` or namespaced call reaches codex in the shape it runs (they used to come
+  back as a plain `function_call`). `_cm_emit` (the CLI Multi text report) carries no tool call.
+- **Verified with the REAL codex 0.165 driving the REAL hub code** (in-process Flask on an ephemeral
+  port, scripted model, sandboxed config and HOME, no auth.json): `exec_command` (run `wsl -e uname
+  -s`, the output came back to the model), `apply_patch` as a `custom_tool_call` (the file was
+  created), code-mode `exec` with JavaScript (returned the WSL output), and a command followed by a
+  patch in one turn, streamed. This exercises the hub's own events (`status`, the empty-input `added`
+  item), which a hand-built fake emitter did not.
+- **A cold WSL answers slowly.** MEASURED: the first `wsl -e` after idle took 6.0 s from a plain
+  shell, later ones 0.1 s; through codex's PowerShell wrapper the cold call can pass codex's 10 s
+  yield and come back as "Process running with session ID ... Output:" with nothing in it (2 of 4
+  scripted runs of the same command; the third passed). Not the hub; the model has to poll with
+  `write_stdin` (or just retry), and a weak model may read it as a failure.
+- **Hub entries use `tool_mode: "direct"`** (OWNER DECISION 2026-10-30, recommended and accepted;
+  `_codex_catalog_models`, flag `codex_direct_tools`, default on, `tests/test_codex_direct_tool_mode.py`).
+  The hub's `/model` entries are cloned from codex's bundled one, so they carried
+  `code_mode_only` (a free model must write JavaScript to run a command). They now say `direct`
+  (plain exec_command / apply_patch), but only when codex's own template has the field (an older
+  codex is not handed an unknown key), and only for the hub's own entries -- codex's built-in
+  entries keep theirs. The cost is codex's batching of many tool calls into one script. Whether weak
+  free models actually do better with plain calls is NOT measured; the evidence is that both modes
+  work end to end and that JavaScript is the harder thing to write. It takes effect when the catalog
+  is rewritten (hub start / Connect; a running codex keeps its own copy until restarted). Flag off =
+  the bundled value, as before.
+- **Limits.** codex's other freeform tools, if any appear later, go through the same path. Older
+  codex builds (top-level `tools`) are unaffected.
 
-Release-note: fix: Codex 0.165 can run commands, reach WSL and edit files through the hub again (the hub was dropping the tools the new Codex sends).
+Release-note: fix: Codex 0.165 can run commands, reach WSL and edit files through the hub again (the hub was dropping the tools the new Codex sends), and the hub's own models now get plain tools instead of having to write JavaScript.
 
 ## A relay that gags its model after one tool call: recognised in the model's own words (2026-10-30)
 

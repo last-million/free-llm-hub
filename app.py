@@ -1301,8 +1301,26 @@ def _codex_catalog_models(dump):
         if "auto_compact_token_limit" in entry:
             entry["auto_compact_token_limit"] = agentic_chat.declared_compact_limit(
                 mid, cli="codex")
+        if "tool_mode" in entry and _codex_direct_tools_on():
+            # Plain function calls (exec_command, apply_patch, ...) instead of codex's
+            # "code mode", where a model must write JavaScript to run anything.
+            entry["tool_mode"] = "direct"
         out.append(entry)
     return out + [copy.deepcopy(m) for m in models if isinstance(m, dict)]
+
+
+def _codex_direct_tools_on():
+    """Hub entries in codex's /model catalog use tool_mode "direct" (flag
+    `codex_direct_tools`, default on). The entries are cloned from codex's bundled
+    one, whose `tool_mode` is "code_mode_only": there codex offers ONE tool, `exec`
+    (raw JavaScript calling `tools.exec_command(...)`), plus `wait`, and a free model
+    has to write a program to run a command. MEASURED 2026-10-30 (real codex 0.165):
+    "direct" offers exec_command / write_stdin / apply_patch as ordinary tools.
+    Off = the bundled value, as before. Never raises."""
+    try:
+        return bool(config.get_flag("codex_direct_tools", True))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _codex_catalog_label(mid):
@@ -50513,13 +50531,20 @@ def _swarm_as_responses(body, messages, tools, est):
         return None
     data, hdrs = out
     label = (body.get("model") or "").strip() or data.get("model") or "swarm"
+    # codex's own tool shapes (see _responses_ns_backmap / _responses_custom_map): a pipeline
+    # tier's actor call must come back as name=<child> + namespace, and a freeform tool
+    # (apply_patch, code-mode exec) as a custom_tool_call, or codex answers "unsupported
+    # call" / "incompatible payload". Built from the request's own (lifted) tools.
+    ns_map = _responses_ns_backmap(body.get("tools"))
+    custom_map = _responses_custom_map(body.get("tools"))
     if not body.get("stream"):
         _pipeline_usage(data, est, True)
-        return jsonify(_chat_to_responses(data, label)), 200, hdrs
+        return jsonify(_chat_to_responses(data, label, ns_map=ns_map,
+                                          custom_map=custom_map)), 200, hdrs
     _pipeline_usage(data, est, False)       # _responses_stream steers once
     return Response(stream_with_context(
         _responses_stream(_ReplayUpstream(_swarm_sse_lines(data)), label,
-                          prompt_est=est)),
+                          prompt_est=est, ns_map=ns_map, custom_map=custom_map)),
         mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
 
 

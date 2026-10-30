@@ -116,3 +116,56 @@ def test_the_retry_is_capped_per_instruction(filed):
 def test_with_the_rest_flag_off_it_is_served(filed, monkeypatch):
     monkeypatch.setattr(A, "_relay_injection_rest_on", lambda: False)
     assert _types(RELAY, MODEL)[-1] == "response.completed"
+
+
+# --------------------------------------------------------------------------- the retry's route
+# Codex's retry is a fresh request with the SAME session, so it reaches the router with the
+# same pin. The bench only helps if a pinned session leaves a benched relay.
+
+PIN = ("g4f", "srv_abc:z-ai/glm-5.3")
+MSGS = [{"role": "user", "content": "make proof.txt with the output of uname"}]
+SCORES = {"srv_abc:z-ai/glm-5.3": 134.0, "deepseek-ai/deepseek-v4.1-flash": 130.0}
+WORLD = {"g4f": ["srv_abc:z-ai/glm-5.3"], "nvidia": ["deepseek-ai/deepseek-v4.1-flash"]}
+
+
+@pytest.fixture
+def pinned_fleet(monkeypatch):
+    world = {p: list(ms) for p, ms in WORLD.items()}
+    monkeypatch.setattr(A, "_available_providers", lambda *a, **k: list(world))
+    monkeypatch.setattr(A, "_prefetch_auto_models", lambda pids: dict(world))
+    monkeypatch.setattr(A, "_auto_models", lambda pid: list(world[pid]))
+    monkeypatch.setattr(A, "_provider_capable", lambda pid, est: True)
+    monkeypatch.setattr(A, "_benchmark_score", lambda pid, m: SCORES.get(m, 10.0))
+    monkeypatch.setattr(A, "_supports_tools", lambda pid, m: True)
+    monkeypatch.setattr(A, "_session_pin_get", lambda key: PIN)
+    monkeypatch.setattr(A, "_session_pin_set", lambda *a, **k: None)
+    monkeypatch.setattr(A, "_weighted_pick", lambda pool, *a, **k: max(pool))
+    monkeypatch.setattr(A, "_active_mode", lambda: A.MODE_ALL)
+    monkeypatch.setattr(A, "_simple_turn", lambda: False)
+    monkeypatch.setattr(A, "_relay_injection_rest_on", lambda: True)
+    with A._relay_tool_lock:
+        A._relay_tool_fail.clear()
+    yield world
+    with A._relay_tool_lock:
+        A._relay_tool_fail.clear()
+
+
+def _route():
+    pid, model, _diff = A._route_by_difficulty(MSGS, None, 500, require_tools=True)
+    return pid, model
+
+
+def test_control_a_pinned_session_stays_on_its_pair_until_the_relay_is_benched(pinned_fleet):
+    assert _route() == PIN
+
+
+def test_a_benched_relay_releases_a_pinned_session(pinned_fleet):
+    A._note_relay_injection(PIN[0], PIN[1], ["relay_tool_injection"])
+    assert A._relay_tool_sick(*PIN)
+    assert _route() == ("nvidia", "deepseek-ai/deepseek-v4.1-flash")
+
+
+def test_when_the_relay_is_all_there_is_it_is_still_used(pinned_fleet):
+    pinned_fleet.pop("nvidia")
+    A._note_relay_injection(PIN[0], PIN[1], ["relay_tool_injection"])
+    assert _route() == PIN
