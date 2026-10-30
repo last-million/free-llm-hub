@@ -74,14 +74,23 @@ def test_supports_tools_is_never_asked_about_a_sub_provider():
 
 def test_rejecting_subs_in_supports_tools_would_not_remove_them(monkeypatch):
     """Measured, not argued. With the 'fix' applied the sub hop is still in a
-    require_tools chain."""
+    require_tools chain: _build_chain adds a subscription through
+    _sub_available_providers / _sub_models, and neither asks _supports_tools.
+
+    Hermetic (2026-10-30): a subscription is INJECTED instead of read from this
+    machine's config. It used to skip wherever no subscription was switched on --
+    every machine but one -- and never asserted anything even where it ran."""
+    sub = next((p for p in ("sub-claude", "sub-codex") if A._is_sub(p)), None)
+    assert sub is not None, "no sub provider id is recognised any more"
+    monkeypatch.setattr(A, "_sub_available_providers", lambda: [sub])
+    monkeypatch.setattr(A, "_sub_models", lambda pid: ["sonnet"] if pid == sub else [])
     real = A._supports_tools
     monkeypatch.setattr(A, "_supports_tools",
                         lambda pid, m: False if A._is_sub(pid) else real(pid, m))
     chain = A._build_chain(None, None, 500, require_tools=True,
                            messages=[{"role": "user", "content": "make a file"}])
-    if not [p for p, _m in chain if A._is_sub(p)]:
-        pytest.skip("no sub provider is enabled on this machine")
+    assert (sub, "sonnet") in chain, \
+        "rejecting subs in _supports_tools would remove the hop -- then it is not a no-op"
 
 
 # --------------------------------------------------------------------------- #
