@@ -52388,12 +52388,99 @@ def _responses_tools_to_chat(tools):
     OpenAI chat tools. Namespace children are expanded (_responses_ns_entries)."""
     out = []
     for presented, _child, _ns, inner in _responses_ns_entries(tools):
+        if _is_custom_tool(inner):
+            out.append({"type": "function", "function": {
+                "name": presented,
+                "description": _custom_tool_description(inner),
+                "parameters": {"type": "object", "properties": {"input": {
+                    "type": "string",
+                    "description": "The tool's whole raw text input, exactly as its "
+                                   "format requires."}},
+                    "required": ["input"]},
+            }})
+            continue
         out.append({"type": "function", "function": {
             "name": presented,
             "description": inner.get("description") or "",
             "parameters": inner.get("parameters") or {"type": "object", "properties": {}},
         }})
     return out
+
+
+# --- codex FREEFORM ("custom") tools, e.g. apply_patch (2026-10-30) ---
+# A Responses tool of type "custom" takes raw TEXT, not JSON arguments (codex's
+# apply_patch: a lark grammar for "*** Begin Patch ..."). Chat models only know
+# JSON function calls, so the model is offered a function with ONE string
+# argument `input`, and its call is handed back to codex as a
+# `custom_tool_call` carrying that text. MEASURED with the real codex 0.165:
+# apply_patch returned as a `function_call` -> "Fatal error: tool apply_patch
+# invoked with incompatible payload" (aborted); as a `custom_tool_call` with
+# `input` -> the patch is applied. Flag `responses_custom_tools` (default on);
+# off = the old behaviour (an empty-argument function, history items dropped).
+_CUSTOM_FORMAT_HINT_CHARS = 1500
+
+
+def _custom_tools_on():
+    try:
+        return bool(config.get_flag("responses_custom_tools", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _is_custom_tool(inner):
+    return (isinstance(inner, dict) and inner.get("type") == "custom"
+            and _custom_tools_on())
+
+
+def _custom_tool_description(inner):
+    """The tool's own description, plus how to call it through a JSON function
+    and its input format (a grammar is clipped to _CUSTOM_FORMAT_HINT_CHARS)."""
+    desc = str(inner.get("description") or "").strip()
+    note = ("Call it with ONE argument, `input`: the whole raw text the tool takes "
+            "(not JSON inside it).")
+    fmt = inner.get("format") if isinstance(inner.get("format"), dict) else {}
+    definition = str(fmt.get("definition") or "").strip()
+    if definition:
+        if len(definition) > _CUSTOM_FORMAT_HINT_CHARS:
+            definition = definition[:_CUSTOM_FORMAT_HINT_CHARS] + "\n..."
+        note += " The input must match this %s %s:\n%s" % (
+            str(fmt.get("syntax") or "").strip() or "text", str(fmt.get("type") or "format"),
+            definition)
+    return (desc + "\n\n" + note).strip() if desc else note
+
+
+def _responses_custom_map(tools):
+    """{presented_name: tool_name} for every FREEFORM ("custom") tool offered, so
+    the emitters hand the model's call back as a `custom_tool_call`. Pure, built
+    from the request's own tools. Empty when none or the flag is off."""
+    if not _custom_tools_on():
+        return {}
+    return {presented: child for presented, child, _ns, inner in _responses_ns_entries(tools)
+            if isinstance(inner, dict) and inner.get("type") == "custom"}
+
+
+def _custom_input_from_args(arguments):
+    """The raw text input of a FREEFORM tool from the model's JSON arguments:
+    {"input": "..."} -> its string; a bare string or unreadable JSON -> the text
+    itself; any other object -> its JSON. Never raises."""
+    if not isinstance(arguments, str):
+        try:
+            return json.dumps(arguments)
+        except Exception:                                        # noqa: BLE001
+            return ""
+    try:
+        obj = json.loads(arguments)
+    except (ValueError, TypeError):
+        return arguments
+    if isinstance(obj, dict):
+        if isinstance(obj.get("input"), str):
+            return obj["input"]
+        if len(obj) == 1 and isinstance(next(iter(obj.values())), str):
+            return next(iter(obj.values()))
+        return json.dumps(obj)
+    if isinstance(obj, str):
+        return obj
+    return arguments
 
 
 def _responses_ns_backmap(tools):
@@ -52441,7 +52528,7 @@ def _responses_to_chat(body):
     # alone would be an orphan tool message, which strict templates reject too.
     nameless = {(it.get("call_id") or it.get("id"))
                 for it in (inp or []) if isinstance(it, dict)
-                and it.get("type") == "function_call"
+                and it.get("type") in ("function_call", "custom_tool_call")
                 and not str(it.get("name") or "").strip()}
     nameless.discard(None)
     for item in inp or []:
@@ -52453,7 +52540,7 @@ def _responses_to_chat(body):
         itype = item.get("type")
         if itype == "function_call" and not str(item.get("name") or "").strip():
             continue
-        if itype == "function_call_output" and nameless and (
+        if itype in ("function_call_output", "custom_tool_call_output") and nameless and (
                 item.get("call_id") or item.get("id")) in nameless:
             continue
         if itype == "function_call":
@@ -52470,6 +52557,33 @@ def _responses_to_chat(body):
                 }],
             })
         elif itype == "function_call_output":
+            output = item.get("output")
+            content = output if isinstance(output, str) else json.dumps(output)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id") or item.get("id"),
+                "content": content,
+            })
+        elif itype == "custom_tool_call" and _custom_tools_on():
+            # A FREEFORM tool call (apply_patch) in the history: the same
+            # one-argument function the model was offered (_responses_tools_to_chat),
+            # so it sees what it wrote and, below, what came of it.
+            if not str(item.get("name") or "").strip():
+                continue
+            raw = item.get("input")
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "",
+                        "arguments": json.dumps({"input": raw if isinstance(raw, str) else ""}),
+                    },
+                }],
+            })
+        elif itype == "custom_tool_call_output" and _custom_tools_on():
             output = item.get("output")
             content = output if isinstance(output, str) else json.dumps(output)
             messages.append({
@@ -52578,12 +52692,14 @@ def _fix_nameless_tool_calls(chat_json, tool_defs):
     return chat_json
 
 
-def _chat_to_responses(chat_json, model_label, tool_defs=None, ns_map=None):
+def _chat_to_responses(chat_json, model_label, tool_defs=None, ns_map=None, custom_map=None):
     """Non-streaming OpenAI chat-completions JSON -> a Responses `response` object.
     A tool call without a name is repaired from its arguments when that is
     unambiguous, else left out (_fix_nameless_tool_calls) -- never emitted.
     A call to a namespaced child (ns_map, _responses_ns_backmap) is emitted as
-    the bare child name plus a `namespace` field, the shape codex routes on."""
+    the bare child name plus a `namespace` field, the shape codex routes on.
+    A call to a FREEFORM tool (custom_map, _responses_custom_map) is emitted as
+    a `custom_tool_call` carrying the raw `input` text."""
     _fix_nameless_tool_calls(chat_json, tool_defs)
     _dedupe_tool_calls_json(chat_json)
     choice = (chat_json.get("choices") or [{}])[0]
@@ -52603,6 +52719,18 @@ def _chat_to_responses(chat_json, model_label, tool_defs=None, ns_map=None):
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function") or {}
         nm = fn.get("name") or ""
+        if nm in (custom_map or {}):
+            cname = custom_map[nm]
+            output.append({
+                "type": "custom_tool_call",
+                "id": "ctc_" + uuid.uuid4().hex,
+                "call_id": tc.get("id"),
+                "name": cname,
+                "input": _custom_input_from_args(_normalize_apply_patch_diff(
+                    cname, _repair_tool_arguments(fn.get("arguments") or ""))),
+                "status": "completed",
+            })
+            continue
         child, ns = (ns_map or {}).get(nm, (nm, None))
         item = {
             "type": "function_call",
@@ -52633,7 +52761,7 @@ def _chat_to_responses(chat_json, model_label, tool_defs=None, ns_map=None):
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
                       hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
                       last_prompt=None, answer_gate=None, tool_defs=None, served=None,
-                      ns_map=None):
+                      ns_map=None, custom_map=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -52700,10 +52828,24 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
         # shape codex routes on (VERIFIED live). Done once, before the item is
         # first emitted, so the added/done/completed items all agree.
         if "ns" not in st:
-            child, ns = (ns_map or {}).get(st["name"], (st["name"], None))
-            st["name"], st["ns"] = child, ns
+            if st["name"] in (custom_map or {}):
+                # A FREEFORM tool (apply_patch): handed back as a custom_tool_call
+                # with the raw `input` text, never as a function_call (see
+                # _responses_custom_map). Its input is sent whole at the end.
+                st["custom"] = True
+                st["name"], st["ns"] = custom_map[st["name"]], None
+            else:
+                child, ns = (ns_map or {}).get(st["name"], (st["name"], None))
+                st["name"], st["ns"] = child, ns
         st["out_index"] = next_index
         next_index += 1
+        if st.get("custom"):
+            yield _sse_event("response.output_item.added", {
+                "type": "response.output_item.added", "output_index": st["out_index"],
+                "item": {"type": "custom_tool_call", "id": st["item_id"],
+                         "call_id": st["call_id"], "name": st["name"], "input": "",
+                         "status": "in_progress"}})
+            return
         _added = {"type": "function_call", "id": st["item_id"],
                   "call_id": st["call_id"], "name": st["name"],
                   "arguments": "", "status": "in_progress"}
@@ -52760,6 +52902,16 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             # the underlying hunk is valid (see _normalize_apply_patch_diff).
             full_args = _normalize_apply_patch_diff(
                 st["name"], _repair_tool_arguments("".join(st["args"])))
+            if st.get("custom"):
+                item = {"type": "custom_tool_call", "id": st["item_id"],
+                        "call_id": st["call_id"], "name": st["name"],
+                        "input": _custom_input_from_args(full_args),
+                        "status": "incomplete" if cut_short[0] else "completed"}
+                yield _sse_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": st["out_index"], "item": item})
+                done_items.append((st["out_index"], item))
+                continue
             yield _sse_event("response.function_call_arguments.done", {
                 "type": "response.function_call_arguments.done",
                 "item_id": st["item_id"], "output_index": st["out_index"],
@@ -52891,7 +53043,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 if st["out_index"] is None:
                     # Announces (with the buffered args) once a name exists.
                     yield from _announce_tool(st)
-                elif args:
+                elif args and not st.get("custom"):
                     yield _sse_event("response.function_call_arguments.delta", {
                         "type": "response.function_call_arguments.delta",
                         "item_id": st["item_id"], "output_index": st["out_index"],
@@ -53020,11 +53172,65 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
         resp.close()
 
 
+def _lift_additional_tools(body):
+    """codex 0.165+ sends its tools as an INPUT ITEM, not the `tools` field.
+
+    MEASURED 2026-10-30 (real codex 0.165.0 against a fake Responses server): the
+    request has NO top-level `tools` and no `instructions`; `input[0]` is
+    {"type": "additional_tools", "role": "developer", "tools": [namespace
+    "functions" (exec_command, write_stdin, apply_patch, view_image, ...),
+    namespace "clock", namespace "collaboration" (spawn_agent, ...)]}. The hub
+    read only `body["tools"]`, `_responses_to_chat` drops unknown item types,
+    so every codex request reached the models with NO tools (hub.log:
+    RESPONSES ... tools=False) and they truthfully answered "I can't run
+    commands / reach your WSL". Codex RUNS a call returned as name=<child> (with
+    or without `namespace: "functions"`), so once the tools are lifted the
+    existing namespace path does the rest. The SAME parsed dict is changed in
+    place (werkzeug caches get_json, so every later reader sees the lifted
+    tools). A later definition of the same (type, name) replaces an earlier
+    one. Flag `responses_additional_tools` (default on); off = untouched."""
+    if not isinstance(body, dict):
+        return body
+    inp = body.get("input")
+    if not isinstance(inp, list) or not any(
+            isinstance(it, dict) and it.get("type") == "additional_tools" for it in inp):
+        return body
+    if not config.get_flag("responses_additional_tools", True):
+        return body
+    merged, index = [], {}
+
+    def _add(tool):
+        if not isinstance(tool, dict):
+            return
+        inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        key = (str(tool.get("type") or ""), str(inner.get("name") or ""))
+        if key[1] and key in index:
+            merged[index[key]] = tool
+            return
+        if key[1]:
+            index[key] = len(merged)
+        merged.append(tool)
+
+    for tool in body.get("tools") if isinstance(body.get("tools"), list) else []:
+        _add(tool)
+    keep = []
+    for it in inp:
+        if isinstance(it, dict) and it.get("type") == "additional_tools":
+            for tool in it.get("tools") if isinstance(it.get("tools"), list) else []:
+                _add(tool)
+            continue
+        keep.append(it)
+    body["tools"] = merged
+    body["input"] = keep
+    return body
+
+
 @app.route("/v1/responses", methods=["POST"])
 def v1_responses(_retry_pass=False, _hedged=False):
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
+    body = _lift_additional_tools(body)    # codex 0.165+: tools ride in `input`
     try:
         messages = _responses_to_chat(body)
         messages, image_count = _normalize_openai_messages(messages)
@@ -53049,6 +53255,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # count toward routing so a big request doesn't land on a small-TPM provider).
     tools = _responses_tools_to_chat(body.get("tools"))
     ns_map = _responses_ns_backmap(body.get("tools"))
+    custom_map = _responses_custom_map(body.get("tools"))   # freeform tools (apply_patch)
     est = _est_tokens(messages, tools)
     _rr_set_request_fit(messages, tools, est)   # fix #1: fit on the post-clear size
     # IMAGES ON A PIPELINE TIER OR A NON-VISION MODE: describe up front (see
@@ -53306,7 +53513,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est,
-                                      tool_defs=tools, ns_map=ns_map,
+                                      tool_defs=tools, ns_map=ns_map, custom_map=custom_map,
                                       served=_served_metadata(hop_pid, hop_model))),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
@@ -53363,7 +53570,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                       prompt_text=_prompt_text_for_check(payload),
                                       last_prompt=_last_user_text_for_check(payload),
                                       tools_offered=has_tools, answer_gate=gated,
-                                      tool_defs=tools, ns_map=ns_map,
+                                      tool_defs=tools, ns_map=ns_map, custom_map=custom_map,
                                       served=_served_metadata(hop_pid, hop_model))),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
@@ -53426,7 +53633,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                    max_tokens=body.get("max_output_tokens"))
             if _rv:
                 hop_pid, hop_model, data = _rv
-            out = _chat_to_responses(data, model_label, tool_defs=tools, ns_map=ns_map)
+            out = _chat_to_responses(data, model_label, tool_defs=tools, ns_map=ns_map,
+                                     custom_map=custom_map)
             out["metadata"] = _served_metadata(hop_pid, hop_model)
             return (jsonify(out), 200,
                     _routing_headers(hop_pid, hop_model, len(_tried), last_error))

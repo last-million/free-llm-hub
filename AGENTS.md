@@ -9652,3 +9652,42 @@ The three non-blocking items from "Review fixes, batch 3":
   limit. The stale worktrees were also removed.
 
 Release-note: fix: security-finding checks no longer count an error page that only repeats the tester's own URL as proof, form labels next to a checkbox or icon are no longer called placeholders, and a damaged encryption key file no longer leaves newly saved API keys unencrypted.
+
+## codex 0.165 sends its tools inside `input`; apply_patch is a freeform tool (2026-10-30)
+
+Covered by `tests/test_codex_additional_tools.py` (20, hermetic). Owner: "codex can't access my WSL or
+run commands". MEASURED: today's terminal codex session (folder "bount en", `danger-full-access`,
+approval `never`) had 13 turns and ZERO tool calls; every reply said "I can't reach your WSL / I cannot
+execute ...", and hub.log showed every codex request as `RESPONSES ... tools=False`. WSL itself was
+healthy (`/mnt/c` v9fs, automount and interop on, home writable) and neither codex's own sandbox nor
+the hub's `--dangerously-bypass-approvals-and-sandbox` launch was involved.
+
+- **Cause (verified with the real codex 0.165.0 against a fake Responses server, isolated
+  CODEX_HOME).** codex 0.165 no longer sends a top-level `tools` field (nor `instructions`): its first
+  input item is `{"type": "additional_tools", "role": "developer", "tools": [namespace "functions"
+  (exec_command, write_stdin, apply_patch, view_image, ...), namespace "clock", namespace
+  "collaboration" (spawn_agent, ...)]}`. The hub read only `body["tools"]` and `_responses_to_chat`
+  drops unknown item types, so the models never saw a tool. The catalog field `tool_mode`
+  (`code_mode_only` / `direct`, inherited from codex's own models_cache) was tested and is NOT the
+  switch: both values send the tools the same way.
+- **Fix 1** (`_lift_additional_tools`, first line of `v1_responses`; flag `responses_additional_tools`,
+  default on): the tools of every `additional_tools` input item are moved into `body["tools"]` (a later
+  definition of the same (type, name) wins) and the items are removed, in the SAME parsed dict
+  (werkzeug caches get_json). The existing namespace path then does the rest: codex RUNS a call
+  returned as `exec_command` with `namespace: "functions"` or with no namespace (both measured).
+- **Fix 2, freeform tools** (flag `responses_custom_tools`, default on). `apply_patch` arrives as
+  `type: "custom"` (raw text matching a lark grammar, no JSON parameters). MEASURED: returned as a
+  `function_call` codex answers "Fatal error: tool apply_patch invoked with incompatible payload"
+  (aborted); as a `custom_tool_call` with `input` the patch is applied. So a custom tool is offered to
+  the model as a function with ONE string argument `input` (`_custom_tool_description` adds the
+  grammar, clipped at 1500 chars), `_responses_custom_map` names the custom tools of the request, and
+  both emitters (`_chat_to_responses`, `_responses_stream`) hand such a call back as a
+  `custom_tool_call` (`_custom_input_from_args`: the `input` string, else the one string field, else the
+  raw text; no argument deltas are streamed for it). `_responses_to_chat` now translates
+  `custom_tool_call` / `custom_tool_call_output` history items (a nameless one is dropped with its
+  output), so the model sees its own patches and their results.
+- **Limits.** The pipeline-tier replays (`_swarm_as_responses`, `_cm_emit`) do not pass the custom map
+  (as for the namespace map). codex's other freeform tools, if any appear later, go through the same
+  path. Older codex builds (top-level `tools`) are unaffected.
+
+Release-note: fix: Codex 0.165 can run commands, reach WSL and edit files through the hub again (the hub was dropping the tools the new Codex sends).
