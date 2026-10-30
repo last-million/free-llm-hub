@@ -51,6 +51,10 @@ _NONCE_BYTES = 12                               # GCM standard
 
 _cached_key = [None]
 _warned_bad_size = [False]
+# The key file was found with the wrong size (damaged): its path. Set by
+# load_or_create_key, read by encrypt/decrypt to use the fallback key below.
+_damaged_at = [None]
+_cached_fallback = [None]
 log = logging.getLogger(__name__)
 
 
@@ -108,8 +112,10 @@ def load_or_create_key(config_path):
             if not _warned_bad_size[0]:
                 _warned_bad_size[0] = True
                 log.error("secret.key is %d bytes, expected %d: stored keys cannot "
-                          "be decrypted until it is restored (it is left as it is)",
-                          len(raw), _KEY_BYTES)
+                          "be decrypted until it is restored (it is left as it is; "
+                          "new keys are encrypted with %s meanwhile)",
+                          len(raw), _KEY_BYTES, os.path.basename(fallback_path(config_path)))
+            _damaged_at[0] = path
             return None
         except FileNotFoundError:
             _last = None
@@ -156,6 +162,63 @@ def load_or_create_key(config_path):
     return raw
 
 
+def fallback_path(config_path):
+    """secret-fallback.key, beside secret.key: the key NEW secrets are encrypted
+    with while secret.key is damaged (wrong size)."""
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)), "secret-fallback.key")
+
+
+def _fallback_key(config_path, create):
+    """The fallback key, or None. Created (O_EXCL, like the main key) only when
+    `create` and secret.key is damaged. A damaged secret.key is NEVER moved,
+    overwritten or replaced: restoring it makes every old secret readable again,
+    and the secrets saved meanwhile stay readable through this file."""
+    if not _HAVE_CRYPTO:
+        return None
+    if _cached_fallback[0] is not None:
+        return _cached_fallback[0]
+    path = fallback_path(config_path)
+    for _attempt in range(4):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if len(raw) != _KEY_BYTES:
+                return None
+            _cached_fallback[0] = raw
+            return raw
+        except FileNotFoundError:
+            break
+        except OSError:
+            time.sleep(0.05 * (_attempt + 1))
+    else:
+        return None
+    if not create:
+        return None
+    raw = os.urandom(_KEY_BYTES)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _fallback_key(config_path, False)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    _restrict(path)
+    _cached_fallback[0] = raw
+    log.error("secret.key is damaged: new keys are encrypted with %s until it is "
+              "restored (old keys stay unreadable until then)", os.path.basename(path))
+    return raw
+
+
 def is_encrypted(value):
     return isinstance(value, str) and value.startswith(PREFIX)
 
@@ -166,6 +229,9 @@ def encrypt(value, config_path):
     if not isinstance(value, str) or not value or is_encrypted(value):
         return value
     key = load_or_create_key(config_path)
+    if not key and _damaged_at[0] == key_path(config_path):
+        # secret.key is damaged: never fall back to storing the key in plain text
+        key = _fallback_key(config_path, True)
     if not key:
         return value
     try:
@@ -186,17 +252,27 @@ def decrypt(value, config_path):
     that no amount of re-entering the right key would fix."""
     if not is_encrypted(value):
         return value
-    key = load_or_create_key(config_path)
-    if not key:
+    keys = [k for k in (load_or_create_key(config_path),
+                        _fallback_key(config_path, False)) if k]
+    if not keys:
         return None
     try:
         blob = base64.b64decode(value[len(PREFIX):].encode("ascii"))
-        return AESGCM(key).decrypt(blob[:_NONCE_BYTES], blob[_NONCE_BYTES:],
-                                   None).decode("utf-8")
     except Exception:                                        # noqa: BLE001
         return None
+    # The main key first; then the fallback key that encrypted what was saved
+    # while secret.key was damaged (it stays readable after secret.key is restored).
+    for key in keys:
+        try:
+            return AESGCM(key).decrypt(blob[:_NONCE_BYTES], blob[_NONCE_BYTES:],
+                                       None).decode("utf-8")
+        except Exception:                                    # noqa: BLE001
+            continue
+    return None
 
 
 def reset_cache():
     """Test hook: forget the loaded master key."""
     _cached_key[0] = None
+    _cached_fallback[0] = None
+    _damaged_at[0] = None

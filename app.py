@@ -42713,6 +42713,81 @@ def _ends_with_announcement(text):
         return False
 
 
+# --- A committed codex stream that stops on "I'll do X" is retried (2026-10-30) ---
+# The peek only holds replies up to _ANNOUNCE_MAX_CHARS; a LONGER reply streams to the
+# client as it arrives, so a reply that ends "...Next I'll run the tests." with no tool
+# call used to end the codex turn (Activity: served, task_complete, nothing done). At the
+# END of such a stream /v1/responses now sends `response.failed` code "upstream_error"
+# (codex retries it like a dropped stream, up to stream_max_retries, and keeps nothing of
+# the partial reply -- no output_item.done) and files the pair, so the retry starts on
+# another model. At most _ANNOUNCE_STOP_RETRIES per instruction per _ANNOUNCE_STOP_TTL: it
+# can never loop. Flag `announce_stop_retry` (default on; off = response.completed).
+_ANNOUNCE_STOP_RETRIES = 2
+_ANNOUNCE_STOP_TTL = 900.0
+_ANNOUNCE_STOP_TEXT = ("The model only announced its next step and stopped without doing "
+                       "it; asking for the turn again so another model does the step.")
+_announce_stop_lock = threading.Lock()
+_announce_stop_seen = {}        # sha256(instruction)[:16] -> [epoch, ...]
+
+
+# A last paragraph that hands the turn to the USER is a stop on purpose, never a
+# stalled step: "I'll wait for your confirmation", "once you approve", "let me know".
+_AWAITS_USER_RE = re.compile(
+    r"(?i)\b(?:your\s+(?:confirmation|approval|go-?ahead|answer|input|reply|decision|ok|"
+    r"permission|choice|feedback|instructions?)|once\s+you\b|after\s+you\b|"
+    r"when\s+you\b|until\s+you\b|if\s+you\b|let\s+me\s+know|wait(?:ing)?\s+for\s+you)")
+
+
+def _stopped_on_announcement(text):
+    """A finished tool-turn reply that ENDS on a bare announcement of a step: a short
+    reply judged whole (_ends_with_announcement), a longer one by its LAST paragraph
+    (<= _ANNOUNCE_MAX_CHARS, no question, no code; an unclosed code fence = no).
+    Never raises."""
+    try:
+        vis, _think = _ann_split(text or "")
+        body = vis.strip()
+        if not body:
+            return False
+        tail_para = [x for x in re.split(r"\n\s*\n", body) if x.strip()][-1]
+        if _AWAITS_USER_RE.search(tail_para):
+            return False
+        if len(body) <= _ANNOUNCE_MAX_CHARS:
+            return _ends_with_announcement(text)
+        if body.count("```") % 2:
+            return False
+        paras = [x for x in re.split(r"\n\s*\n", body) if x.strip()]
+        last = paras[-1].strip() if paras else ""
+        if not last or len(last) > _ANNOUNCE_MAX_CHARS or len(last) == len(body):
+            return False
+        return _ends_with_announcement(last)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _announce_stop_allowed(instruction):
+    """Spend one of this instruction's announce-stop retries; False when the flag is
+    off, there is no instruction to key on, or its budget is spent. Never raises."""
+    try:
+        if not instruction or not config.get_flag("announce_stop_retry", True):
+            return False
+        key = hashlib.sha256(str(instruction).encode("utf-8", "ignore")).hexdigest()[:16]
+        now = time.time()
+        with _announce_stop_lock:
+            times = [t for t in _announce_stop_seen.get(key, ()) if now - t < _ANNOUNCE_STOP_TTL]
+            if len(times) >= _ANNOUNCE_STOP_RETRIES:
+                _announce_stop_seen[key] = times
+                return False
+            times.append(now)
+            _announce_stop_seen[key] = times
+            if len(_announce_stop_seen) > 2000:
+                for k in [k for k, v in _announce_stop_seen.items()
+                          if not v or now - v[-1] >= _ANNOUNCE_STOP_TTL]:
+                    _announce_stop_seen.pop(k, None)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # Longest the peek holds a short reply to see if it ends as a bare announcement (still
 # capped by what the peek itself may wait). MEASURED 2026-10-30 02:19 UTC (codex,
 # `coding`): a g4f relay took 18-23 s to stream a 189-char reply ending "I'll start with
@@ -52859,6 +52934,25 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
         for st in tools.values():
             if not st["name"]:
                 st["name"] = _infer_tool_name("".join(st["args"]), tool_defs) or ""
+        if (hop_pid and tools_offered and not judged and stream_fin != "length"
+                and not cut_short[0] and not getattr(answer_gate, "cut", False)
+                and not any(st["name"] for st in tools.values())
+                and _stopped_on_announcement("".join(text_buf))
+                and _announce_stop_allowed(last_prompt or prompt_text or "")):
+            # Announced a step and stopped (see _stopped_on_announcement): codex
+            # retries a response.failed like a dropped stream and keeps nothing of
+            # this reply (no output_item.done), and the pair is filed so the retry
+            # opens on another model.
+            _log.warning("[announce-stop] %s/%s: the stream ended on an announcement "
+                         "with no tool call; codex is asked to retry the turn",
+                         hop_pid, hop_model)
+            _note_nonanswer(hop_pid, hop_model, "announced")
+            _note_recent_hop_failure(hop_pid, hop_model, "announced")
+            failed = _obj("failed", [])
+            failed["error"] = {"code": "upstream_error", "message": _ANNOUNCE_STOP_TEXT}
+            yield _sse_event("response.failed", {"type": "response.failed",
+                                                 "response": failed})
+            return
         if not judged and not getattr(answer_gate, "cut", False):
             # The stream ENDED: file the outcome it never used to (see
             # _record_stream_outcome). The client already has the bytes.

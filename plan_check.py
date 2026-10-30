@@ -355,7 +355,9 @@ def _index(project_dir):
             return None
         rel, base, n = set(), set(), 0
         for root, dirs, files in os.walk(project_dir):
-            dirs[:] = [d for d in dirs if d not in _INDEX_SKIP]
+            # .claude/worktrees: copies of the whole project that agent tools create
+            dirs[:] = [d for d in dirs if d not in _INDEX_SKIP
+                       and not (d == "worktrees" and os.path.basename(root) == ".claude")]
             for name in files:
                 path = os.path.relpath(os.path.join(root, name), project_dir)
                 rel.add(path.replace("\\", "/").casefold())

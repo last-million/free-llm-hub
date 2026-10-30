@@ -506,6 +506,11 @@ _FIELD_LABEL_TAGS = {"label", "th", "legend", "option", "optgroup", "dt", "capti
 # Inline wrappers that may sit between a label element and its text
 # ("<label><span>Company Name</span> *</label>"): looked through, open or closed.
 _INLINE_TAGS = {"span", "b", "strong", "em", "i", "small", "abbr", "u", "mark", "font"}
+# Empty or decorative elements a label often starts with ("<label><input
+# type=checkbox> Company Name</label>", an icon, "<th>Billing<br>Company Name"):
+# looked through too, an inline SVG icon with everything inside it.
+_DECOR_TAGS = {"input", "br", "img", "wbr", "svg", "path", "g", "use", "circle", "rect",
+               "line", "polyline", "polygon", "ellipse", "title", "desc", "defs", "symbol"}
 _OPEN_CLOSE_RE = re.compile(r"<(/?)([A-Za-z][\w-]*)\b[^<>]*>")
 # "Company Name:" followed by nothing on the line, a tag (an <input>) or a
 # blank to fill in ("____"): a field label. Words after the colon ("Company
@@ -522,7 +527,7 @@ def _is_field_label(doc, start, end):
     before = doc.code[max(0, start - 2000):start]
     for m in reversed(list(_OPEN_CLOSE_RE.finditer(before))):
         name = m.group(2).lower()
-        if name in _INLINE_TAGS:
+        if name in _INLINE_TAGS or name in _DECOR_TAGS:
             continue
         if not m.group(1) and name in _FIELD_LABEL_TAGS:
             return True
@@ -530,7 +535,8 @@ def _is_field_label(doc, start, end):
     if _LABEL_COLON_RE.match(doc.code, end):
         return True
     line_before = before.rsplit("\n", 1)[-1].rstrip(" \t")
-    return doc.kind == "md" and line_before.endswith("|")
+    # "| **Company Name** |": markdown emphasis between the cell bar and the text
+    return doc.kind == "md" and line_before.rstrip("*_ \t").endswith("|")
 
 
 _NUMBERED_RE = re.compile(

@@ -9383,7 +9383,8 @@ and he says he will do it but he does nothing and he stops."
 - **Limits.** A reply longer than `_ANNOUNCE_MAX_CHARS` (400) that ends on an announcement is
   still committed as it streams and never judged; so is one that outlasts the peek's own wait.
   Once a stream is committed the hub has no way to continue a terminal CLI's turn (the Build page
-  has the stall auto-continue; terminal CLIs do not). Not done, an option for later: end such a
+  has the stall auto-continue; terminal CLIs do not). SUPERSEDED for codex (`/v1/responses`) the same day: see "A long
+  codex reply that stops on 'I'll do X' is retried (2026-10-30)". Not done, an option for later: end such a
   committed tool-turn stream with the protocol's retryable failure (the broken-stream endings)
   so the CLI itself retries, bounded per conversation.
 
@@ -9595,3 +9596,59 @@ Covered by 26 new tests at the end of `tests/test_github_push.py` (hermetic: rea
   - Not run against the real GitHub.
 
 Release-note: fix: pushing a project to GitHub now checks its whole past history for passwords and API keys (even after an earlier link attempt to another repository), recognises Groq, NVIDIA, Cerebras and GitHub sign-in keys, and never copies another folder's history by mistake.
+
+## A long codex reply that stops on "I'll do X" is retried (2026-10-30)
+
+Covered by `tests/test_announce_stop_retry.py`. The stream peek holds only replies up to
+`_ANNOUNCE_MAX_CHARS` (400) to judge them whole; a longer reply streams to codex as it arrives,
+so one that ended "...Next, I'll fetch the API documentation." with no tool call was closed with
+`response.completed` and codex ended the turn with nothing done.
+
+- **What.** At the END of a `/v1/responses` stream (`_responses_stream`), a tool turn whose reply
+  made no tool call, finished normally (not "length", not cut by the deadline or the answer gate)
+  and stops on an announcement (`_stopped_on_announcement`: a short reply judged whole by
+  `_ends_with_announcement`, a longer one by its LAST paragraph of <= 400 chars, no question, no
+  unclosed code fence) ends with `response.failed` code `upstream_error` instead. Codex retries
+  that like a dropped stream (stream_max_retries) and keeps nothing of the partial reply (no
+  `output_item.done`, the BROKEN UPSTREAM STREAMS contract). The pair is filed
+  (`_note_nonanswer(..., "announced")` + `_note_recent_hop_failure(..., "announced")`), so the
+  retry opens on another model.
+- **Never loops.** At most `_ANNOUNCE_STOP_RETRIES` (2) per instruction (sha256 of the last user
+  message) per `_ANNOUNCE_STOP_TTL` (15 min), in memory; past it the reply is served as before.
+- **Never on a deliberate stop.** A last paragraph that hands the turn to the user
+  (`_AWAITS_USER_RE`: "your confirmation / approval / answer", "once / when / if you", "let me
+  know", "waiting for you") is served; so is a question, a tool call, or a tool-free turn.
+- **Flag** `announce_stop_retry` (default on); off = `response.completed`, as before.
+- **Limits.** codex only. The opencode chat passthrough has already relayed `[DONE]` when the
+  text can be judged, and Claude Code was not reported; both are unchanged. The detector is the
+  same heuristic as the peek's: a report whose last sentence opens with "I'll ..." about a real
+  next step costs one retry on another model (the cap bounds it).
+
+Release-note: fix: when a model in Codex writes a long reply that ends with "I'll do X" and then stops without doing it, Codex now retries the turn on another model instead of ending it.
+
+## Review leftovers fixed (2026-10-30)
+
+The three non-blocking items from "Review fixes, batch 3":
+
+- **SSRF echo is not proof** (`findings._proof_line`): a proof match whose exact text also
+  appears in that call's own arguments (URL-decoded) is the target echoing the agent's payload
+  ("url not allowed: http://metadata.google.internal/computeMetadata/v1/"), not internal content;
+  the next match is tried. Applies to every class's proof patterns. Content the agent did not send
+  ("AccessKeyId" from a credentials page) still proves it. `tests/test_findings_check.py`.
+- **Company Name labels with a checkbox, an icon or a break** (`slopcheck._DECOR_TAGS`): the
+  nearest-tag rule also looks through input, br, img, wbr and an inline SVG with everything in it,
+  and a markdown table cell may wrap the text in `**`/`_`. A logo link that starts with an icon is
+  still a placeholder. `tests/test_slopcheck_label_and_warm_gradient.py`.
+- **A damaged secret.key no longer means plain-text keys** (`secretstore`): the damaged file is
+  NEVER moved, overwritten or replaced; new secrets are encrypted with `secret-fallback.key`
+  (beside it, created O_EXCL, 0600, only while secret.key has the wrong size), and `decrypt` tries
+  the main key, then the fallback. Restoring the real secret.key makes the old secrets readable
+  again and keeps the ones saved meanwhile readable. Supersedes the "stored in plain text until it
+  is fixed" trade-off of `test_a_wrong_size_key_file_does_not_break_config_reads`.
+  `tests/test_config_secrets_review_fixes.py`.
+- **Agent worktrees are not project files** (`plan_check._index`): `.claude/worktrees` is skipped
+  by the dry run's file scan. MEASURED: with 18 worktrees inside this repo, the scan of "." took
+  1.1 s and pushed `test_a_worker_that_keeps_producing_output_is_not_timed_out` past its 1.5 s idle
+  limit. The stale worktrees were also removed.
+
+Release-note: fix: security-finding checks no longer count an error page that only repeats the tester's own URL as proof, form labels next to a checkbox or icon are no longer called placeholders, and a damaged encryption key file no longer leaves newly saved API keys unencrypted.

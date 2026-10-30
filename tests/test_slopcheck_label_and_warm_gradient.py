@@ -161,3 +161,20 @@ def test_a_listed_or_warm_described_violet_gradient_is_still_the_default_one(tex
 ])
 def test_a_gradient_whose_own_stops_are_warm_is_not_flagged(text):
     assert not S._design_gradient(text, "")
+
+
+def test_a_label_that_starts_with_a_checkbox_an_icon_or_a_break_is_not_a_placeholder():
+    assert _placeholders('<form><label><input type="checkbox" name="c"> Company Name</label></form>') == []
+    assert _placeholders('<form><label><svg viewBox="0 0 8 8"><path d="M0 0h8v8z"/></svg> '
+                         'Company Name</label><input></form>') == []
+    assert _placeholders("<table><tr><th>Billing<br>Company Name</th></tr>"
+                         "<tr><td>Fixli</td></tr></table>") == []
+    md = "# Clients\n\n| **Company Name** | Plan |\n| --- | --- |\n| Fixli | Pro |\n"
+    assert [f for f in S.check_files([("README.md", md)]) if f["rule"] == "placeholder"] == []
+
+
+def test_an_icon_before_a_logo_name_does_not_hide_the_placeholder():
+    found = _placeholders('<header><a class="logo" href="/"><svg viewBox="0 0 8 8">'
+                          '<path d="M0 0h8v8z"/></svg> Company Name</a></header>')
+    assert [f["severity"] for f in found] == ["high"]
+

@@ -1025,3 +1025,21 @@ def test_flag_off_the_handler_sends_the_old_body(route, monkeypatch):
                              json={"model": PINNED, "messages": msgs, "tools": TOOLS}).get_data()
     assert _notes_in(route["sent"][-1]["messages"]) == []
     assert not fc["root"].exists()
+
+def test_an_error_page_that_echoes_the_metadata_url_is_not_proof():
+    claim = _claim("Confirmed SSRF at https://api.example.com/fetch.")
+    url = "http://metadata.google.internal/computeMetadata/v1/"
+    echo = _res("c1", "curl -si 'https://api.example.com/fetch?url=%s'" % url,
+                'HTTP/1.1 400 Bad Request\n\n{"error":"url not allowed: %s"}' % url)
+    assert F.evidence(claim, [echo])["status"] != "proven"
+    aws = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    echo2 = _res("c2", "curl -si 'https://api.example.com/fetch?url=%s'" % aws.replace(":", "%3A"),
+                 "HTTP/1.1 400 Bad Request\n\nblocked: %s" % aws)
+    assert F.evidence(claim, [echo2])["status"] != "proven"
+
+
+def test_internal_content_the_agent_did_not_send_is_still_proof():
+    claim = _claim("Confirmed SSRF at https://api.example.com/fetch.")
+    creds = _res("c1", "curl -s 'https://api.example.com/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/web'",
+                 'HTTP/1.1 200 OK\n\n{"Code":"Success","AccessKeyId":"ASIAXXXXXXXXXXXXXXXX"}')
+    assert F.evidence(claim, [creds])["status"] == "proven"

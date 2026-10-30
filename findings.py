@@ -626,6 +626,34 @@ def _pattern_line(rx, text):
     return text[s:e if e >= 0 else len(text)]
 
 
+def _unquoted(text):
+    """`text` URL-decoded (twice at most), lower-cased."""
+    t = text or ""
+    for _ in range(2):
+        d = unquote(t)
+        if d == t:
+            break
+        t = d
+    return t.casefold()
+
+
+def _proof_line(rx, text, args):
+    """The line of the first match of proof pattern `rx` in `text` whose matched
+    text is NOT in the call's own arguments `args`: an error page that echoes the
+    agent's payload ('url not allowed: http://metadata.google.internal/...') shows
+    what the agent SENT, not what the target did. None when every match is such
+    an echo."""
+    sent = _unquoted(args)
+    for m in re.finditer(rx, text):
+        hit = m.group(0).strip().casefold()
+        if hit and sent and hit in sent:
+            continue
+        s = text.rfind("\n", 0, m.start()) + 1
+        e = text.find("\n", m.end())
+        return text[s:e if e >= 0 else len(text)]
+    return None
+
+
 def _status(output):
     codes = _STATUS_LINE_RE.findall(output)
     if codes:
@@ -867,7 +895,7 @@ def _evidence(claim, results):
             return {"proof": "observed", "status": "proven", "pointer": _pointer(r, sp[2]), "reasons": []}
         view = _response_view(out)
         for rx in rule.get("proof", ()):
-            line = _pattern_line(rx, view)
+            line = _proof_line(rx, view, r.get("args") or "")
             if line is not None:
                 return {"proof": "observed", "status": "proven", "pointer": _pointer(r, line),
                         "reasons": []}

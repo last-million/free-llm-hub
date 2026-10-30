@@ -457,3 +457,17 @@ def test_the_brief_stays_within_its_token_budget():
     # addition is ~150 tokens (chars / 4, the suite's convention).
     assert (len(craft.PLAN_PHASES) - 626) / 4 <= 150
     assert len(craft.PLAN_PHASES) / 4 <= 230
+
+
+def test_agent_worktrees_are_not_project_files(tmp_path):
+    import plan_check as _pc
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x")
+    wt = tmp_path / ".claude" / "worktrees" / "agent-1" / "src"
+    wt.mkdir(parents=True)
+    (wt / "copy.py").write_text("x")
+    (tmp_path / ".claude" / "settings.json").write_text("{}")
+    rel, base = _pc._index(str(tmp_path))
+    assert "src/app.py" in rel and ".claude/settings.json" in rel
+    assert "copy.py" not in base
+

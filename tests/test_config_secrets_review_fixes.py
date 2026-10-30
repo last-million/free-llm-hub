@@ -167,8 +167,13 @@ def test_a_wrong_size_key_file_does_not_break_config_reads(cfg_path, content):
     cfg = config.load_config()                     # used to raise ValueError
     assert config.get_flag("some_flag") is True
     assert cfg["providers"]["groq"]["api_keys"] == []
-    # The value is kept as it is, as encrypt() promises.
-    assert secretstore.encrypt("sk-x", str(cfg_path)) == "sk-x"
+    # A NEW key is never stored in plain text: the fallback key encrypts it, and
+    # the damaged key file is left exactly as it was.
+    enc = secretstore.encrypt("sk-x", str(cfg_path))
+    assert secretstore.is_encrypted(enc)
+    assert secretstore.decrypt(enc, str(cfg_path)) == "sk-x"
+    with open(key_file, "rb") as f:
+        assert f.read() == content
     config.set_flag("other_flag", True)            # a save works too
     with open(cfg_path, encoding="utf-8") as f:
         on_disk = json.load(f)
@@ -227,3 +232,32 @@ def test_the_control_token_docs_do_not_promise_it_stays_out_of_the_html():
     start = src.index("def _local_control_guard")
     guard = src[start:src.index("\n@app.after_request", start)]
     assert "never rendered" not in re.sub(r"[\s#]+", " ", guard)
+
+
+def test_restoring_the_damaged_key_keeps_both_old_and_new_secrets_readable(cfg_path):
+    if not secretstore.available():
+        pytest.skip("cryptography is not installed")
+    good = secretstore.load_or_create_key(str(cfg_path))
+    old_secret = secretstore.encrypt("sk-old", str(cfg_path))
+    key_file = secretstore.key_path(str(cfg_path))
+    with open(key_file, "wb") as f:
+        f.write(good[:31])                          # damaged
+    secretstore.reset_cache()
+    assert secretstore.decrypt(old_secret, str(cfg_path)) is None
+    new_secret = secretstore.encrypt("sk-new", str(cfg_path))
+    assert secretstore.is_encrypted(new_secret)
+    assert os.path.exists(secretstore.fallback_path(str(cfg_path)))
+    with open(key_file, "wb") as f:                 # the owner restores the real key
+        f.write(good)
+    secretstore.reset_cache()
+    assert secretstore.decrypt(old_secret, str(cfg_path)) == "sk-old"
+    assert secretstore.decrypt(new_secret, str(cfg_path)) == "sk-new"
+
+
+def test_no_fallback_key_is_made_while_the_key_file_is_fine(cfg_path):
+    if not secretstore.available():
+        pytest.skip("cryptography is not installed")
+    enc = secretstore.encrypt("sk-x", str(cfg_path))
+    assert secretstore.decrypt(enc, str(cfg_path)) == "sk-x"
+    assert not os.path.exists(secretstore.fallback_path(str(cfg_path)))
+
