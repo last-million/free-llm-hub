@@ -41372,6 +41372,10 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
     # empty reply instead of the chain walking on.
     notice_watch = bool(check)
     notice_relay = bool(check and check.get("relay"))
+    # A relay's text-only reply on a tool turn is judged whole (see A RELAY'S TEXT-ONLY
+    # REPLY IS HELD TO ITS END): the gag or a stopped-on-"I'll ..." ending is only readable
+    # once the reply is over, whatever its length.
+    relay_hold = bool(check and tools_turn and check.get("relay") and _relay_text_hold_on())
 
     def _claim_possible(text):
         return bool((claim_watch and answer_check.is_empty_claim_possible(text, claim_lp))
@@ -41407,6 +41411,17 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         if tools_turn and _ends_with_announcement(text):
             box["kind"] = "announced"
             return "nonanswer"
+        if relay_hold:
+            # The relay's own gag (or the model's words for it) means this reply cannot be
+            # followed by another call; an ending that only announces a step is the same
+            # dead end. Kind "announced": walk on, at most _ANNOUNCE_RETRIES per request.
+            if (_relay_gagged_reply(check.get("pid"), text)
+                    or _relay_reply_ends_announcing(text)):
+                if _relay_gagged_reply(check.get("pid"), text):
+                    _note_relay_injection(check.get("pid"), check.get("model"),
+                                          ["relay_tool_injection"])
+                box["kind"] = "announced"
+                return "nonanswer"
         # The text grew after the first verdict: the empty-message claim is only
         # readable now (it was judged on its first ~11 characters).
         return _claim_verdict(seen, True) or "content"
@@ -41415,13 +41430,14 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         buf = box["buf"]
         saw_reasoning = False
         seen_content = []
+        seen_chars = 0
         read_on_at, read_on_budget = None, 0.0
         n_read, held = 0, 0
         try:
             while True:
                 # The old `for _ in range(max_lines)`, except that a HELD stream
                 # (reasoning only so far, see `hold`) reads on past max_lines.
-                if n_read >= max_lines and not (
+                if n_read >= max_lines and not box.get("gag") and not (
                         hold and saw_reasoning and not seen_content
                         and not box.get("nameless_tool")):
                     break
@@ -41486,13 +41502,14 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # without waiting at all. Bounded by _PEEK_JUDGE_CHARS and by
                     # the deadline this whole peek already runs under.
                     seen_content.append(b.decode("utf-8", "ignore"))
+                    seen_chars += len(seen_content[-1])
                     if not box.get("saw_content") and on_content is not None:
                         try:
                             on_content()
                         except Exception:                        # noqa: BLE001
                             pass
                     box["saw_content"] = True
-                    if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
+                    if seen_chars < _PEEK_JUDGE_CHARS:
                         continue
                     if read_on_at is None:
                         verdict = _judge(seen_content, complete=False)
@@ -41518,11 +41535,13 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         # ...and while the text so far could still BECOME the
                         # empty-message claim (same bounded hold as above).
                         box["emc"] = bool(verdict == "content" and _claim_possible(_first))
+                        box["gag"] = bool(verdict == "content" and relay_hold)
                         _now = time.monotonic()
                         box["ann_until"] = _now + max(0.0, min(
                             _ANNOUNCE_HOLD_S,
                             deadline_s + (content_grace or 0.0) - (_now - started) - 0.5))
-                        if verdict != "content" or not (watch or box["ann"] or box["emc"]):
+                        if verdict != "content" or not (
+                                watch or box["ann"] or box["emc"] or box["gag"]):
                             box["status"] = verdict
                             return
                         # MEASURED 2026-09-27: _PEEK_JUDGE_CHARS counts frame
@@ -41538,7 +41557,12 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                             deadline_s + (content_grace or 0.0)
                             - (read_on_at - started) - 0.5))
                         box["nt"] = watch
-                    text_now = _peeked_text("".join(seen_content))
+                    # joined and scanned only while a hold that READS it is active: a
+                    # long relay reply held only for its ending (box["gag"]) would
+                    # otherwise be re-scanned in full on every frame (quadratic)
+                    text_now = (_peeked_text("".join(seen_content))
+                                if (box.get("nt") or box.get("ann") or box.get("emc"))
+                                else "")
                     if box.get("nt"):
                         state = _no_tools_peek_state(text_now)
                         if state == "claim":
@@ -41561,7 +41585,10 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         if (not _claim_possible(text_now)
                                 or time.monotonic() >= box.get("ann_until", 0.0)):
                             box["emc"] = False
-                    if not (box.get("nt") or box.get("ann") or box.get("emc")):
+                    if box.get("gag") and time.monotonic() >= box.get("ann_until", 0.0):
+                        box["gag"] = False       # the hold ran out: commit, as before
+                    if not (box.get("nt") or box.get("ann") or box.get("emc")
+                            or box.get("gag")):
                         box["status"] = "content"
                         return
                     continue
@@ -42793,6 +42820,53 @@ def _relay_gagged_reply(pid, text):
         if not pid or not _is_relay_pid(pid) or not _relay_injection_rest_on():
             return False
         return answer_check.has_relay_gag(text or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+# A RELAY'S TEXT-ONLY REPLY IS HELD TO ITS END (2026-10-31).
+# MEASURED (the owner's OpenCode `coding-max` session, 00:21-01:34, chat protocol): seven
+# "continue" turns in a row ended with no tool call, every one served HTTP 200 / "ok" by a
+# g4f poe relay copy. Three carried the relay's "stop calling tools" gag inside a leaked
+# <think> at the very START of a 2-7K-character reply; two ended on "I'll ..." / "Let me ..."
+# in a reply of 600+ characters. The peek only held a reply up to _ANNOUNCE_MAX_CHARS to see
+# how it ends, so all of them were committed unjudged and OpenCode ended its turn on each.
+# The chat protocol cannot take back frames it already relayed (codex gets a retry at the END
+# of its stream instead), so on a RELAY hop of a TOOL turn the peek now keeps reading a
+# text-only reply until a tool call arrives (commit), the stream ends (judged whole: the gag
+# or a last paragraph that only announces the next step fails the hop, so the chain walks on
+# and the relay server rests) or the bounded hold (_ANNOUNCE_HOLD_S) runs out (committed, as
+# before). Direct providers and tool-free turns are untouched. Flag `relay_text_hold`
+# (default on; off = the old peek, byte for byte).
+def _relay_text_hold_on():
+    try:
+        return bool(config.get_flag("relay_text_hold", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _relay_reply_ends_announcing(text):
+    """A COMPLETE relay reply, of any length, whose last paragraph (or, when that is long,
+    its last sentence) only announces the next step: "...Next, let me run the tests."
+    A tail that hands the turn to the user, a question and unclosed code are not. Wider
+    than _stopped_on_announcement, which leaves one long paragraph alone, because it is
+    used only for a relay hop that already has the dead-end shape (no tool call after a
+    held reply). Never raises."""
+    try:
+        vis, _think = _ann_split(text or "")
+        body = vis.strip()
+        if not body or body.count("```") % 2:
+            return False
+        paras = [x for x in re.split(r"\n\s*\n", body) if x.strip()]
+        tail = paras[-1].strip() if paras else body
+        if len(tail) > _ANNOUNCE_MAX_CHARS:
+            parts = [x for x in _LAST_SENTENCE_SPLIT_RE.split(tail) if x.strip()]
+            tail = parts[-1].strip() if parts else tail
+            if len(tail) > _ANNOUNCE_MAX_CHARS:
+                return False
+        if _AWAITS_USER_RE.search(tail):
+            return False
+        return _ends_with_announcement(tail)
     except Exception:                                            # noqa: BLE001
         return False
 
