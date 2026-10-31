@@ -268,7 +268,13 @@ def _from_tool_call_block(inner):
 # Model-native markup: DeepSeek DSML, DeepSeek/Kimi special-token calls
 # --------------------------------------------------------------------------- #
 
-_BAR = "[｜|]"                # fullwidth vertical line, or the ASCII one
+# One OR MORE bars: MEASURED 2026-10-31 (opencode, g4f relay copies of DeepSeek):
+# a call typed as text spelled its tokens with DOUBLED bars and a slash on the
+# end ones -- "<||tool_calls_begin||>" ... "</||tool_call_end||>" (shown here
+# with ASCII bars). One bar was the only spelling known, so none of it parsed,
+# has_model_markup() was False, and the call was served as prose: nothing ran
+# and the turn ended.
+_BAR = "[｜|]+"               # fullwidth vertical line, or the ASCII one, 1+
 _SP = "[▁_ ]"                # sentencepiece "▁", "_" or a plain space
 _DSML_OPEN = r"<\s*" + _BAR + r"\s*DSML\s*" + _BAR + r"\s*"
 _DSML_CLOSE = r"<\s*(?:/\s*" + _BAR + r"|" + _BAR + r"\s*/)\s*DSML\s*" + _BAR + r"\s*"
@@ -276,7 +282,7 @@ _DSML_CLOSE = r"<\s*(?:/\s*" + _BAR + r"|" + _BAR + r"\s*/)\s*DSML\s*" + _BAR + 
 
 def _special(*words):
     """A <｜tool▁call▁begin｜>-style token, any bar / space spelling."""
-    return r"<\s*" + _BAR + r"\s*" + _SP.join(words) + r"\s*" + _BAR + r"\s*>"
+    return r"<\s*/?\s*" + _BAR + r"\s*" + _SP.join(words) + r"\s*" + _BAR + r"\s*>"
 
 
 _TC_BEGIN = _special("tool", "call", "begin")
@@ -321,7 +327,7 @@ _MARKUP_START_RE = re.compile(
 # Every tag of that markup, to find where it ENDS.
 _MARKUP_TAG_RE = re.compile(
     r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR + _TAG_ATTRS + r">"
-    r"|<\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>"
+    r"|<\s*/?\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>"
     r"|<\s*/?\s*" + _NS + r"(?:invoke|parameter|function_calls)\b" + _TAG_ATTRS + r">", re.I)
 # The openers, normalised (see _norm_marker), for the streaming prefix hold.
 _MARKERS = ("<|dsml|", "<|tool_calls_begin|>", "<|tool_call_begin|>",
@@ -705,7 +711,8 @@ _STREAM_ERROR = {"error": {"message": "the model wrote a tool call as model-nati
 
 
 def _norm_marker(s):
-    return re.sub(r"\s+", "", s.lower().replace("｜", "|").replace("▁", "_"))
+    s = re.sub(r"\s+", "", s.lower().replace("｜", "|").replace("▁", "_"))
+    return re.sub(r"\|+", "|", s)        # doubled bars read as one
 
 
 def _may_open_marker(text):

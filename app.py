@@ -41411,20 +41411,35 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         if tools_turn and _ends_with_announcement(text):
             box["kind"] = "announced"
             return "nonanswer"
-        if relay_hold:
-            # The relay's own gag (or the model's words for it) means this reply cannot be
-            # followed by another call; an ending that only announces a step is the same
-            # dead end. Kind "announced": walk on, at most _ANNOUNCE_RETRIES per request.
-            if (_relay_gagged_reply(check.get("pid"), text)
-                    or _relay_reply_ends_announcing(text)):
-                if _relay_gagged_reply(check.get("pid"), text):
-                    _note_relay_injection(check.get("pid"), check.get("model"),
-                                          ["relay_tool_injection"])
-                box["kind"] = "announced"
-                return "nonanswer"
+        if relay_hold and _relay_end_check(text):
+            return "nonanswer"
         # The text grew after the first verdict: the empty-message claim is only
         # readable now (it was judged on its first ~11 characters).
         return _claim_verdict(seen, True) or "content"
+
+    def _relay_end_check(text):
+        """True (and the kind set) when a relay reply, judged whole, is a dead end: the
+        relay's own gag (or the model's words for it) means no further call can follow,
+        and an ending that only announces a step is the same. Kind "announced": the
+        chain walks on, at most _ANNOUNCE_RETRIES per request."""
+        if not (_relay_gagged_reply(check.get("pid"), text)
+                or _relay_reply_ends_announcing(text)):
+            return False
+        if _relay_gagged_reply(check.get("pid"), text):
+            _note_relay_injection(check.get("pid"), check.get("model"),
+                                  ["relay_tool_injection"])
+        box["kind"] = "announced"
+        return True
+
+    def _judged_whole(seen):
+        """Verdict for a stream that ENDED before the first verdict point (under
+        _PEEK_JUDGE_CHARS of frames, so `read_on_at` never started): the usual judge,
+        and on a relay hop the same whole-reply check a long reply gets at its end."""
+        v = _judge(seen)
+        if (v == "content" and relay_hold
+                and _relay_end_check(_peeked_text("".join(seen)))):
+            return "nonanswer"
+        return v
 
     def _worker():
         buf = box["buf"]
@@ -41540,6 +41555,11 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         box["ann_until"] = _now + max(0.0, min(
                             _ANNOUNCE_HOLD_S,
                             deadline_s + (content_grace or 0.0) - (_now - started) - 0.5))
+                        # The gag hold lapses earlier: a relay that pauses while the hold
+                        # runs into the peek's own deadline is cut there as a "timeout".
+                        box["gag_until"] = _now + max(0.0, min(
+                            _ANNOUNCE_HOLD_S,
+                            deadline_s + (content_grace or 0.0) - (_now - started) - 3.0))
                         if verdict != "content" or not (
                                 watch or box["ann"] or box["emc"] or box["gag"]):
                             box["status"] = verdict
@@ -41585,7 +41605,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         if (not _claim_possible(text_now)
                                 or time.monotonic() >= box.get("ann_until", 0.0)):
                             box["emc"] = False
-                    if box.get("gag") and time.monotonic() >= box.get("ann_until", 0.0):
+                    if box.get("gag") and time.monotonic() >= box.get("gag_until", 0.0):
                         box["gag"] = False       # the hold ran out: commit, as before
                     if not (box.get("nt") or box.get("ann") or box.get("emc")
                             or box.get("gag")):
@@ -41610,7 +41630,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # and /v1/messages paths -- and many iter_content ones):
                     # the trivial answers this chain most needs to keep.
                     box["status"] = (_read_on_end(seen_content) if read_on_at is not None
-                                     else _judge(seen_content) if seen_content
+                                     else _judged_whole(seen_content) if seen_content
                                      else _nameless_verdict(buf, check)
                                      if box.get("nameless_tool")
                                      else _empty_or_starved(buf, check))
@@ -41649,7 +41669,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
             box["status"] = (_read_on_end(seen_content) if read_on_at is not None
-                             else _judge(seen_content) if seen_content
+                             else _judged_whole(seen_content) if seen_content
                              else _nameless_verdict(buf, check)
                              if box.get("nameless_tool")
                              else _empty_or_starved(buf, check))

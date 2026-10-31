@@ -355,3 +355,150 @@ def test_e2e_the_flag_off_serves_the_gagged_reply_as_before(quiet, monkeypatch):
     text, tools = _read(body)
     assert text == GAGGED and tools == []   # the old behaviour: the gagged reply is served
     assert calls == [RELAY_A]
+
+
+# --------------------------------------------------------------------------- #
+# A relay reply that ENDS before the first verdict point (under ~600 frame bytes)
+# --------------------------------------------------------------------------- #
+
+SHORT_GAGGED = ("<think>\nThe instruction says don't request another function call.\n</think>\n"
+                "Status: the scanner module is finished and its notes are stored.")
+
+
+def test_a_short_gagged_relay_reply_that_ends_early_fails_the_hop():
+    assert len(SHORT_GAGGED) < 200
+    for size in (len(SHORT_GAGGED), 40, 9):
+        status, kind, _n, _total = _peek(_cut(SHORT_GAGGED, size))
+        assert (status, kind) == ("nonanswer", "announced"), size
+    assert A._relay_tool_sick("g4f", MODEL) is True
+
+
+def test_a_short_plain_relay_answer_is_still_served():
+    short = "Both test files pass now and nothing else needed to change."
+    status, kind, n, total = _peek(_cut(short, 12))
+    assert (status, kind) == ("content", None) and n == total
+
+
+def test_a_short_gagged_reply_from_a_direct_provider_or_a_tool_free_turn_is_left_alone():
+    status, _kind, _n, _total = _peek(_cut(SHORT_GAGGED, 9), check=_check(relay=False))
+    assert status == "content"
+    status, _kind, _n, _total = _peek(_cut(SHORT_GAGGED, 9), check=_check(tools=False))
+    assert status == "content"
+
+
+def test_a_short_gagged_reply_is_served_with_the_flag_off(monkeypatch):
+    real = A.config.get_flag
+    monkeypatch.setattr(A.config, "get_flag",
+                        lambda k, d=None: False if k == "relay_text_hold" else real(k, d))
+    status, kind, _n, _total = _peek(_cut(SHORT_GAGGED, 9))
+    assert (status, kind) == ("content", None)
+
+
+# --------------------------------------------------------------------------- #
+# The same walk on the other two protocols (the peek is shared)
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(autouse=True)
+def _clean_stop_ledger():
+    A._announce_stop_seen.clear()
+    yield
+    A._announce_stop_seen.clear()
+
+
+def _post_responses():
+    return A.app.test_client().post("/v1/responses", json={
+        "model": "auto", "stream": True,
+        "tools": [{"type": "function", "name": "exec_command",
+                   "parameters": {"type": "object"}}],
+        "input": [
+            {"role": "user", "content": "run the tests and fix what fails"},
+            {"type": "function_call", "call_id": "c0", "name": "exec_command",
+             "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c0", "output": "2 failed"},
+            {"role": "user", "content": "continue"}]})
+
+
+def _post_messages():
+    return A.app.test_client().post("/v1/messages", json={
+        "model": "claude-sonnet-4", "max_tokens": 1024, "stream": True,
+        "tools": [{"name": "exec_command", "description": "run a command",
+                   "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": "run the tests and fix what fails"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c0", "name": "exec_command", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c0", "content": "2 failed"},
+                {"type": "text", "text": "continue"}]}]})
+
+
+def _sse_objects(body):
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("data:") and not line.endswith("[DONE]"):
+            try:
+                yield json.loads(line[5:].strip())
+            except ValueError:
+                continue
+
+
+def _responses_text(body):
+    return "".join(o.get("delta") or "" for o in _sse_objects(body)
+                   if o.get("type") == "response.output_text.delta")
+
+
+def _messages_text(body):
+    return "".join((o.get("delta") or {}).get("text") or "" for o in _sse_objects(body)
+                   if o.get("type") == "content_block_delta"
+                   and (o.get("delta") or {}).get("type") == "text_delta")
+
+
+def test_e2e_responses_a_gagged_relay_reply_is_walked_past(quiet, monkeypatch):
+    calls = _fleet(monkeypatch, [(*RELAY_A, _says(GAGGED)), (*DIRECT, _calls_a_tool)])
+    r = _post_responses()
+    body = r.get_data().decode("utf-8")
+    assert r.status_code == 200
+    assert r.headers.get("X-Free-LLM-Hub-Provider") == "nvidia"
+    assert "exec_command" in body and "pytest -q" in body
+    assert _responses_text(body) == ""
+    assert calls == [RELAY_A, DIRECT]
+    assert A._relay_tool_sick(*RELAY_A) is True
+
+
+def test_e2e_messages_a_gagged_relay_reply_is_walked_past(quiet, monkeypatch):
+    calls = _fleet(monkeypatch, [(*RELAY_A, _says(GAGGED)), (*DIRECT, _calls_a_tool)])
+    r = _post_messages()
+    body = r.get_data().decode("utf-8")
+    assert r.status_code == 200
+    assert r.headers.get("X-Free-LLM-Hub-Provider") == "nvidia"
+    assert "exec_command" in body and "pytest -q" in body
+    assert _messages_text(body) == ""
+    assert calls == [RELAY_A, DIRECT]
+
+
+def test_e2e_responses_a_relay_that_really_finished_keeps_its_answer(quiet, monkeypatch):
+    calls = _fleet(monkeypatch, [(*RELAY_A, _says(FINAL)), (*DIRECT, _calls_a_tool)])
+    body = _post_responses().get_data().decode("utf-8")
+    assert _responses_text(body) == FINAL
+    assert "response.completed" in body and "response.failed" not in body
+    assert calls == [RELAY_A]
+
+
+def test_e2e_messages_a_relay_that_really_finished_keeps_its_answer(quiet, monkeypatch):
+    calls = _fleet(monkeypatch, [(*RELAY_A, _says(FINAL)), (*DIRECT, _calls_a_tool)])
+    body = _post_messages().get_data().decode("utf-8")
+    assert _messages_text(body) == FINAL
+    assert calls == [RELAY_A]
+
+
+def test_e2e_responses_the_third_gagged_reply_is_served_but_codex_is_told_to_retry(
+        quiet, monkeypatch):
+    # The peek walks past two gagged replies per request and then serves the third, so a pool
+    # of gagged relays cannot burn the deadline. Codex's end-of-stream check (the bounded
+    # retry of 2026-10-30) still ends that served stream as a retryable failure, once.
+    calls = _fleet(monkeypatch, [(*RELAY_A, _says(GAGGED)), (*RELAY_B, _says(GAGGED)),
+                                 (*RELAY_C, _says(GAGGED)), (*DIRECT, _calls_a_tool)])
+    body = _post_responses().get_data().decode("utf-8")
+    assert calls == [RELAY_A, RELAY_B, RELAY_C]
+    assert "response.failed" in body and "upstream_error" in body
+    assert "response.completed" not in body

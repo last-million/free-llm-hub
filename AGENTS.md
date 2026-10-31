@@ -9750,42 +9750,70 @@ knew the relay's exact sentence, so this paraphrase benched nothing and the stop
 Release-note: fix: when a free relay tells its model to stop after one tool call, Codex now retries the turn on another model, and that relay is set aside for tool work, so multi-step tasks (like running a WSL command and then writing a file) finish.
 
 
-## A relay's text-only reply is held to its end (2026-10-31)
+## A relay's text-only reply is held to its end; typed call tokens are rescued (2026-10-31)
 
-Covered by `tests/test_relay_text_hold.py` (18: the peek itself, and the real chat handler end to
-end with fake upstreams; a negative control against HEAD's `app.py` fails 9 of them). Owner: "check
-the problem in the last conversation".
+Covered by `tests/test_relay_text_hold.py` (27: the peek itself, and the real chat, `/v1/responses` and
+`/v1/messages` handlers end to end with fake upstreams) and `tests/test_special_token_calls_doubled_bars.py`
+(41). Owner: "check the problem in the last conversation".
 
 - **MEASURED** (the owner's OpenCode `coding-max` session, 2026-10-31 00:21-01:34; structure only --
-  counts, lengths, offsets and booleans, no content read): the session had made 1228 tool calls up to
-  10-30 01:57; after the owner came back it got SEVEN replies in 73 minutes and NONE made a tool call
-  (`finish=stop`, no tool part). Every one was HTTP 200 / "ok" in Activity, served by a g4f poe relay
-  copy (DeepSeek-V4.1-Flash-T, GLM-5.3-Flash-T) or glm-4.5-flash. Three carried the relay's "stop
-  calling tools" gag inside a leaked `<think>` that OPENS the reply (offset 90-416 of a 2-7K-character
-  text; `answer_check.inspect` flags it as the informational `relay_tool_injection`, which only benches
-  the relay for LATER requests); two ended on a future intent ("I'll ...", "Let me ...") in a reply of
-  600+ characters; two short replies from glm-4.5-flash carry no marker the hub reads. The quiet watch
-  fired (pin released after two quiet turns) but the replacements were the same kind of relay, because
-  the rest of the fleet was failing in the same minutes (dahl HTTP 429, nvidia `_HopBudgetExceeded`,
-  g4f direct HTTP 500 / empty 200; `[quality-fallback] max->auto` on every request).
-- **Root cause.** The peek (`_peek_until_content`) held a reply only while it was <= `_ANNOUNCE_MAX_CHARS`
-  (400) so that it could see how it ends. A longer one -- a gagged reply with its leaked thinking, a
-  600-character reply that stops on "Let me ..." -- was committed unjudged. The chat protocol cannot
-  take frames back once relayed (codex gets a retry at the END of its stream instead, 10-30), so
-  OpenCode ended its turn on each, 7 times in a row.
-- **Fix** (`relay_hold` in the peek; flag `relay_text_hold`, default on, `_relay_text_hold_on`): on a
-  RELAY hop (`check["relay"]`) of a TOOL turn, a reply with no tool call yet is held until a tool call
-  arrives (commit at once, as always), the stream ENDS (judged whole) or the bounded hold
-  (`_ANNOUNCE_HOLD_S`, 45 s, never past what the peek may wait) runs out (committed, as before).
-  Judged whole in `_read_on_end`: `_relay_gagged_reply` (the relay's gag or the model's words for it,
-  `answer_check.has_relay_gag`) or `_relay_reply_ends_announcing` (last paragraph, or the last SENTENCE
-  of one long paragraph, only announces the next step; a tail that hands the turn to the user or asks a
-  question is served; wider than `_stopped_on_announcement`, which leaves one long paragraph alone)
-  fails the hop with kind "announced": the chain walks on inside the same request, at most
-  `_ANNOUNCE_RETRIES` (2) per request, then the next reply is served. A gagged hop also rests its relay
-  SERVER for tool turns right away (`_note_relay_injection`, 15 min), so the same request's walk and the
-  next request skip it. Direct providers, tool-free turns and a reply that calls a tool are untouched.
-  Applies to all three protocols (chat, responses, messages share the peek).
+  counts, lengths, offsets, token spellings and booleans; no reply text and no tool name or argument was
+  read): the session had made 1228 tool calls up to 10-30 01:57; after the owner came back it got SEVEN
+  replies in 73 minutes and NONE made a tool call (`finish=stop`, no tool part). Every one was HTTP 200 /
+  "ok" in Activity, served by a g4f poe relay copy (DeepSeek-V4.1-Flash-T, GLM-5.3-Flash-T) or the direct
+  glm-4.5-flash. The quiet watch fired (pin released after two quiet turns) but the replacements were the
+  same kind of relay, because the rest of the fleet was failing in the same minutes (dahl HTTP 429, nvidia
+  `_HopBudgetExceeded`, g4f direct HTTP 500 / empty 200; `[quality-fallback] max->auto` on every request).
+  Two things were found in those seven replies, and they overlap:
+  1. **Three carried the relay's "stop calling tools" gag** inside a leaked `<think>` that OPENS the reply
+     (offset 90-416 of a 2-7K-character text). `answer_check.inspect` flags that as the informational
+     `relay_tool_injection`, which only benches the relay for LATER requests, and the peek held only
+     replies up to `_ANNOUNCE_MAX_CHARS` (400), so the reply itself was committed unjudged. Replayed
+     through the hub's own judges, the new hold walks past exactly those three (00:21, 00:40, 01:33).
+  2. **Five of the seven (00:21, 00:40, 01:27, 01:33, 01:34) end in a call-shaped block of DeepSeek-style
+     special tokens** (calls-begin, call-begin, name, sep, JSON, call-end, calls-end) -- a tool call typed
+     as text. All five are COMPLETE blocks by shape, but they use a spelling `tool_rescue` did not know:
+     the tokens with DOUBLED bars (and a slash on the closing ones). Only the one-bar spelling parsed, so
+     `has_model_markup` was False, nothing was rescued and each call was served as prose. Whether the
+     tool names in them are tools OpenCode offered was NOT checked (the names were deliberately not
+     read), so it is not claimed that all five would have run. An earlier note said four of seven; the
+     full token listing counts five. The hold plus the token fix cover those five replies; the other two
+     (00:33, 00:45) came from the direct glm-4.5-flash with no marker and are not touched (by design).
+- **Typed tokens, doubled bars** (`tool_rescue`, no flag, like every dialect it already knows): `_BAR` is
+  now one OR MORE bars, the special tokens and `_MARKUP_TAG_RE` accept a slash after `<`, and
+  `_norm_marker` collapses repeated bars so the streaming prefix-hold sees a half-typed doubled-bar
+  opener. A complete call to an offered tool becomes a real `tool_calls` entry (stream, non-stream and
+  the roles path share `tool_rescue`); an unfinished one is `has_model_markup` -> a non-answer that hands
+  the turn to another model; the visible text is stripped of every token. One-bar spellings behave as
+  before; the one-bar spelling with slashed closing tokens used to leave residue in the text and no
+  longer does. A fenced or inline mention of a token is still not a call. Negative control: against the
+  old `tool_rescue.py` 28 of the 41 new tests fail. The tests build every token from `chr()` pieces.
+- **The relay hold** (`relay_hold` in `_peek_until_content`; flag `relay_text_hold`, default on,
+  `_relay_text_hold_on`): on a RELAY hop (`check["relay"]`) of a TOOL turn, a reply with no tool call yet
+  is held until a tool call arrives (commit at once, as always), the stream ENDS (judged whole) or the
+  bounded hold (`_ANNOUNCE_HOLD_S`, 45 s, never past what the peek may wait) runs out (committed, as
+  before). Judged whole by `_relay_end_check`: `_relay_gagged_reply` (the relay's gag or the model's
+  words for it, `answer_check.has_relay_gag`) or `_relay_reply_ends_announcing` (last paragraph, or the
+  last SENTENCE of one long paragraph, only announces the next step; a tail that hands the turn to the
+  user or asks a question is served; wider than `_stopped_on_announcement`, which leaves one long
+  paragraph alone) fails the hop with kind "announced": the chain walks on inside the same request, at
+  most `_ANNOUNCE_RETRIES` (2) per request, then the next reply is served. A gagged hop also rests its
+  relay SERVER for tool turns right away (`_note_relay_injection`, 15 min), so the same request's walk
+  and the next request skip it. Direct providers, tool-free turns and a reply that calls a tool are
+  untouched.
+  - **A reply that ENDS early is judged the same way** (`_judged_whole`): a stream that ends before the
+    first verdict point (under `_PEEK_JUDGE_CHARS` of frame bytes) never started the hold, and its end
+    went to the plain `_judge`, which does not know the gag -- so a short gagged reply was served. Found
+    in review of the first version of this change, reproduced, fixed. Against the committed first
+    version exactly that new test fails.
+  - **The gag hold lapses 3 s before the peek's own deadline** (`gag_until`; the other holds keep 0.5 s)
+    so a relay that keeps streaming slowly is committed instead of being cut there as a "timeout". A
+    relay that goes SILENT mid-reply still ends the peek as a timeout (the worker is blocked in `next`);
+    that is not new and is not tested here.
+  - **All three protocols** share the peek and are tested end to end: a gagged reply is walked past on
+    chat, `/v1/responses` and `/v1/messages`, a finished relay answer is served whole on each, and on
+    `/v1/responses` a THIRD gagged reply (served, because two walks per request are spent) still ends as
+    the retryable `response.failed` of the 10-30 codex check, once.
 - **Also fixed on the way**: while a held reply streamed, the peek joined and re-scanned everything it
   had read on EVERY frame (quadratic: a 7K-character reply at three characters a frame ate the whole
   hold). The text is now joined only while a hold that reads it is active, and the collected length is
@@ -9796,10 +9824,12 @@ the problem in the last conversation".
   at once. A reply that outlasts the hold streams unjudged, as before.
 - **Limits, said plainly.** (a) It cannot make the fleet healthy: when every other provider is failing,
   the walk ends on the last relay and serves it (two walks per request), so a session can still stall;
-  it just stops being the FIRST reply that ends the turn. (b) A reply whose last paragraph reads as an
-  announcement but is a real stop costs one retry (never a lost answer). (c) The two short glm-4.5-flash
-  replies of that session carry no marker the hub reads, so they are still served. (d) Only the observed
-  gag wording and future-intent endings are recognised. (e) Not run against a live relay; the live hub
-  is checked only through the new tests and the structure of the session above.
+  it just stops being the FIRST reply that ends the turn. The dahl 429s and nvidia stalls of that night
+  are the other half of the problem. (b) A reply whose last paragraph reads as an announcement but is a
+  real stop costs one retry (never a lost answer). (c) A direct provider's text-only reply is still
+  served (the two glm-4.5-flash replies). (d) Only the observed gag wording, future-intent endings and
+  the special-token spellings above are recognised; another spelling of the tokens would not parse.
+  (e) Not run against a live relay or a live OpenCode; the evidence is the new tests plus the structure
+  of the stored session described above.
 
-Release-note: fix: when a free relay answers with only text and no action (including the "I'll do it" and "stop calling tools" replies that ended OpenCode turns), the hub now holds that reply to its end, tries the next model, and rests that relay instead of ending your turn.
+Release-note: fix: when a free model types its tool call as text with DeepSeek-style tokens, or a free relay answers with only text and no action (including "I'll do it" and "stop calling tools" replies), the hub now runs the call or tries the next model instead of ending your OpenCode turn.
