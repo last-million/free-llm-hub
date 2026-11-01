@@ -16021,6 +16021,18 @@ def _delegating_tool_offered(tools):
     return None
 
 
+# The order a sub-agent should be handed, whatever tool delegates (opencode `task`, Claude Code
+# `Task`, codex `spawn_agent`, the hub's own MCP tools). Model-agnostic on purpose: it is a work
+# habit, not a persona. Shipped only when the request really OFFERS a delegating tool (flag
+# `agent_order_template`, default on); opening turn only, like the rest of the hint.
+_AGENT_ORDER_TEMPLATE = (
+    "When you hand work to a sub-agent, write it an order: the goal in one "
+    "sentence, the files it may touch and the files it must not, the command "
+    "that must exit 0 when it is done, and what to report back. Give parallel "
+    "agents separate files. A sub-agent's report is a claim: re-run its "
+    "command yourself before you say it worked.")
+
+
 def _crew_agent_hint(tools):
     """The sub-agent guidance injected on an agentic opening turn, built from
     the request's OWN tools. It replaces _CREW_AGENT_HINT, whose "delegate via a
@@ -16032,12 +16044,14 @@ def _crew_agent_hint(tools):
     on) selects this over the old text."""
     name = _delegating_tool_offered(tools)
     if name:
+        order = (" " + _AGENT_ORDER_TEMPLATE
+                 if config.get_flag("agent_order_template", True) else "")
         return ("SUB-AGENTS: to run work in parallel, actually CALL your `%s` "
                 "tool. Never say you delegated, spawned sub-agents, or ran work "
                 "in parallel unless you called it in THIS turn -- otherwise do "
-                "the work yourself with your own tools. The user can also pick "
+                "the work yourself with your own tools.%s The user can also pick "
                 "the Multi or Swarm tier in their model picker for a full "
-                "hub-run parallel build." % name)
+                "hub-run parallel build." % (name, order))
     return ("SUB-AGENTS: only say you delegated, spawned sub-agents, or ran "
             "work in parallel if you actually invoked a tool that does it THIS "
             "turn -- otherwise do the work yourself with your own tools. The "
@@ -26472,6 +26486,28 @@ def _stall_evaluate(session_id, info):
     return d, prior, made_progress, sigs, rhash
 
 
+# What the auto-continue sends after a turn that made NO new progress. The plain Continue text
+# alone made the next attempt -- often on another model that never saw the first -- repeat what
+# did not work. This adds the one thing a stuck agent can do about it: change approach, or say
+# exactly what blocks it. An honest blocker is an answer (_stall_answer_ok), so it ends the chain
+# instead of looping to the cap. Model-agnostic; flag `stall_nudge` (default on).
+_STALL_NUDGE = ("Your last attempt made no new progress, so do not repeat it. Try a "
+                "different approach. If you are truly blocked, say exactly what blocks "
+                "you and what you already tried.")
+
+
+def _stall_continue_text(made_progress):
+    """The text the auto-continue sends. A turn that DID new work gets the plain Continue; one
+    that did not gets the same Continue plus the nudge (its start is unchanged, so
+    _multi_is_continue still recognises it)."""
+    try:
+        if made_progress or not config.get_flag("stall_nudge", True):
+            return _CONTINUE_TEXT
+    except Exception:                                            # noqa: BLE001
+        return _CONTINUE_TEXT
+    return _CONTINUE_TEXT + " " + _STALL_NUDGE
+
+
 def _stall_exhaust_notice(reason, used=0, budget_min=0):
     if reason == stallcheck.COUNT:
         return ("Stopped continuing by itself after %d tries (the retry limit). Send a message "
@@ -26630,6 +26666,8 @@ def _stall_on_turn_end(session_id, info, send=None, sync=False, clock=None):
                 cur = _STALL_RETRIES.get(session_id)
             return isinstance(cur, dict) and cur.get("nonce") == nonce
 
+        text = _stall_continue_text(made_progress)
+
         def _go():
             try:
                 if not _guard():
@@ -26646,10 +26684,10 @@ def _stall_on_turn_end(session_id, info, send=None, sync=False, clock=None):
                 except Exception:                           # noqa: BLE001
                     pass
                 if send is None:
-                    _stall_send(session_id, _CONTINUE_TEXT, guard=_guard,
+                    _stall_send(session_id, text, guard=_guard,
                                 provider_ok=_hb_providers_ok, clock=clock)
                 else:
-                    send(session_id, _CONTINUE_TEXT)
+                    send(session_id, text)
             except Exception as exc:                        # noqa: BLE001
                 with _STALL_LOCK:
                     cur = _STALL_RETRIES.get(session_id)

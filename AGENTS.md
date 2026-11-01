@@ -9833,3 +9833,68 @@ Covered by `tests/test_relay_text_hold.py` (27: the peek itself, and the real ch
   of the stored session described above.
 
 Release-note: fix: when a free model types its tool call as text with DeepSeek-style tokens, or a free relay answers with only text and no action (including "I'll do it" and "stop calling tools" replies), the hub now runs the call or tries the next model instead of ending your OpenCode turn.
+
+## Four work habits, model-agnostic (2026-11-01)
+
+Covered by `tests/test_work_habits.py` (23). Owner handed over an example agent prompt (a multi-phase
+"war council" orchestrator written for one strong model in one CLI) and asked whether it could make the
+hub better at orchestration; decision: take the habits that are useful, MODEL-AGNOSTIC, and leave the
+persona, the six mandatory phases and the model binding. A test pins that no model, vendor, CLI or
+persona name appears in any new text.
+
+- **Why not adopt it as is.** It names one model id (through the hub that only reaches relay copies, which
+  were measured not to answer), tool and sub-agent names that were not verified against the installed CLI,
+  and a ceremony that costs weak free models more than it helps (the hub's own notes: they narrate
+  delegation and stop). And most of it already exists as CODE, which enforces better than a prompt on free
+  models: observed evidence (`evidence.py`), plan + design + dry run (`craft.PLAN_PHASES`, `plan_check.py`),
+  verifier / corrector and the findings and slop checks, "claimed, not checked" labels on Multi phases,
+  bounded retries that switch model (`stall_recheck`, `PHASE_RETRIES`). A grep of `craft`, `swarm`,
+  `swarm_windows`, `crews`, `verify`, `model_guides` and `evidence` found four things it had that the hub did not.
+- **1. Baseline first** (`craft.PLAN_PHASES`, a bullet): "BASELINE (changing existing code): before editing,
+  run the tests/build that cover it and note what already fails -- a failure that was there first is not
+  yours." Ships on every tool-carrying opening turn from any CLI and in the Build brief file (not on a
+  tool-less turn). Net +149 chars (895 -> 1044, ~261 tokens); the last bullet was tightened for 14 of them
+  and the token cap in `tests/test_plan_design_and_dry_run.py` moved 230 -> 270 once, deliberately. The
+  heaviest request (a saas landing page) keeps 212 chars under `craft.BRIEF_CEILING_CHARS`: the NEXT addition
+  to the brief has to fund itself or move that ceiling. No flag (a brief text, covered by the `craft_briefs`
+  master switch like every other line of it).
+- **2. A red-team checklist for the reviewers that exist** (no new reviewer): the `crew-code` reviewer's hunt
+  list (`crews.py`) gained race conditions and check-then-act on shared state, leaked resources (files,
+  threads, timers), errors swallowed or retried without limit, and tests that pass for the wrong reason (no
+  assertion, the real logic mocked away); the Multi "Review and finish" phase (`swarm_windows._REVIEW_TASK`)
+  gained a paragraph asking it to attack the work once and to give a real defect a fix and a regression test.
+  The other crews' reviewers are untouched (a test pins that), the JSON contract and "do not manufacture
+  criticism" stay. Not put on the per-turn verifier (it judges one proposed action, and its 300-token verdict
+  is not the place) nor on single sessions (a long ceremony on every turn is what weak models do worst).
+- **3. An order for a sub-agent** (`app._AGENT_ORDER_TEMPLATE`, flag `agent_order_template`, default on):
+  when the request really OFFERS a delegating tool (opencode `task`, Claude Code `Task`, codex `spawn_agent`,
+  the hub's MCP tools) the honest sub-agent hint also says what an order contains -- the goal in one sentence,
+  the files it may touch and must not, the command that must exit 0 when done, what to report back --, to give
+  parallel agents separate files, and that a sub-agent's report is a claim to re-check by running its command.
+  Never added when no delegating tool is offered. Flag off = the previous hint byte for byte (pinned).
+  The Multi planner already enforces file ownership and "needs" between phases in code; this only helps the
+  CLIs' own sub-agent tools.
+- **4. A retry that asks for something different** (`app._stall_continue_text`, `_STALL_NUDGE`, flag
+  `stall_nudge`, default on): the Build page's auto-continue sent the same "Continue exactly where you
+  stopped" text whatever happened, so after a turn that did nothing new the next attempt -- usually on another
+  model that never saw the first -- repeated it. After a turn with NO new progress (`_stall_productive` false)
+  the same text is sent plus: "Your last attempt made no new progress, so do not repeat it. Try a different
+  approach. If you are truly blocked, say exactly what blocks you and what you already tried." After a turn
+  that did new work the text is the plain Continue. An honest blocker reads as an answer
+  (`_stall_answer_ok`), so it ends the chain instead of running to the cap. The nudged text still starts with
+  the Continue text, so `_multi_is_continue` still recognises it. Multi phase retries already tell the next
+  attempt the previous failure ("avoid whatever caused that failure"), so they are unchanged.
+- **Verified**: full suite under the `.venv` 11436 passed, 2 skipped; against the old source 16 of the 23 new
+  tests fail (the other 7 pin what must stay true). Nothing was run against a live model.
+- **Limits, said plainly.** (a) The baseline is a PROMPT: the observed-FAIL gate (`evidence.py` /
+  `swarm_windows._cheap_problems`) does not know what failed before the first edit, so a failing check that was
+  already there still counts as an outstanding FAIL and can cost the phase its one revision. Making the hub
+  remember a baseline mechanically would need file-change times next to the evidence rows; not done. (b) Whether
+  free models actually follow the new lines is unmeasured. (c) The reviewer checklist can raise the share of
+  "revise" verdicts; a revision is bounded to one pass. (d) The order template rides the opening turn only, like
+  the rest of the hint. (e) The nudge trusts `_stall_productive`, a heuristic: a model that makes a new but
+  useless call each turn is "progressing" and gets the plain text. (f) A mechanical "test with no assertion"
+  check on changed test files (the way `_slop_scan` reads web files) would be the stronger version of the
+  reviewer line; not built.
+
+Release-note: improved: the hub now tells agents to run the relevant tests before changing existing code, asks its code reviewers to hunt races, leaks, swallowed errors and tests that prove nothing, tells sub-agents what a work order contains, and nudges a stuck auto-continue to change approach instead of repeating itself.

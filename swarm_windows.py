@@ -288,6 +288,12 @@ Look for: files that reference something nobody created, two phases that solved
 the same thing differently, anything a phase said it would do and did not, and
 anything that plainly does not work.
 
+Then attack the work once: races or check-then-act on shared state, leaked
+files / threads / timers, errors swallowed, empty / huge / unicode inputs,
+changed public behaviour, and tests that pass for the wrong reason (no
+assertion, the real logic mocked away). A real defect gets a fix and a
+regression test.
+
 Fix what you find. Change nothing that is already correct. Finish with a short
 list of what you changed and anything still genuinely open."""
 

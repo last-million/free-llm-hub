@@ -456,7 +456,8 @@ def test_the_brief_stays_within_its_token_budget():
     # 626 chars before the DESIGN + DRY-RUN steps; the owner's cap for the
     # addition is ~150 tokens (chars / 4, the suite's convention).
     assert (len(craft.PLAN_PHASES) - 626) / 4 <= 150
-    assert len(craft.PLAN_PHASES) / 4 <= 230
+    # 230 -> 270 on 2026-11-01, deliberately and once, for the BASELINE bullet (see craft.py).
+    assert len(craft.PLAN_PHASES) / 4 <= 270
 
 
 def test_agent_worktrees_are_not_project_files(tmp_path):

@@ -239,7 +239,8 @@ def test_the_whole_chain_is_bounded_and_the_second_retry_switches_model(monkeypa
     list(AC.send_message_stream_durable("s-chain", "fix the failing test in parser.py"))
     assert len(turns) == 1 + stallcheck.MAX_RETRIES
     assert turns[0] == "fix the failing test in parser.py"
-    assert turns[1:] == [A._CONTINUE_TEXT] * stallcheck.MAX_RETRIES
+    # an unproductive chain is nudged to change approach (stall_nudge), never sent the bare text
+    assert turns[1:] == [A._stall_continue_text(False)] * stallcheck.MAX_RETRIES
     assert dropped == ["s-chain"]            # 1st retry same model (pin kept), 2nd switched
 
 
@@ -294,7 +295,7 @@ def test_end_to_end_an_empty_turn_schedules_exactly_one_same_model_retry(monkeyp
                         lambda sid, info: A._stall_on_turn_end(
                             sid, info, send=lambda s, t: sent.append(t), sync=True))
     list(AC.send_message_stream_durable("s-e2e", "fix the failing test in parser.py"))
-    assert len(sent) == 1 and sent[0] == A._CONTINUE_TEXT
+    assert len(sent) == 1 and sent[0] == A._stall_continue_text(False)
 
 
 # =============================================================================================

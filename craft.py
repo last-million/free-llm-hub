@@ -465,6 +465,12 @@ ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
+# BASELINE added 2026-11-01 (owner: take the useful habits of a "war council" agent prompt, model-
+# agnostic): a change to an existing project starts by running what already covers the code, so a
+# failure that was there first is neither blamed on the change nor "fixed" by accident. Net +149 chars
+# (895 -> 1044, ~261 tokens) on every tool-carrying opening turn: the bullet is 163 with its newline and
+# tightening the last bullet saved 14. The heaviest request (a saas landing page) keeps ~200 chars under
+# BRIEF_CEILING_CHARS, so the NEXT addition to the brief must fund itself or move that ceiling.
 # DESIGN and DRY RUN added 2026-10-04 at the owner's request: "In all works the
 # hub must do steps: design, plan well in a perfect architecture, then go --
 # and prevent problems with a DRY RUN in planning." The Multi planner does the
@@ -477,7 +483,8 @@ Before touching anything, write the todo list you will work from:
 - Phases, each with a CONCRETE artefact, an observable "done when" and what it NEEDS from another. Phases that need nothing from each other run at the SAME TIME -- do them together.
 - DRY-RUN the plan before editing: every asked part has a phase, no two same-time phases edit one file, each has a done when. Fix the plan first.
 - Keep it in PROGRESS.md as a checklist (- [ ] / - [x] / - [~] in progress); if it exists, read it first and continue from it.
-- Execute it, and after EACH step update PROGRESS.md: tick the item - [x] (or - [~]) before starting the next; never leave the list stale. Do not stop between phases to report; the list IS the report."""
+- BASELINE (changing existing code): before editing, run the tests/build that cover it and note what already fails -- a failure that was there first is not yours.
+- Execute it, and after EACH step tick the item in PROGRESS.md (- [x] or - [~]) before the next; never leave the list stale. Do not stop between phases to report; the list IS the report."""
 
 
 # DESIGN DECISIONS FIRST, added 2026-10-04 at the owner's request: "slop must be
