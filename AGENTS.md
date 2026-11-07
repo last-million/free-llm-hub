@@ -10144,3 +10144,113 @@ Its opening request matched App & API testing + Security; every request of the l
 on every host that lists it; the shipped bare `nemotron-3-ultra` is an exact identity that does not cover
 that spelling). `_seed_default_blocks` delivers them once to every install. His Nemotron 3.5 Lightning
 blocks are not shipped: the 3.5 chat generation stays allowed for every install (2026-10-23).
+
+## A provider's content filter hands the turn to the next model (2026-11-07)
+
+Covered by `tests/test_content_filter_hands_over.py` (93 tests, hermetic: fake fleet, fake streams,
+no network). Owner: "I don't want it to stop -- if a model is blocked or can't do it, he should
+continue with the next model by himself", for every CLI (OpenCode, Hermes, OpenClaw, Codex, Claude
+Code, qwen, kimi, pi, aider ...) and anything else that uses the hub. Flag `content_filter_handover`
+(`config.get_flag`, default ON; a flag read that raises counts as off). Off = every stream and reply is
+served as before.
+
+- **MEASURED** (the owner's OpenCode `coding-max`, 2026-11-07 22:37 UTC): a turn ended on "The
+  response was blocked by the provider's content filter" with no text. OpenCode's own record: finish
+  `content-filter`, parts `step-start` + `step-finish` only, 0 output tokens, 58 s. Activity: ok / 200,
+  hop 1 a g4f HTTP 500, hop 2 `g4f/Pollinations:anthropic/claude-opus-5`. OpenCode raises that error
+  for `finish_reason: "content_filter"` and stops, so the user had to type "continue". Nothing in
+  app.py read that finish_reason (only the Anthropic stop-reason map did).
+- **Reproduced first** through the real chat handler: role delta + ONE whitespace content delta +
+  finish `content_filter` + `[DONE]` was served (text "\n", finish `content_filter`). A bare stream
+  and one with real text already walked on. The whitespace delta slipped through because
+  `_STREAM_CONTENT_RE` counts it as content and `_judge_peeked` began `if not text: return "content"`.
+- **Streams** (the peek `_peek_until_content`, shared by chat, responses and messages, so Codex and
+  Claude Code are covered by the same code as OpenCode): a stream that ENDS with a filter finish and no
+  tool call is a failed hop, kind `content_filter` (`_ended` -> `nonanswer`); a COMPLETE stream whose
+  content was only whitespace and made no tool call is an empty hop (`_judge_peeked`, new even without
+  a filter). Filter finishes read (`_FILTER_FINISHES`, any case, `-`/`_`): `content_filter`, `safety`,
+  `blocked`, `prohibited_content`, `blocklist`, `spii`, `recitation`, `image_safety`, `refusal`.
+- **Non-streamed replies**: `_chat_json_nonanswer` (chat, responses, messages and the hedge legs),
+  `_role_judge` (the roles actor hop, fail kind `filtered`) and the swarm stage hop (the longest
+  partial stays the fallback when every hop is blocked). A tool call is never called filtered.
+- **A COMMITTED stream** (the peek commits after ~7 per-token frames, so a filter a few words in always
+  lands here): `_StreamAnswerGate` raises `_ContentFilterStop` at the filter finish, which ends the
+  stream like an upstream that died -- chat: the retryable `ECONNRESET` frame and no `[DONE]` (OpenCode
+  and qwen-code retry it, read from their source on 2026-10-03; kimi-cli shows it as an error without a
+  retry; Hermes and OpenClaw were not checked, so what they do with that frame is unverified); responses:
+  `response.failed` `upstream_error`; messages: the body ends without `message_stop`;
+  `/v1/completions`, Gemini (`UNAVAILABLE`) and Ollama translate it into their own error shape. The
+  words already shown stay shown. A stream that carries a tool call passes unchanged.
+- **Filing**: a failed delivery plus `_note_recent_hop_failure(pid, model, "content_filter")` (the pair
+  goes behind the others for `_RECENT_FAIL_TTL`), never the dead-mark: a filter is about THIS prompt,
+  not the model (`_note_nonanswer` exempts the kind; `_note_broken_stream` files it for the gate).
+- **Bounds so nothing loops**: `_FILTER_WALKS` (2) filtered hops walk on per request (`_filter_skip_spent`,
+  through `_skip_nonanswer`), the next one is served so the client reads the real cause and not a
+  deadline; the committed-stream retry stops once the walk spent them and after `_FILTER_RETRIES` (3)
+  per conversation per 10 minutes. A blank non-streamed reply keeps walking like any empty 200.
+- **Reused, not rebuilt**: a relay server whose hop failed is already skipped for the rest of the walk
+  (`_ChainClock._close_hop`) and the chain always carries a permissive model
+  (`_ensure_permissive_hop`), so no second ordering was added.
+- **Mutation-checked**: each piece (gate retry, peek end check, whitespace empty hop, JSON check, roles
+  hop, swarm hop, dead-mark exemption, per-request cap) was disabled in turn and failed 1-27 tests.
+
+**What it does not fix, said plainly.** The hub cannot type "continue" into a terminal CLI it did not
+start: it can only refuse to serve a stopping reply and hand over to another model. A week of the
+owner's OpenCode (79 turns, structure only) also shows turns that stopped for another reason:
+**8 turns ended on an assistant message with no part at all** (the request never got an answer -- those
+line up with `CHAT-503 ... nothing served after Ns` while the whole free fleet was slow or failing at
+110-147K tokens of history), 1 empty `finish=stop` with 0 output tokens (11-03, cause not found), 4
+user aborts, 11 turns that ended on a question (legitimate). When every provider fails inside the
+request deadline there is no model to hand over to. The real lever for that case -- committing the
+HTTP response early with keepalive comments and walking the chain for many minutes -- needs the three
+chain loops restructured into generators and was NOT built. Hub-owned Build turns are covered by the
+stall auto-continue (`stall_recheck`). An exact "I can't do X" refusal wording is still only caught for
+vision (`cannot_do`), tool/file/command claims (`_no_tools_claim`) and first-person refusals
+(`_looks_like_refusal`): one capability-refusal reply in 1659 messages of the week is no evidence that
+widening the wording pays, and the code comments record a false-positive incident.
+
+Release-note: fix: when a provider's content filter blocks a reply, the hub now hands the turn to the next model by itself in every CLI, so the turn no longer stops and you no longer have to type "continue".
+
+## A bare "continue" on a huge session is not a trivial turn (2026-11-07)
+
+Covered by `tests/test_quality_fallback_size_gate.py` (16, hermetic: fake clock, no network, no sleeping).
+Flag `qf_size_gate` (`config.get_flag`, default ON; a flag read that raises counts as off = the previous
+behaviour). Owner: "he should always use the best available models by intelligence -- why does he use
+some [weak] models sometimes when he has much better ones available".
+
+- **MEASURED** (hub.log + Activity, 2026-11-07, OpenCode `coding-max`): the CHAT-503 of a 145,671-token
+  request listed hop budgets of 19 / 45 / 6 / 25 / 25 s -- exactly the trivial-turn budgets
+  (`_adaptive_hop_budget`: 25 s fast / 45 s slow, 3.5 x p90 with a 6 s floor: dahl 19, Mercury 6) -- under a
+  `[quality-fallback] max->auto: nothing served after 30s` line. Activity rows of the same hour show the
+  same shape: the strong models (g4f Claude / GLM / Gemini copies, dahl, nvidia) each fail, then the
+  `max->auto` fallback serves Mercury, lfm-3-1.7b, crouton-alpha or glm-4.5-flash.
+- **Cause (reproduced with the real classifier).** `_ChainClock.plan_quality_fallback` called
+  `_is_trivial_ask(messages)`, which judges the LAST user message alone: a bare "continue" / "go" is trivial
+  (checked: `_is_trivial_ask` is True for it). The clock's own `trivial` flag refuses a big request
+  (`_is_trivial_turn`: est >= `STREAM_BIG_REQUEST_TOKENS`, 12K); the fallback did not. So a 145K-token turn got
+  the 30 s mark instead of `max(45, 0.45 x deadline)`, `_fire_quality_fallback` then set `self.trivial = True`,
+  and every later hop -- the strong ones included -- got a 6-45 s first-content budget. Nothing prefills 145K
+  tokens in 25 s: the hub's saved first-token times for nvidia glm-5.3-flash are 48-130 s. Each hop was cut by
+  the hub, filed as a `deadline` failure and fed the failure-streak rest (`_note_pair_failure`: 30 min,
+  doubling per repeat, cap 6 h; nvidia deepseek-v4.1-flash read "resting 120 min (level 3)" after ONE more
+  cut), so the best models were benched by the hub's own budget and the weak fast ones served.
+  The same flip shortened the reasoning-stall wait (it follows the hop budget): "only reasoning for 25s".
+- **Fix** (`_qf_big_request`, used by `plan_quality_fallback`): a request at or over
+  `STREAM_BIG_REQUEST_TOKENS` is never trivial for the fallback, whatever its last message says. It gets
+  the normal mark (`max(45 s, 0.45 x deadline)`) and the clock stays non-trivial after the fallback fires.
+  A small request (and an unknown size, 0) behaves as before. Negative control: with the gate disabled
+  4 of the 16 tests fail.
+- **Seen in the retained logs**: 187 of ~1,400 `[quality-fallback]` firings (157 + 30, the 30 s mark) used the
+  trivial mark. The line does not record the request size, so how many of them were big is NOT known; the
+  hop budgets in the CHAT-503 details are the proof for the 145K case.
+- **Limits, said plainly.**
+  - A hop is still cut at the normal mark (45-128 s) and filed as a deadline failure when it is cut there.
+    nvidia glm-5.3-flash's measured p50 first token is ~90 s, so on a big request some of its hops still lose.
+    Not changed: that mark is what stopped a Max turn hanging for 421 s (2026-09-27).
+  - Models already resting from earlier cuts stay rested until their own rest ends (not cleared; the longest
+    one on 2026-11-07 ended within the hour).
+  - The other half is real: in the same window dahl answered HTTP 429 `model_concurrency` (capacity), g4f
+    answered HTTP 500 / 403 / reasoning stalls and nvidia did not answer in time. No routing change makes
+    those hosts answer; the strong g4f Claude Opus copies DID serve whenever they answered (18-66 s).
+
+Release-note: fix: on a very long session, a short follow-up like "continue" no longer makes the hub give up on the strongest models after 30 seconds and hand the turn to weak fast ones.

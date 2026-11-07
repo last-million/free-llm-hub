@@ -40643,6 +40643,29 @@ _QUALITY_FALLBACK_TRIVIAL_SECONDS = 30.0
 _QUALITY_FALLBACK_PAIRS = 3
 
 
+# THE 30 s MARK IS FOR SMALL REQUESTS ONLY (flag `qf_size_gate`, default on).
+# MEASURED 2026-11-07 on the owner's OpenCode `coding-max` (hub.log): the
+# CHAT-503 of a 145,671-token request listed hop budgets of 19 / 45 / 6 / 25 /
+# 25 s -- exactly the trivial-turn budgets (_adaptive_hop_budget, 25 s fast /
+# 45 s slow) -- and the `[quality-fallback] ... after 30s` line above it said
+# why: the walk judged the turn trivial because its LAST message was "continue",
+# jumped to the fast picks at 30 s and flipped the clock to trivial. Nothing can
+# prefill 145K tokens in 25 s on these hosts (nvidia glm-5.3-flash's measured
+# first token is 48-130 s), so every strong hop was cut by the hub itself, filed
+# as a deadline failure and rested for 30 min -> 6 h, and the weak fast models
+# served. 187 of ~1,400 fallbacks in the retained logs fired at the 30 s mark.
+def _qf_big_request(est):
+    """True when a request is too big for the trivial 30 s fallback mark: the
+    same size line the clock draws for a trivial turn (STREAM_BIG_REQUEST_TOKENS).
+    Unknown size (0) is not big -- the previous behaviour. Never raises."""
+    try:
+        if not est or not config.get_flag("qf_size_gate", True):
+            return False
+        return int(est) >= STREAM_BIG_REQUEST_TOKENS
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
     """Up to _QUALITY_FALLBACK_PAIRS (pid, model) of `entries` (the chain not
     walked yet) to serve a best/max turn whose strong pool did not answer in
@@ -41007,6 +41030,12 @@ class _ChainClock:
         restart it. Never raises."""
         try:
             trivial = _is_trivial_ask(messages, max_tokens) if messages else False
+            # A short ASK is not a small REQUEST: a bare "continue" at the end of a
+            # 145K-token session is trivial to READ and slow to ANSWER (every hop
+            # must prefill the whole history). The clock's own `trivial` gate
+            # already refuses a big request (_is_trivial_turn); this one did not.
+            if trivial and _qf_big_request(self.est):
+                trivial = False
             if trivial:
                 wait = _QUALITY_FALLBACK_TRIVIAL_SECONDS
             else:
@@ -41999,6 +42028,13 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
     try:
         text = _peeked_text("".join(chunks))
         if not text:
+            # A COMPLETE stream whose content frames held only whitespace and made no
+            # tool call never answered anything (MEASURED 2026-11-07: "\n" + finish
+            # content_filter was committed as content): an empty hop. A stream still
+            # arriving (complete False) is left alone.
+            if (complete and raw_items and _content_filter_on()
+                    and _stream_blank_ended(raw_items)):
+                return "empty"
             return "content"
         # A claim to have no tools on a turn that offered them (see
         # _no_tools_claim). The peek commits at once on a real tool call, so
@@ -42363,6 +42399,19 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             return "nonanswer"
         return v
 
+    def _ended(seen, read_on_at):
+        """Verdict for a stream that ENDED ([DONE], a terminal event or the end of
+        the iterator) inside the peek window. A stream the provider's content
+        filter ended is a failed hop first (see A REPLY THE PROVIDER'S CONTENT
+        FILTER BLOCKED...): kind "content_filter", walked past like any non-answer."""
+        if _content_filter_on() and _stream_filtered(box["buf"]):
+            box["kind"] = "content_filter"
+            return "nonanswer"
+        return (_read_on_end(seen) if read_on_at is not None
+                else _judged_whole(seen) if seen
+                else _nameless_verdict(box["buf"], check) if box.get("nameless_tool")
+                else _empty_or_starved(box["buf"], check))
+
     def _worker():
         buf = box["buf"]
         saw_reasoning = False
@@ -42551,11 +42600,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # every iter_lines stream -- each line on the /v1/responses
                     # and /v1/messages paths -- and many iter_content ones):
                     # the trivial answers this chain most needs to keep.
-                    box["status"] = (_read_on_end(seen_content) if read_on_at is not None
-                                     else _judged_whole(seen_content) if seen_content
-                                     else _nameless_verdict(buf, check)
-                                     if box.get("nameless_tool")
-                                     else _empty_or_starved(buf, check))
+                    box["status"] = _ended(seen_content, read_on_at)
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
@@ -42590,11 +42635,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
-            box["status"] = (_read_on_end(seen_content) if read_on_at is not None
-                             else _judged_whole(seen_content) if seen_content
-                             else _nameless_verdict(buf, check)
-                             if box.get("nameless_tool")
-                             else _empty_or_starved(buf, check))
+            box["status"] = _ended(seen_content, read_on_at)
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
 
@@ -43897,7 +43938,11 @@ def _announce_skip_spent(kind):
     action: those walk the chain on (kind "announced"); the next one in the same
     request is served, so a pool that keeps announcing cannot burn the whole
     deadline. It was ONE until 2026-10-30: with several relays that announce, the
-    second one ended the user's turn. False for any other kind. Never raises."""
+    second one ended the user's turn. Kind "content_filter" has its own bound
+    (_filter_skip_spent); False for any other kind. Never raises."""
+    if kind == "content_filter":
+        # a provider's content filter: its own per-request bound (_FILTER_WALKS)
+        return _filter_skip_spent()
     if kind != "announced":
         return False
     try:
@@ -43987,6 +44032,14 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
         msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         if msg.get("tool_calls"):
             return False                      # a real tool call is a real answer
+        # The provider's content filter blocked the reply (finish_reason
+        # "content_filter" / "SAFETY" / "refusal"): not an answer whatever text it
+        # carries -- next hop, a quality failure, never a dead-mark (see A REPLY THE
+        # PROVIDER'S CONTENT FILTER BLOCKED HANDS THE TURN TO THE NEXT MODEL).
+        if (_content_filter_on()
+                and _is_filter_finish(((data.get("choices") or [{}])[0] or {}).get("finish_reason"))):
+            _set_nonanswer_kind("content_filter")
+            return True
         if tools and tool_rescue.rescue(data, tools):
             return False                      # it WAS an answer, in the wrong envelope
         content = msg.get("content")
@@ -44048,7 +44101,14 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     # "no_tools_claim" (_no_tools_claim) and "announced" (_announced_only /
     # _ends_with_announcement) are heuristics about ONE reply: the failure is
     # filed, the pair stays routable.
-    if kind in ("provider_quota", "provider_error", "no_tools_claim", "announced"):
+    if kind in ("provider_quota", "provider_error", "no_tools_claim", "announced",
+                "content_filter"):
+        if kind == "content_filter":
+            # A filter blocks THIS prompt, not the model: the failure is filed (above)
+            # and the pair goes behind the others for _RECENT_FAIL_TTL, so the CLI's
+            # next request starts elsewhere instead of re-paying the blocked hop. Never
+            # the dead-mark below (a good model benched over one prompt).
+            _note_recent_hop_failure(pid, model, "content_filter")
         if kind == "provider_quota":
             _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
             # A key-budget notice is the BACKEND's, not this model's: rest the
@@ -44369,6 +44429,14 @@ class _StreamAnswerGate:
         self._rfirst_end = None
         self._tail = ""              # the last _GATE_TAIL chars of the text
         self._tail_before = ""       # ...as they were before the latest delta
+        # A provider's content filter ending the reply before any visible text (see A
+        # REPLY THE PROVIDER'S CONTENT FILTER BLOCKED HANDS THE TURN...): read here, in
+        # the request's context, because _run may iterate on another thread.
+        self._filter_ok = _content_filter_on()
+        try:
+            self._filter_key = str(_cmem_conv() or "%s|%s" % (hop_pid, hop_model))
+        except Exception:                                        # noqa: BLE001
+            self._filter_key = "%s|%s" % (hop_pid, hop_model)
         self.cut = False
         self.reasons = []
 
@@ -44755,6 +44823,19 @@ class _StreamAnswerGate:
                         yield fr
                         continue
                     k, t, fin = self._classify(fr)
+                    if (fin and self._filter_ok and k in ("text", "finish")
+                            and _is_filter_finish(fin)
+                            and _filter_retry_ok(self._filter_key)):
+                        # The provider's content filter ended this COMMITTED stream (no tool
+                        # call in it: that would have disarmed the gate). The peek commits
+                        # after ~7 per-token frames, so a filter that comes a few words in
+                        # always lands here. End it like an upstream that died, so the CLI's
+                        # own retry reaches another model instead of the turn stopping on a
+                        # ContentFilterError that the user has to answer with "continue".
+                        # Bounded per request and per conversation (_filter_retry_ok); the
+                        # words already shown stay shown.
+                        raise _ContentFilterStop(
+                            "the provider's content filter blocked the reply")
                     if k == "other":
                         yield fr
                         continue
@@ -45169,9 +45250,146 @@ def _note_broken_stream(pid, model, exc, where):
         _record_outcome(pid, model, False)
         kind = "timeout" if (isinstance(exc, (requests.Timeout, TimeoutError))
                              or "timed out" in str(exc).lower()) else "conn"
+        if isinstance(exc, _ContentFilterStop):
+            kind = "content_filter"          # the provider blocked THIS reply: not a dropped link
         _note_recent_hop_failure(pid, model, kind)
     except Exception:                                            # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------- #
+# A REPLY THE PROVIDER'S CONTENT FILTER BLOCKED HANDS THE TURN TO THE NEXT MODEL.
+#
+# MEASURED 2026-11-07 (the owner's OpenCode, coding-max): a turn ended on "The
+# response was blocked by the provider's content filter" with no text at all.
+# Activity: ok / 200 -- hop 1 a g4f HTTP 500, hop 2 a g4f relay copy whose stream
+# was ONE whitespace delta, finish_reason "content_filter", [DONE]. Nothing read
+# that finish_reason (only the Anthropic stop-reason map did), the peek counted
+# the whitespace delta as content and committed the stream, and OpenCode raised
+# its ContentFilterError and stopped: no other model was tried. (A bare stream
+# with no content frame at all already walked on as "empty"; the whitespace delta
+# is what slipped through.) Covered by tests/test_content_filter_hands_over.py.
+#
+#   * the peek (shared by chat, responses and messages): a stream that ENDS with a
+#     filter finish and no tool call is a failed hop (kind "content_filter"); one
+#     whose content was only whitespace is an empty hop (_judge_peeked);
+#   * a non-streamed 200 with a filter finish and no tool call: the same
+#     (_chat_json_nonanswer), and in the roles / swarm-stage hops;
+#   * a COMMITTED stream that reaches a filter finish (the peek commits after
+#     ~7 per-token frames, so a filter a few words in always lands here) ends
+#     like an upstream that died (the retryable frame / response.failed), so the
+#     CLI's own retry reaches another model instead of the turn stopping for the
+#     user to type "continue" (_StreamAnswerGate). The words already shown stay
+#     shown; a tool call in the stream passes unchanged.
+# A filter belongs to THIS prompt, not to the model: the pair is filed as a failed
+# delivery and a recent failure, never dead-marked (_note_nonanswer). At most
+# _FILTER_WALKS filtered hops are walked per request and the next is served, so a
+# request every model blocks ends on the real cause and not on a deadline; the
+# committed-stream retry is bounded per request and per conversation too. A relay
+# server whose hop failed is already skipped for the rest of the walk
+# (_ChainClock._close_hop), and the chain always carries a permissive model
+# (_ensure_permissive_hop), so no second ordering is needed here.
+# Flag `content_filter_handover` (default on); off = the stream and the JSON reply
+# are served as before.
+# --------------------------------------------------------------------------- #
+_FILTER_FINISHES = frozenset((
+    "content_filter", "contentfilter", "safety", "blocked", "prohibited_content",
+    "blocklist", "spii", "recitation", "image_safety", "refusal"))
+_FILTER_FINISH_RE = re.compile(
+    rb'"finish_reason"\s*:\s*"(?:content[_-]?filter|safety|blocked|prohibited[_-]?content'
+    rb'|blocklist|spii|recitation|image[_-]?safety|refusal)"', re.I)
+_FILTER_WALKS = 2             # filtered hops per request that walk the chain on
+_FILTER_RETRIES = 3           # committed-stream retries per conversation per window
+_FILTER_RETRY_WINDOW = 600
+_filter_retries = {}          # conversation key -> [first epoch, count]
+_filter_retries_lock = threading.Lock()
+
+
+def _content_filter_on():
+    """Flag `content_filter_handover` (default on); a flag read that raises = off."""
+    try:
+        return bool(config.get_flag("content_filter_handover", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _is_filter_finish(value):
+    """True for a finish_reason that says the provider blocked the reply
+    (OpenAI/Azure "content_filter", Gemini "SAFETY", Anthropic "refusal"...)."""
+    try:
+        return (isinstance(value, str)
+                and value.strip().lower().replace("-", "_").replace(" ", "_") in _FILTER_FINISHES)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _stream_filtered(buf):
+    """True when the buffered chat SSE of a stream that ENDED carries a filter
+    finish and no tool call. Cheap pre-check first; never raises."""
+    try:
+        if not any(_FILTER_FINISH_RE.search(
+                x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8", "ignore"))
+                for x in (buf or ()) if x):
+            return False
+        _text, saw_tools, fin = _buffered_digest(buf)
+        return (not saw_tools) and _is_filter_finish(fin)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _stream_blank_ended(buf):
+    """True when a buffered stream that ENDED carries no tool call and no visible
+    text -- its content frames held only whitespace. Never raises."""
+    try:
+        text, saw_tools, _fin = _buffered_digest(buf)
+        return (not saw_tools) and not (text or "").strip()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _filter_skip_spent():
+    """_FILTER_WALKS filtered hops per request walk the chain on; the next one in
+    the same request is served (the client then reads the provider's real cause).
+    True when it is spent. Never raises."""
+    try:
+        used = int(getattr(g, "hub_filter_skips", 0) or 0)
+        if used >= _FILTER_WALKS:
+            return True
+        g.hub_filter_skips = used + 1
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _filter_retry_ok(conv_key):
+    """May a COMMITTED stream the provider's filter cut end with the retryable
+    frame? Bounded per request (the walk already spent its filtered
+    hops) and per conversation (_FILTER_RETRIES in _FILTER_RETRY_WINDOW), so a
+    prompt every model blocks cannot loop a CLI's own retry. Counts the grant."""
+    try:
+        if int(getattr(g, "hub_filter_skips", 0) or 0) >= _FILTER_WALKS:
+            return False
+    except Exception:                                            # noqa: BLE001
+        pass
+    key = str(conv_key or "")
+    now = time.time()
+    with _filter_retries_lock:
+        row = _filter_retries.get(key)
+        if row is None or now - row[0] > _FILTER_RETRY_WINDOW:
+            row = [now, 0]
+            _filter_retries[key] = row
+        if row[1] >= _FILTER_RETRIES:
+            return False
+        row[1] += 1
+        if len(_filter_retries) > 500:
+            for k in sorted(_filter_retries, key=lambda x: _filter_retries[x][0])[:100]:
+                _filter_retries.pop(k, None)
+    return True
+
+
+class _ContentFilterStop(_UpstreamStreamError):
+    """A committed stream the provider's content filter ended: the relay ends it
+    like an upstream that died, so the client retries on another model."""
 
 
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
@@ -46266,6 +46484,21 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                 continue
             choice = (data.get("choices") or [{}])[0]
             text = ((choice.get("message") or {}).get("content") or "").strip()
+            if (_content_filter_on() and not (choice.get("message") or {}).get("tool_calls")
+                    and _is_filter_finish(choice.get("finish_reason"))):
+                # The provider's content filter blocked this stage reply: the next hop
+                # may pass it. The longest partial stays the fallback if every hop is
+                # blocked; the pair is filed as a failed delivery and a recent failure,
+                # never dead-marked (the filter is about THIS prompt).
+                _record_outcome(hop_pid, hop_model, False)
+                _note_recent_hop_failure(hop_pid, hop_model, "content_filter")
+                if text and len(text) > len(best_partial):
+                    best_partial = text
+                    best_partial_who = "%s/%s" % (hop_pid, hop_model)
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0,
+                              "blocked by the provider's content filter")
+                continue
             if plan is not None and not text:
                 # EMPTY: finish "length" is the thinker that spent its whole
                 # budget before the first brace (learn it, so the next call
@@ -48723,6 +48956,14 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
             _record_outcome(pid, model, False)
             _note_empty_200(pid, model)
             return fail("empty", "200 with an empty message")
+        if (not msg.get("tool_calls") and _content_filter_on()
+                and _is_filter_finish((data.get("choices") or [{}])[0].get("finish_reason"))):
+            # The provider's content filter blocked the reply (whatever partial text it
+            # carries): the next actor hop, a failed delivery and a recent failure --
+            # never a dead-mark or an empty-200 strike, the filter is about THIS prompt.
+            _record_outcome(pid, model, False)
+            _note_recent_hop_failure(pid, model, "content_filter")
+            return fail("filtered", "blocked by the provider's content filter")
         if not msg.get("tool_calls") and tools:
             if tool_rescue.rescue(data, tools):
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
