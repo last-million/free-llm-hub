@@ -48,7 +48,7 @@ def model_entry(model_id, context_window=None, display=None):
         "baseModelId": str(model_id),
         "version": "001",
         "displayName": display or str(model_id),
-        "description": "Served by free-llm-hub",
+        "description": "Served by Calvoun Free LLM Hub",
         "inputTokenLimit": int(context_window or DEFAULT_INPUT_LIMIT),
         "outputTokenLimit": DEFAULT_OUTPUT_LIMIT,
         "supportedGenerationMethods": list(_METHODS),

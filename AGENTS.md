@@ -1,4 +1,4 @@
-# AGENTS.md — free-llm-hub
+# AGENTS.md — Calvoun Free LLM Hub
 
 ## Token economy: use the graphify graph before reading files
 

@@ -54,6 +54,9 @@ import uuid
 PROTOCOL_VERSION = "2025-03-26"
 
 SERVER_NAME = "free-llm-hub"
+# What a person reads. SERVER_NAME is the id clients build tool names from
+# (mcp__free-llm-hub__...), so it never changes.
+SERVER_TITLE = "Calvoun Free LLM Hub"
 # Overridable via init(version=...) — app.py passes its own hub version stamp.
 SERVER_VERSION = "0.1.0"
 
@@ -153,7 +156,7 @@ def _tools():
         {
             "name": "crew_run",
             "description": (
-                "Run a free-llm-hub multi-agent crew (planner -> workers -> "
+                "Run a Calvoun Free LLM Hub multi-agent crew (planner -> workers -> "
                 "reviewer -> fix pass) on a task and return the final "
                 "artefact. WARNING: this BLOCKS for the whole run, typically "
                 "5-20 minutes. If your client has a short tool timeout, use "
@@ -829,7 +832,8 @@ def handle_rpc(payload):
         if method == "initialize":
             return _respond(rpc_id, result={
                 "protocolVersion": PROTOCOL_VERSION,
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE,
+                               "version": SERVER_VERSION},
                 "capabilities": {"tools": {}},
             })
         if method == "ping":

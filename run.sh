@@ -68,7 +68,7 @@ hub_kill_pid() {
 
 if [ -n "$HUB_RESTART" ]; then
   for pid in $(hub_pids_on_port); do
-    echo "[free-llm-hub] Stopping the hub on port ${PORT} (pid ${pid})..."
+    echo "[Calvoun Free LLM Hub] Stopping the hub on port ${PORT} (pid ${pid})..."
     hub_kill_pid "$pid"
   done
   # Let it drain, then insist. Windows/macOS can hold the socket briefly after
@@ -78,7 +78,7 @@ if [ -n "$HUB_RESTART" ]; then
     sleep 0.5
   done
   for pid in $(hub_pids_on_port); do
-    echo "[free-llm-hub] pid ${pid} did not exit - forcing."
+    echo "[Calvoun Free LLM Hub] pid ${pid} did not exit - forcing."
     if [ -n "${WINDIR:-}${SYSTEMROOT:-}" ]; then hub_kill_pid "$pid"; else kill -9 "$pid" 2>/dev/null || true; fi
   done
   sleep 1
@@ -105,7 +105,7 @@ else
 fi
 STOP_MARKER="$(dirname "$CONFIG_FILE")/intentional-stop"
 if [ "${HUB_SUPERVISED:-}" = "1" ] && [ -f "$STOP_MARKER" ]; then
-  echo "[free-llm-hub] Intentionally stopped from the dashboard - supervisor restart skipped."
+  echo "[Calvoun Free LLM Hub] Intentionally stopped from the dashboard - supervisor restart skipped."
   exit 0
 fi
 if [ "${HUB_SUPERVISED:-}" != "1" ]; then
@@ -150,7 +150,7 @@ if [ -z "${HUB_FORCE:-}" ]; then
   # as failure. That silently broke this exact double-bind check (it always
   # said "not running" once a token existed, so a second copy would start).
   if command -v curl >/dev/null 2>&1 && curl -sS -m 2 -o /dev/null "http://127.0.0.1:${PORT}/api/providers"; then
-    echo "[free-llm-hub] Already running and healthy on port ${PORT} - nothing to do."
+    echo "[Calvoun Free LLM Hub] Already running and healthy on port ${PORT} - nothing to do."
     echo "               Dashboard: http://127.0.0.1:${PORT}"
     echo "               (restart it instead of starting a second copy; HUB_FORCE=1 to override)"
     maybe_autopersist
@@ -193,7 +193,7 @@ install_python() {
   # a missing command.
   BOUND=""
   command -v timeout >/dev/null 2>&1 && BOUND="timeout 300"
-  echo "[free-llm-hub] Installing Python - this can take a few minutes on a slow network."
+  echo "[Calvoun Free LLM Hub] Installing Python - this can take a few minutes on a slow network."
   if command -v apt-get >/dev/null 2>&1; then
     $SUDO $BOUND apt-get update -qq || true
     $SUDO $BOUND apt-get install -y python3 python3-venv python3-pip
@@ -218,9 +218,9 @@ NEEDS_VENV=""
 find_python
 if [ -z "$PY" ] || [ -n "$NEEDS_VENV" ]; then
   if [ -z "$PY" ]; then
-    echo "[free-llm-hub] Python was not found on this machine - installing it."
+    echo "[Calvoun Free LLM Hub] Python was not found on this machine - installing it."
   else
-    echo "[free-llm-hub] Python is missing its venv module - installing it."
+    echo "[Calvoun Free LLM Hub] Python is missing its venv module - installing it."
   fi
   install_python || true
   NEEDS_VENV=""
@@ -235,7 +235,7 @@ fi
 
 # --- venv (create once, reuse forever) ---
 if [ ! -d ".venv" ]; then
-  echo "[free-llm-hub] Creating virtual environment..."
+  echo "[Calvoun Free LLM Hub] Creating virtual environment..."
   "$PY" -m venv .venv
 fi
 
@@ -266,9 +266,9 @@ import flask, requests, cryptography, psutil, PIL   # noqa: F401 - must be IMPOR
 sys.exit(0 if ok else 1)
 PYCHK
 then
-  echo "[free-llm-hub] Dependencies already installed - skipping pip."
+  echo "[Calvoun Free LLM Hub] Dependencies already installed - skipping pip."
 else
-  echo "[free-llm-hub] Installing dependencies from requirements.txt..."
+  echo "[Calvoun Free LLM Hub] Installing dependencies from requirements.txt..."
   echo "               This can take a minute on a slow network - progress prints below."
   echo "               If nothing moves for several minutes, your network is likely"
   echo "               blocking it - check a proxy/firewall or try a different network."

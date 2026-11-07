@@ -44,7 +44,7 @@ http://127.0.0.1:8787
 
 | How | What to do |
 | --- | --- |
-| **ZIP** (no tools needed) | **[Download free-llm-hub (.zip)](https://github.com/last-million/free-llm-hub/archive/refs/heads/main.zip)**, unzip anywhere |
+| **ZIP** (no tools needed) | **[Download Calvoun Free LLM Hub (.zip)](https://github.com/last-million/free-llm-hub/archive/refs/heads/main.zip)**, unzip anywhere |
 | **git** | `git clone https://github.com/last-million/free-llm-hub.git` |
 
 **2. Run the file for your system**

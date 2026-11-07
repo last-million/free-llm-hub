@@ -5,7 +5,7 @@
 - License: MIT — Copyright (c) 2026 Matt Van Horn (see `LICENSE` in this directory)
 
 This is a **modified** vendor for Kimi Code running against the local
-free-llm-hub (127.0.0.1:8787). Upstream history is not imported; the clone was
+Calvoun Free LLM Hub (127.0.0.1:8787). Upstream history is not imported; the clone was
 discarded after copying `SKILL.md` + `scripts/` + `LICENSE`.
 
 ## Modifications vs upstream

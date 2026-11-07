@@ -36199,9 +36199,9 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
     amodels = defaults.get("models")
     if not isinstance(amodels, dict):
         amodels = {}
-    amodels["freehub/auto"] = {"alias": "Free LLM Hub"}  # allowlist (else "model not allowed")
+    amodels["freehub/auto"] = {"alias": "Calvoun Free LLM Hub"}  # allowlist (else "model not allowed")
     for mid in _HUB_TIER_IDS[1:]:
-        amodels["freehub/" + mid] = {"alias": "Free LLM Hub %s" % mid}
+        amodels["freehub/" + mid] = {"alias": "Calvoun Free LLM Hub %s" % mid}
     defaults["models"] = amodels
     mdl = defaults.get("model")
     if not isinstance(mdl, dict):
@@ -37583,7 +37583,7 @@ def _disconnect_pi(entry):
     return {"ok": True, "reverted_path": path if (changed or deleted) else None,
             "wrote_path": path,
             "changed": bool(changed or deleted or settings_changed),
-            "detail": ("removed the free-llm-hub provider" if changed
+            "detail": ("removed the Calvoun Free LLM Hub provider" if changed
                        else "nothing of ours was in the file"),
             "restart_hint": hint}
 

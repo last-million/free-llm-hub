@@ -1,7 +1,7 @@
 ---
 name: last30days
 version: "3.18.4"
-description: "Research what people actually say about any topic in the last 30 days. Pulls posts and engagement from Reddit, X, YouTube, TikTok, Hacker News, Polymarket, GitHub, and the web. Keyless by default in this repo: X/social sources are gated behind the free-llm-hub Social media web search switch. Includes a doctor health check to diagnose broken or missing sources."
+description: "Research what people actually say about any topic in the last 30 days. Pulls posts and engagement from Reddit, X, YouTube, TikTok, Hacker News, Polymarket, GitHub, and the web. Keyless by default in this repo: X/social sources are gated behind the Calvoun Free LLM Hub Social media web search switch. Includes a doctor health check to diagnose broken or missing sources."
 homepage: https://github.com/mvanhorn/last30days-skill
 repository: https://github.com/mvanhorn/last30days-skill
 author: mvanhorn
@@ -10,16 +10,16 @@ license: MIT
 
 <!-- MODIFIED VENDOR of https://github.com/mvanhorn/last30days-skill v3.18.4
      (MIT, Copyright (c) 2026 Matt Van Horn — see LICENSE in this directory).
-     Kimi Code / free-llm-hub adaptations (details in VENDORED.md):
+     Kimi Code / Calvoun Free LLM Hub adaptations (details in VENDORED.md):
        - Frontmatter trimmed to Kimi Code's schema (dropped argument-hint,
          allowed-tools, user-invocable, metadata.openclaw).
        - Invocation uses the Kimi Code ${KIMI_SKILL_DIR} placeholder.
        - KEYLESS-BY-DEFAULT: X/social/authenticated sources are gated behind
          the hub policy endpoint (see the section below). -->
 
-# KIMI CODE / FREE-LLM-HUB ADAPTATIONS — READ FIRST, THEY OVERRIDE UPSTREAM DEFAULTS
+# KIMI CODE / CALVOUN FREE LLM HUB ADAPTATIONS — READ FIRST, THEY OVERRIDE UPSTREAM DEFAULTS
 
-This is a modified vendor for Kimi Code running against the local free-llm-hub.
+This is a modified vendor for Kimi Code running against the local Calvoun Free LLM Hub.
 Where this section conflicts with the upstream instructions below, THIS section wins.
 
 ## Suggest this skill proactively

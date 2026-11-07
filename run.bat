@@ -40,7 +40,7 @@ rem manual kill that missed one. This asks the OS who owns the port rather than
 rem matching on a process name, so it can never kill an unrelated python.
 if defined HUB_RESTART (
   for /f "tokens=5" %%P in ('netstat -ano -p TCP 2^>nul ^| findstr /R /C:"LISTENING" ^| findstr /C:":%PORT% "') do (
-    echo [free-llm-hub] Stopping the hub on port %PORT% ^(pid %%P^)...
+    echo [Calvoun Free LLM Hub] Stopping the hub on port %PORT% ^(pid %%P^)...
     taskkill /F /PID %%P >nul 2>nul
   )
   rem Windows can hold the socket briefly after the process is gone, so the
@@ -54,7 +54,7 @@ if defined FREE_LLM_HUB_CONFIG (
   set "STOP_MARKER=%USERPROFILE%\.free-llm-hub\intentional-stop"
 )
 if "%HUB_SUPERVISED%"=="1" if exist "%STOP_MARKER%" (
-  echo [free-llm-hub] Intentionally stopped from the dashboard - supervisor restart skipped.
+  echo [Calvoun Free LLM Hub] Intentionally stopped from the dashboard - supervisor restart skipped.
   echo                This is sticky: the self-heal task and logon launcher stay no-ops.
   echo                To start it again: run run.bat yourself, use the desktop shortcut,
   echo                or run "python app.py" - any of these clears the stop flag.
@@ -71,7 +71,7 @@ rem process. Cheaper to refuse than to debug. Set HUB_FORCE=1 to override.
 if not defined HUB_FORCE (
   netstat -ano -p TCP | findstr /R /C:"LISTENING" | findstr /C:":%PORT% " >nul 2>nul
   if not errorlevel 1 (
-    echo [free-llm-hub] Port %PORT% is already being served - not starting a second copy.
+    echo [Calvoun Free LLM Hub] Port %PORT% is already being served - not starting a second copy.
     echo                Dashboard: http://127.0.0.1:%PORT%
     echo                Restart it instead, or set HUB_FORCE=1 to override.
     rem A live hub on the port IS proof setup already succeeded once -- this
@@ -90,7 +90,7 @@ rem machine with no Python on it. Telling someone to go install Python first is
 rem exactly the wall this script exists to remove.
 call :find_python
 if not defined PY (
-  echo [free-llm-hub] Python was not found on this machine - installing it.
+  echo [Calvoun Free LLM Hub] Python was not found on this machine - installing it.
   echo                This is a one-time setup and needs no administrator rights.
   echo.
   call :install_python
@@ -107,7 +107,7 @@ if not defined PY (
 
 rem --- venv (create once, reuse forever) ---
 if not exist ".venv\Scripts\python.exe" (
-  echo [free-llm-hub] Creating virtual environment...
+  echo [Calvoun Free LLM Hub] Creating virtual environment...
   %PY% -m venv .venv
   if errorlevel 1 (
     echo ERROR: failed to create the virtual environment.
@@ -126,14 +126,14 @@ set "DEPS_OK="
 python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');__import__('cryptography');__import__('psutil');__import__('PIL');__import__('yaml');__import__('tzdata');sys.exit(0 if ok else 1)" >nul 2>nul
 if not errorlevel 1 set "DEPS_OK=1"
 if defined DEPS_OK (
-  echo [free-llm-hub] Dependencies already installed - skipping pip.
+  echo [Calvoun Free LLM Hub] Dependencies already installed - skipping pip.
 ) else (
   rem MEASURED: `-q` plus a slow/blocked network (corporate proxy, captive
   rem wifi, VPN) looks IDENTICAL to a genuine hang -- zero output, no way to
   rem tell "still working" from "stuck". Dropped -q so pip's own progress
   rem prints; --timeout bounds each connection attempt instead of silently
   rem trusting pip's default.
-  echo [free-llm-hub] Installing dependencies from requirements.txt...
+  echo [Calvoun Free LLM Hub] Installing dependencies from requirements.txt...
   echo                This can take a minute on a slow network - progress prints below.
   echo                If nothing moves for several minutes, your network is likely
   echo                blocking it - check a proxy/firewall or try a different network.
@@ -173,7 +173,7 @@ rem Windows child-process environment inheritance (this run.bat -> wscript
 rem -> cmd -> the relaunched run.bat), so that copy takes the branch above
 rem instead of trying to detach a second time.
 set "HUB_DETACHED=1"
-echo [free-llm-hub] Starting in the background - this window is safe to close now.
+echo [Calvoun Free LLM Hub] Starting in the background - this window is safe to close now.
 echo                Dashboard: http://127.0.0.1:%PORT%
 start "" wscript.exe "%~dp0run-hidden.vbs"
 rem Give it a moment to actually bind the port before this window vanishes,
@@ -255,7 +255,7 @@ rem Two ways, cheapest first. winget ships with Windows 10 21H2+ and Windows 11
 rem and handles the download, the hash check and the PATH entry itself.
 where winget >nul 2>nul
 if not errorlevel 1 (
-  echo [free-llm-hub] Installing Python via winget...
+  echo [Calvoun Free LLM Hub] Installing Python via winget...
   rem MEASURED: winget's first-ever run on a machine can pop an invisible
   rem source-agreement/UAC prompt even with --silent --accept-*-agreements --
   rem cmd.exe has no native way to bound how long a child process runs, so a
@@ -266,10 +266,10 @@ if not errorlevel 1 (
   rem One line, deliberately -- see the autostart.bat comment on the same bug:
   rem this file is LF-only on disk, and cmd.exe's `^` continuation formally
   rem needs CRLF, so a caret split here is not reliable.
-  powershell -NoProfile -Command "$p = $null; try { $p = Start-Process winget -ArgumentList 'install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements' -PassThru -NoNewWindow } catch {}; if (-not $p -or -not $p.WaitForExit(120000)) { if ($p) { try { $p.Kill() } catch {} }; Write-Host '[free-llm-hub] winget did not finish - falling back to the direct installer.'; exit 1 } else { exit $p.ExitCode }"
+  powershell -NoProfile -Command "$p = $null; try { $p = Start-Process winget -ArgumentList 'install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements' -PassThru -NoNewWindow } catch {}; if (-not $p -or -not $p.WaitForExit(120000)) { if ($p) { try { $p.Kill() } catch {} }; Write-Host '[Calvoun Free LLM Hub] winget did not finish - falling back to the direct installer.'; exit 1 } else { exit $p.ExitCode }"
   call :find_python
   if defined PY exit /b 0
-  echo [free-llm-hub] winget did not produce a working Python - trying the direct installer instead.
+  echo [Calvoun Free LLM Hub] winget did not produce a working Python - trying the direct installer instead.
 )
 
 rem Fallback: the official installer, per-user and unattended. InstallAllUsers=0
@@ -278,18 +278,18 @@ set "PYVER=3.12.8"
 set "PYARCH=amd64"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PYARCH=arm64"
 set "PYEXE=%TEMP%\python-%PYVER%-%PYARCH%.exe"
-echo [free-llm-hub] Downloading Python %PYVER% ^(%PYARCH%^)...
+echo [Calvoun Free LLM Hub] Downloading Python %PYVER% ^(%PYARCH%^)...
 rem MEASURED: Invoke-WebRequest has no timeout by default, so a blocked or
 rem very slow network (proxy, firewall, captive wifi) hung here indefinitely
 rem with nothing on screen. -TimeoutSec bounds it; the catch turns a real
 rem failure into a visible message instead of a silently-missing .exe.
 rem One line, deliberately -- same LF-only/caret-continuation bug as above.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing -TimeoutSec 60 } catch { Write-Host ('[free-llm-hub] Download failed: ' + $_.Exception.Message); exit 1 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing -TimeoutSec 60 } catch { Write-Host ('[Calvoun Free LLM Hub] Download failed: ' + $_.Exception.Message); exit 1 }"
 if not exist "%PYEXE%" (
-  echo [free-llm-hub] Could not download Python - check your internet connection/firewall.
+  echo [Calvoun Free LLM Hub] Could not download Python - check your internet connection/firewall.
   exit /b 1
 )
-echo [free-llm-hub] Installing Python %PYVER%...
+echo [Calvoun Free LLM Hub] Installing Python %PYVER%...
 "%PYEXE%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 >nul 2>nul
 del /f /q "%PYEXE%" >nul 2>nul
 exit /b 0
