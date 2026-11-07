@@ -15680,7 +15680,8 @@ def _strip_thinking(text):
 # block at the very START only, only when something is left to show (text or tool calls), never
 # when the user's own prompt is about <think> tags; the text MOVES to `reasoning_content` (never
 # thrown away). Non-stream paths of all three protocols and the roles path (which replays to a
-# streaming client); a streamed single-model reply is not rewritten. Flag `strip_leaked_think`.
+# streaming client); a streamed CHAT reply is handled by _think_to_reasoning_sse below.
+# Flag `strip_leaked_think`.
 _LEAKED_THINK_RE = re.compile(r"^\s*<(think|thinking)>(.*?)</\1>\s*", re.S | re.I)
 _THINK_TAG_IN_PROMPT_RE = re.compile(r"<\s*/?\s*think", re.I)
 
@@ -15720,6 +15721,205 @@ def _strip_leaked_think_data(data, pid, prompt):
         return _strip_leaked_think_msg(msg, relay=_is_relay_pid(pid), prompt=prompt)
     except Exception:                                            # noqa: BLE001
         return False
+
+
+# THE SAME, FOR A STREAMED CHAT REPLY (2026-11-07). MEASURED in a real OpenCode run through
+# the hub: every step's reply opened with "<think>...</think>" in the CONTENT, and OpenCode
+# printed it as the assistant's text. _strip_leaked_think_msg only ever saw non-streamed
+# replies; every CLI streams. This wraps the chat stream AFTER _proxy_sse, so the answer
+# judge, the relay-gag check and the announcement check still read the reply as the model
+# wrote it; only what reaches the client changes. The rules match the non-stream ones:
+# a block at the very START of the reply only, moved to `reasoning_content` (never thrown
+# away), and only once something follows it (text or a tool call). Until then the block
+# is HELD; a reply that ends inside it, or with nothing after it, is sent exactly as it
+# came. A reply that does not open with the tag passes untouched, byte for byte, after
+# its first characters. Any provider (the text moves, nothing is erased); never when the
+# user's own prompt is about these tags. Chat protocol only: on /v1/responses and
+# /v1/messages the end-of-stream checks read the text, so they are left alone.
+# Flag `strip_leaked_think_stream` (default on).
+_THINK_SSE_TAGS = ("<think>", "<thinking>")
+_THINK_SSE_HOLD_MAX = 32000          # chars of held thinking before giving up (sent as is)
+
+
+def _think_sse_on():
+    try:
+        return bool(config.get_flag("strip_leaked_think_stream", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _think_sse_parse(frame):
+    """(json object, delta dict) of one SSE frame, or (None, None)."""
+    try:
+        lines = [ln for ln in frame.split(b"\n") if ln.strip()]
+        data = [ln for ln in lines if ln.startswith(b"data:")]
+        if len(data) != 1 or len(lines) != 1:
+            return None, None
+        raw = data[0][5:].strip()
+        if not raw.startswith(b"{"):
+            return None, None
+        obj = json.loads(raw.decode("utf-8"))
+        ch = obj.get("choices") if isinstance(obj, dict) else None
+        if not isinstance(ch, list) or len(ch) != 1 or not isinstance(ch[0], dict):
+            return obj, None
+        delta = ch[0].get("delta")
+        return obj, (delta if isinstance(delta, dict) else None)
+    except Exception:                                            # noqa: BLE001
+        return None, None
+
+
+def _think_sse_frame(template, delta):
+    """`template` (a parsed chunk) with its delta replaced, as an SSE frame."""
+    obj = dict(template)
+    ch = dict(obj["choices"][0])
+    ch["delta"] = delta
+    obj["choices"] = [ch]
+    return b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n"
+
+
+def _think_to_reasoning_sse(chunks, prompt=None):
+    """Move a leaked leading <think> block of a streamed chat reply into
+    `reasoning_content` deltas (see above). Never raises out of the stream: on any
+    surprise it sends what it held, unchanged, and passes the rest through."""
+    if not _think_sse_on() or (prompt and _THINK_TAG_IN_PROMPT_RE.search(str(prompt))):
+        yield from chunks
+        return
+    mode = "probe"           # probe -> hold -> pass
+    buf = b""
+    held = []                # (frame bytes, has visible content) in order
+    text = ""                # content seen so far (probe + hold)
+    tag = None               # the opening tag, once seen
+    template = None          # the first content chunk, to clone frames from
+
+    def _flush():
+        out = [f for f, _c in held]
+        held.clear()
+        return out
+
+    def _step(frame):
+        nonlocal mode, text, tag, template
+        obj, delta = _think_sse_parse(frame)
+        if delta is None:
+            # [DONE], a usage frame, a comment, anything not a plain one-choice delta:
+            # before any content it just passes; while holding, the reply ended
+            # (or turned odd) inside the block -> everything as it came.
+            if mode == "probe" and not held:
+                return [frame]
+            mode = "pass"
+            return _flush() + [frame]
+        content = delta.get("content")
+        content = content if isinstance(content, str) else ""
+        calls = delta.get("tool_calls")
+        finish = (obj.get("choices") or [{}])[0].get("finish_reason")
+        if mode == "probe":
+            if not content:
+                if calls or finish:
+                    mode = "pass"
+                    return _flush() + [frame]
+                if held:
+                    held.append((frame, False))
+                    return []
+                return [frame]
+            held.append((frame, True))
+            if template is None:
+                template = obj
+            text += content
+            low = text.lstrip().lower()
+            if not low:
+                return []
+            for t in _THINK_SSE_TAGS:
+                if low.startswith(t):
+                    mode, tag = "hold", t
+                    break
+                if t.startswith(low):
+                    return []                    # "<thi": not decided yet
+            if mode != "hold":
+                mode = "pass"
+                return _flush()
+            # fall through: this frame may already close the block
+        else:
+            held.append((frame, bool(content)))
+            text += content
+        opened = re.match(r"\s*" + re.escape(tag), text, re.I)
+        closed = (re.compile(re.escape("</" + tag[1:]), re.I).search(text, opened.end())
+                  if opened else None)
+        if not opened:
+            mode = "pass"
+            return _flush()
+        if not closed:
+            if calls or finish or len(text) > _THINK_SSE_HOLD_MAX:
+                mode = "pass"
+                return _flush()
+            return []
+        after = text[closed.end():].lstrip()
+        if not after and not calls:
+            if finish:
+                mode = "pass"
+                return _flush()              # nothing after the block: as it came
+            return []                        # closed; wait for what follows
+        inner = text[opened.end():closed.start()].strip()
+        out = [f for f, has in held if not has and f is not frame]
+        held.clear()
+        mode = "pass"
+        if inner:
+            out.append(_think_sse_frame(template, {"reasoning_content": inner}))
+        rest = {k: v for k, v in delta.items() if k != "content"}
+        if after:
+            rest["content"] = after
+        if rest or finish:
+            out.append(_think_sse_frame(obj, rest))
+        return out
+
+    try:
+        for chunk in chunks:
+            if mode == "pass":
+                if buf:
+                    yield buf
+                    buf = b""
+                yield chunk
+                continue
+            if not chunk:
+                continue
+            if not isinstance(chunk, (bytes, bytearray)):
+                chunk = str(chunk).encode("utf-8", "ignore")
+            buf += chunk
+            while mode != "pass":
+                cut = buf.find(b"\n\n")
+                if cut < 0:
+                    break
+                frame, buf = buf[:cut + 2], buf[cut + 2:]
+                for out in _step(frame):
+                    yield out
+            if mode == "pass" and buf:
+                yield buf
+                buf = b""
+            elif len(buf) > _SSE_FRAME_CAP:
+                mode = "pass"
+                for out in _flush():
+                    yield out
+                yield buf
+                buf = b""
+    except GeneratorExit:
+        # The client left: close the relay below now, so its own cleanup (the
+        # "cancelled" activity row, the upstream socket) runs at once.
+        try:
+            getattr(chunks, "close", lambda: None)()
+        except Exception:                                        # noqa: BLE001
+            pass
+        raise
+    except Exception:                                            # noqa: BLE001
+        mode = "pass"
+        for out in _flush():
+            yield out
+        if buf:
+            yield buf
+            buf = b""
+        yield from chunks
+        return
+    for out in _flush():
+        yield out
+    if buf:
+        yield buf
 
 
 def _recap_text(dropped):
@@ -32086,6 +32286,23 @@ def _sk_loop_messages(messages, tools):
 _RESCUE_DEFAULT = ("inception",)
 _RESCUE_RESERVE_S = 45.0
 _RESCUE_HOPS = 1
+# The rescue STEPS IN SOONER once the strong models have shown they are failing in THIS
+# walk (2026-11-07, owner: "go fix" after "Mercury steps in after ~3.5 min"). MEASURED in
+# a real OpenCode run: two steps were rescued at ~200 s each, because the strong hops ran
+# the clock down to the 45 s reserve. Now, after a hop of the walk has failed, the rescue
+# hop goes next when (a) a provider stalled and half the clock is gone, or (b) no hop left
+# ahead of it is healthy (each one stalled or demoted in this walk, failed recently, junk-
+# benched or, on a tool turn, measured sick). It still never opens a turn, never runs
+# while a healthy strong hop is waiting in the first half of the clock, and is still only
+# one hop. Flag `rescue_early_jump` (default on); off = only the 45 s reserve, as before.
+_RESCUE_EARLY_SHARE = 0.5
+
+
+def _rescue_early_on():
+    try:
+        return bool(config.get_flag("rescue_early_jump", True))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _rescue_pids():
@@ -40479,6 +40696,8 @@ class _ChainClock:
         original = list(chain or ())
         self._rest = rest = list(original)
         self._rescue = _rescue_pids()
+        self._walk_t0 = time.monotonic()
+        self._walk_failed = 0
         try:
             noticed = _relay_notice_servers()
             # Fail-open: a backend is only skipped while something else is left.
@@ -40559,13 +40778,47 @@ class _ChainClock:
 
     def _rescue_jump(self, rest):
         """The index of the rescue hop once only its reserve of the clock is left,
-        else None: a turn the strong models lost still gets answered."""
+        else None: a turn the strong models lost still gets answered.
+
+        Earlier (see _RESCUE_EARLY_SHARE, flag `rescue_early_jump`), but only after a
+        hop of THIS walk has failed: once a provider stalled and half the clock is
+        gone, or once nothing healthy is left ahead of it. Never on a first hop."""
         rp = getattr(self, "_rescue", None)
         if not rp or getattr(self, "deadline_at", None) is None:
             return None
-        if self.left() > _RESCUE_RESERVE_S:
+        k = next((k for k, e in enumerate(rest) if e[0] in rp), None)
+        if k is None:
             return None
-        return next((k for k, e in enumerate(rest) if e[0] in rp), None)
+        left = self.left()
+        if left <= _RESCUE_RESERVE_S:
+            return k
+        try:
+            if not getattr(self, "_walk_failed", 0) or not _rescue_early_on():
+                return None
+            t0 = getattr(self, "_walk_t0", None)
+            if self._stalled and t0 is not None:
+                gone = max(0.0, time.monotonic() - t0)
+                if gone >= _RESCUE_EARLY_SHARE * (gone + max(0.0, left)):
+                    return k
+            if not any(self._rescue_healthy_hop(e) for e in rest if e[0] not in rp):
+                return k
+        except Exception:                                        # noqa: BLE001
+            pass
+        return None
+
+    def _rescue_healthy_hop(self, entry):
+        """True when this chain entry could still answer as far as the hub knows:
+        not stalled or demoted in this walk, no fresh failure, not benched, and on a
+        tool turn not measured sick. Unknown = healthy (never jumps on a guess)."""
+        try:
+            pid, model = entry[0], entry[1]
+            if self._demoted(pid) or _recent_hop_failure(pid, model):
+                return False
+            if _is_pair_benched(pid, model):
+                return False
+            return not (self.tools and _tool_turn_sick(pid, model))
+        except Exception:                                        # noqa: BLE001
+            return True
 
     def _rescue_waiting(self, pid):
         """True while a rescue hop still waits behind this (other) provider's hop."""
@@ -40790,6 +41043,7 @@ class _ChainClock:
             self._net_hop_failed_locally(pid, model, host)
             return
         self._net_hop_failed_otherwise()
+        self._walk_failed = getattr(self, "_walk_failed", 0) + 1
         try:
             self._prov_secs[pid] = (self._prov_secs.get(pid, 0.0)
                                     + max(0.0, time.monotonic() - started))
@@ -52784,6 +53038,10 @@ def _chat_completions_uncached(body):
                                    prompt_text=_prompt_text_for_check(payload),
                                    last_prompt=_last_user_text_for_check(payload),
                                    tools_offered=has_tools, answer_gate=gated)
+                # A leaked leading <think> block goes to reasoning_content, AFTER the
+                # judge above has read the reply as written (_think_to_reasoning_sse);
+                # past its first characters the stream is the same bytes as before.
+                relay = _think_to_reasoning_sse(relay, _last_user_text_for_check(payload))
                 # A tools turn gets its frames checked; a plain chat stream keeps
                 # the zero-copy byte passthrough exactly as it was.
                 if has_tools:

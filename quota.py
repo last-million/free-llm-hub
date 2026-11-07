@@ -1344,6 +1344,17 @@ _MINUTE_429_CAP = 300.0     # a per-minute limit never benches anything longer
 # Provider error codes that mean "this model is full right now" (capacity), documented
 # by the provider. Only a documented code belongs here.
 _CAPACITY_CODES = frozenset({"model_concurrency"})   # dahl, /docs/api/ error table
+# Z.AI (pid "glm") sends every balance, plan, rate and overload error as HTTP 429 with a
+# numeric business `code` -- https://docs.z.ai/api-reference/api-code, read 2026-11-07.
+# Without these, "this MODEL needs a paid balance" (1113) or "not in your plan" (1311) read
+# as an unstated-scope 429 and benched the whole provider, the FREE GLM Flash models with it.
+_ZAI_PIDS = frozenset({"glm"})
+_ZAI_MODEL_CODES = frozenset({"1113", "1311"})       # this model needs money / a plan: park it only
+_ZAI_CAPACITY_CODES = frozenset({"1305"})            # "temporarily overloaded": capacity, key fine
+_ZAI_RATE_CODES = frozenset({"1302"})                # "Rate limit reached for requests": a minute
+_ZAI_HOUR_CODES = frozenset({"1308", "1316", "1318", "1320"})   # a usage cap that resets within hours
+_ZAI_DAY_CODES = frozenset({"1309", "1310", "1313", "1314", "1315",
+                            "1317", "1319", "1321"})            # the plan/key is out for days
 _HOUR_429_CAP = 3600.0
 _WIN_DAY_RE = _re_429.compile(
     r"per[ _-]?day|perday|daily|\bRPD\b|\bTPD\b|per 24 ?h(?:ours?)?|/day\b|"
@@ -1565,6 +1576,25 @@ def classify_429(pid: str, headers=None, body=None, model: str = None,
         if isinstance(code, str) and code.strip().lower() in _CAPACITY_CODES:
             out["source"] = "concurrency"
             scope, window = "model", "minute"
+
+        # 3c) Z.AI business codes (see _ZAI_PIDS): matched on the documented code only.
+        if pid in _ZAI_PIDS and isinstance(code, (str, int)) and not isinstance(code, bool):
+            zc = str(code).strip()
+            if zc in _ZAI_CAPACITY_CODES:
+                out["source"] = "concurrency"
+                scope, window = "model", "minute"
+            elif zc in _ZAI_MODEL_CODES:
+                out["source"] = "zai"
+                scope, window = "model", "day"
+            elif zc in _ZAI_RATE_CODES:
+                out["source"] = "zai"
+                window = "minute"
+            elif zc in _ZAI_HOUR_CODES:
+                out["source"] = "zai"
+                scope, window = "account", "hour"
+            elif zc in _ZAI_DAY_CODES:
+                out["source"] = "zai"
+                scope, window = "account", "day"
 
         # 4) Generic wording and headers.
         text = " ".join(t for t in (msg, meta_raw) if t)

@@ -7842,7 +7842,7 @@ Covered by `tests/test_capacity_429.py` (15), `tests/test_documented_rate_hints.
   freemodel.in refused connections; several Chinese providers' free quota is a ONE-OFF grant (qwen 1M tokens/90
   days Singapore only, baidu 1M/3 months, tencent 1M/1 year), not a renewing allowance; Z.AI (glm) reports balance
   AND rate errors all as HTTP 429 with business codes (1113 insufficient balance, 1302 rate, 1305 overload, 1313
-  fair-usage), never 402 -- the hub does not read those codes yet (open).
+  fair-usage), never 402 -- SUPERSEDED 2026-11-07: the hub reads them now (see "Z.AI's error codes are read").
 - **Capacity 429 (dahl).** Documented: `429 model_concurrency` = "This model is at concurrency capacity ... Retry
   after `Retry-After` or switch `model`" (inference.dahl.global/docs/api/). MEASURED live: the hub read it as scope
   `account` (the message says "paid accounts ... create an account"), so `_apply_429` threw the WHOLE provider into
@@ -9993,6 +9993,7 @@ because it is the fastest." Setting `rescue_only_provider_ids` (default `["incep
   It does not take an image turn, a tool turn it cannot do, or a request over its window.
 - **Limits.** A turn is as slow with it on as with it off, until the rescue: it only catches failures.
   The swarm tiers' roles walk has 4 actor hops, so it reaches the rescue through the `best` fallback.
+  SUPERSEDED 2026-11-07 for the timing: see "The rescue steps in sooner once the strong models fail".
 
 ## Benchmark scores survive the feed (2026-11-07)
 
@@ -10045,4 +10046,62 @@ dialect in `tool_rescue` (it only turns a typed call into a real one, or into a 
 - **Limits.** A fenced ```json block on a stream is left to the older detector (a failed hop, not a rescue).
   A repaired command runs as the model typed it, through the CLI's normal permissions; if the repair guessed
   wrong the command fails and the model sees why. A call whose OUTER JSON is broken is not repaired: it fails
-  the hop. A leaked `<think>` in a streamed reply is still shown as text.
+  the hop. A leaked `<think>` in a streamed reply is still shown as text (SUPERSEDED for the chat protocol:
+  see "A leaked <think> in a streamed chat reply becomes reasoning").
+
+
+## The rescue steps in sooner once the strong models fail (2026-11-07)
+
+Covered by `tests/test_rescue_early_jump.py`. Owner, after "Mercury steps in after ~3.5 min": "go fix".
+MEASURED in a real OpenCode run: two steps were rescued at ~200 s each, because the strong hops ran the clock
+down to the 45 s reserve. Flag `rescue_early_jump` (default on); off = the reserve rule alone, as before.
+
+- `_ChainClock._rescue_jump` still jumps when only `_RESCUE_RESERVE_S` is left. Now ALSO, but only after a hop of
+  THIS walk has failed (`_walk_failed`, counted in `_close_hop`; a local-network failure does not count): (a) a
+  provider stalled in the walk and half the clock is gone (`_RESCUE_EARLY_SHARE` 0.5 of elapsed + left, so an
+  extended deadline counts), or (b) no hop left ahead of the rescue is healthy (`_rescue_healthy_hop`: stalled or
+  demoted in this walk, a fresh `_recent_hop_failure`, junk-benched, or on a tool turn `_tool_turn_sick`).
+- Never on a first hop, never in the first half while a healthy strong hop waits, still one hop, nothing dropped
+  (the strong hops it jumped over still run after it if it fails). A health check that raises reads as healthy:
+  it never jumps on a guess.
+- Limits. When the first strong hop stalls for most of the clock (a slow thinker's long peek), (a) still waits
+  for half of it. The quality cost is the owner's call: a turn the strong models are losing is answered by a
+  weak, fast model sooner.
+
+## A leaked <think> in a streamed chat reply becomes reasoning (2026-11-07)
+
+Covered by `tests/test_think_stream_to_reasoning.py` (28, incl. the real chat handler end to end). MEASURED in
+a real OpenCode run: each step's reply opened with `<think>...</think>` in the CONTENT and OpenCode printed it
+as the answer's text. Flag `strip_leaked_think_stream` (default on).
+
+- `_think_to_reasoning_sse` wraps the chat stream AFTER `_proxy_sse`, so the answer judge, the relay-gag check
+  and the announcement checks still read the reply as the model wrote it; only what reaches the client changes.
+- Same rules as the non-stream `_strip_leaked_think_msg`: a block at the very START only (`<think>` /
+  `<thinking>`, any case, after optional whitespace, a tag split across frames is read), moved to
+  `reasoning_content` deltas (never thrown away), and only once something follows it (text or a tool call). Until
+  then the block is HELD (<= `_THINK_SSE_HOLD_MAX`, 32K chars); a reply that ends inside it, or with nothing after
+  it, or that turns odd (a usage frame, a tool call inside an unclosed block) is sent exactly as it came. A reply
+  that does not open with the tag passes untouched, byte for byte, after its first characters. Any provider (the
+  text moves, nothing is erased); never when the user's own prompt is about these tags.
+- Limits. Chat protocol only (OpenCode, qwen, kimi, pi, openclaw, hermes, aider). On `/v1/responses` (codex)
+  and `/v1/messages` (Claude Code) the end-of-stream checks read the text, so their streams are unchanged.
+  Thinking that appears later in a reply (not at its start) is still text. While the block is held the client
+  sees nothing (OpenCode shows its spinner) instead of the thinking scrolling by.
+
+## Z.AI's error codes are read (2026-11-07)
+
+Covered by `tests/test_zai_error_codes.py`. Z.AI (pid `glm`) sends balance, plan, rate and overload errors all as
+HTTP 429 with a numeric business `code`; read on https://docs.z.ai/api-reference/api-code (2026-11-07) before the
+change. Before it, "Insufficient balance or no resource package" (1113) was a 429 of unstated scope: the key was
+skipped until the day reset and the whole provider throttled, so asking for one PAID GLM model took the FREE GLM
+Flash models out with it.
+
+- `quota.classify_429`, step 3c, pid `glm` only, matched on the documented code (string or number), never wording:
+  1113 / 1311 (needs a balance / not in the plan) -> scope model, window day: that model parks, the key is
+  skipped <= 60 s, free models keep serving. 1305 (overloaded) -> capacity (`source` "concurrency", like dahl's
+  `model_concurrency`: no reliability strike, key fine). 1302 (request rate) -> a minute. 1308 / 1316 / 1318 /
+  1320 (usage caps that reset within hours) -> account, hour. 1309 / 1310 / 1313 / 1314 / 1315 / 1317 / 1319 /
+  1321 (expired plan, weekly/monthly caps, fair-use block) -> account, day.
+- No flag: it only reads documented codes more precisely. Another provider sending the same number is untouched.
+- Limits. The "will reset at <time>" in 1308/1310 is not parsed (the window default applies). A stream that ends
+  abnormally may carry no code at all (the docs say so); that keeps the generic reading.

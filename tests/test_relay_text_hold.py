@@ -341,7 +341,9 @@ def test_e2e_a_pool_of_gagged_relays_cannot_burn_the_request(quiet, monkeypatch)
     assert calls == [RELAY_A, RELAY_B, RELAY_C]
     assert r.headers.get("X-Free-LLM-Hub-Provider") == "g4f"
     text, tools = _read(body)
-    assert text == GAGGED and tools == []   # the third gagged reply is served, not walked again
+    # the third gagged reply is served, not walked again (its leading <think> reaches the
+    # client as reasoning_content, see _think_to_reasoning_sse)
+    assert text == BODY and tools == []
 
 
 def test_e2e_the_flag_off_serves_the_gagged_reply_as_before(quiet, monkeypatch):
@@ -353,7 +355,8 @@ def test_e2e_the_flag_off_serves_the_gagged_reply_as_before(quiet, monkeypatch):
     body = r.get_data().decode("utf-8")
     assert r.headers.get("X-Free-LLM-Hub-Provider") == "g4f"
     text, tools = _read(body)
-    assert text == GAGGED and tools == []   # the old behaviour: the gagged reply is served
+    # the old behaviour: the gagged reply is served (its leading <think> as reasoning_content)
+    assert text == BODY and tools == []
     assert calls == [RELAY_A]
 
 
