@@ -414,21 +414,37 @@ _ORTHOGONAL = [
 ]
 
 
-def match(text, pick_wait=0.0):
+def settles(ids):
+    """True when `ids` name a task of their own: a built-in DOMAIN brief other than the
+    ones that do not settle a request (_UNSETTLED). Ride-along briefs, the user's own
+    skills and ECC skills do not: they are not what the task IS about."""
+    domain = {n for n, _rx, _b in _BRIEFS}
+    return any(isinstance(i, str) and i in domain and i not in _UNSETTLED
+               for i in (ids or ()))
+
+
+def match(text, pick_wait=0.0, extra=()):
     """[(name, brief)] for the domains this text is actually about, in any
     language: the regexes first, and when they find no domain the picker's verdict
     (see set_skill_picker). `pick_wait` > 0 lets this call ask for one and wait that
-    long; 0 only reads a verdict that is already there.
+    long; 0 only reads a verdict that is already there. `extra`: skill ids the caller
+    already knows apply (a conversation's own skills, see app._sk_inherit), merged
+    in as if the picker had named them; disabled ones still drop out.
 
     Capped at MAX_BRIEFS, most specific first: "build me an online store landing
     page" should not get five overlapping briefs. WEB_DESIGN always keeps a slot: it
     carries the design rules and it decides whether DESIGN_FIRST and WEB_MOTION ship,
     so losing it to LANDING + ECOMMERCE or SHIP + LANDING dropped all of them on
     exactly the pages that need them most (MEASURED 2026-11-07)."""
-    if not isinstance(text, str) or not text.strip():
+    extra = tuple(i for i in (extra or ()) if isinstance(i, str) and i)
+    if not isinstance(text, str):
+        text = ""
+    if not text.strip() and not extra:
         return []
     disabled, custom, ecc_on = _skill_state()
-    picked = _picked(text, 0.0 if has_domain(text, disabled) else pick_wait)
+    picked = (_picked(text, 0.0 if has_domain(text, disabled) else pick_wait)
+              if text.strip() else ())
+    picked = tuple(picked) + tuple(i for i in extra if i not in picked)
     # An authorized-testing task replaces the build briefs (_TESTING_REPLACES);
     # with the app_testing skill switched off nothing is replaced.
     skip = (_TESTING_REPLACES if "app_testing" not in disabled
@@ -778,10 +794,10 @@ _LOOP_HEAD = ("STILL APPLIES (the user's task has not changed; keep following th
               "skills while you work)")
 
 
-def loop_message(text):
+def loop_message(text, extra=()):
     """The task's skills for a hop inside a running tool loop, or None. Reads a
     finished picker verdict only: a hop in the loop never waits."""
-    hits = match(text)
+    hits = match(text, extra=extra)
     if not hits:
         return None
     ortho = {n for n, _rx, _b in _ORTHOGONAL}
@@ -800,7 +816,7 @@ def loop_message(text):
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
-def system_message(text, tools=True, session_id=None, pick_wait=0.0):
+def system_message(text, tools=True, session_id=None, pick_wait=0.0, extra=()):
     """One system message for `text`, or None when nothing applies.
 
     `tools` says whether the CALLER can actually execute a check. It selects
@@ -817,7 +833,7 @@ def system_message(text, tools=True, session_id=None, pick_wait=0.0):
     VERIFY_RUN names its own check and does not reference "the ANTI lines
     above", so it stands alone with no domain brief present. VERIFY_READ does
     reference ANTI lines, so the tools=False path stays gated on a real hit."""
-    hits = match(text, pick_wait)
+    hits = match(text, pick_wait, extra=extra)
     # The publish question (web/UI deliverable, tool-carrying, flag on, not a
     # Multi helper) rides right after the briefs and BEFORE the loop: the loop
     # must stay last (its "every brief above" back-references), and this is
@@ -856,5 +872,5 @@ def system_message(text, tools=True, session_id=None, pick_wait=0.0):
     return {"role": "system", "content": body}
 
 
-def names(text):
-    return [n for n, _b in match(text)]
+def names(text, extra=()):
+    return [n for n, _b in match(text, extra=extra)]

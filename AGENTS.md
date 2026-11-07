@@ -10105,3 +10105,42 @@ Flash models out with it.
 - No flag: it only reads documented codes more precisely. Another provider sending the same number is untouched.
 - Limits. The "will reset at <time>" in 1308/1310 is not parsed (the window default applies). A stream that ends
   abnormally may carry no code at all (the docs say so); that keeps the generic reading.
+
+
+## A conversation keeps its skills, in every terminal CLI (2026-11-07)
+
+Covered by `tests/test_skills_keep_with_the_conversation.py` (38, incl. OpenCode / Codex / Claude Code
+through the real handlers and a negative control). Owner: "are skills also used inside terminal CLIs? I
+don't think so." He was right. MEASURED on his terminal OpenCode session (structure only: counts, lengths
+and matched skill ids, no text read): one conversation since 10-27, 265 user messages, 13 compactions.
+Its opening request matched App & API testing + Security; every request of the last hour got NO skill.
+
+- **Why.** Skills were chosen from the text of the CURRENT request only (`_brief_text`). A long terminal
+  session sends short follow-ups, and the CLI's own compaction had taken the opening request out of what
+  it sends (33 follow-ups since the last compaction, none naming the task by itself). A restart also
+  forgot the picker's verdicts (memory only).
+- **The fix** (`_sk_inherit`, flag `skill_conversation_memory`, default on): the skills a conversation's
+  task named are remembered per conversation (`_cmem_conv()`, i.e. `ctxwin.conversation_key`: OpenCode's
+  session id, Codex's `prompt_cache_key`, Claude Code's session header, a Build session), on disk in
+  `state_dir()/conversation-skills.json` (key hashed, skill ids only, never the user's text; 30-day TTL,
+  500 rows, rewritten only on a change or hourly). A request whose own text names no task of its own keeps
+  them (`craft.match(..., extra=)`, also `names`, `loop_message`, `system_message`), on the opening hop and
+  inside the tool loop. A text that names a new task (`craft.settles`: a built-in domain brief other than
+  ship / ecommerce) replaces them; a ride-along brief (security, seo, images), a user skill or an ECC skill
+  does not. A switched-off skill never ships even when remembered.
+- **A session that began before this** (nothing remembered yet): the request's earlier instructions are
+  read newest first (`_SK_CONV_SCAN` 30) for one that names the task; failing that, the newest
+  `_SK_CONV_CTX` (8) are sent TOGETHER to the picker once (cached; the verdict reaches the next hop), and a
+  verdict lost to a restart is asked again in the background.
+- Activity shows the kept skills like any other (`_sk_note(text, extra)`).
+- **Limits.** The first hop after a cold start of an old session may still have none (the picker's answer
+  reaches the next hop). Sub-agents sharing a parent's session id (Claude Code Task) share its skills when
+  their own text names none. A follow-up that names a new domain by accident (a "write a python script"
+  inside a testing session matches Programming) switches the conversation's skills to it.
+
+## Default blocklist, owner's 2026-11-07 additions
+
+`_DEFAULT_BLOCKED_IDENTITIES` gained `lfm-3-1.7b` and `nemotron-3-ultra-550b-a55b` (he blocked the latter
+on every host that lists it; the shipped bare `nemotron-3-ultra` is an exact identity that does not cover
+that spelling). `_seed_default_blocks` delivers them once to every install. His Nemotron 3.5 Lightning
+blocks are not shipped: the 3.5 chat generation stays allowed for every install (2026-10-23).

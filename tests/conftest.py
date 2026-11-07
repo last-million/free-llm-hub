@@ -820,6 +820,8 @@ def _skill_work_and_rescue_off_unless_tested(request, monkeypatch):
         monkeypatch.setattr(app, "_brief_every_turn_on", lambda: False)
     if name != "test_rescue_only_provider":
         monkeypatch.setattr(app, "_rescue_pids", lambda: frozenset())
+    if name != "test_skills_keep_with_the_conversation":
+        monkeypatch.setattr(app, "_sk_conv_on", lambda: False)
     yield
 
 

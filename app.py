@@ -16507,12 +16507,16 @@ def _apply_craft_brief(messages, agentic=False, tools=None):
             text = _brief_text(messages, wait)
             if wait and _SK_OFFERED.get():
                 _sk_pick(text, wait)    # the CLI's own skills are always worth a look
+            # The conversation's own skills when this text names no task of its own
+            # (_sk_inherit): a short follow-up keeps the task it continues.
+            extra = _sk_inherit(text, messages)
             # `agentic` is bool(payload["tools"]) -- the only honest signal for
             # whether this caller can actually RUN a check. It picks which VERIFY
             # block ships, so a tool-less client is never told to run anything.
-            brief = craft.system_message(text or "", tools=bool(agentic), pick_wait=wait)
+            brief = craft.system_message(text or "", tools=bool(agentic), pick_wait=wait,
+                                         extra=extra)
             hint = _sk_tool_hint(tools, messages, text)
-            _sk_note(text)
+            _sk_note(text, extra)
         finally:
             _SK_OFFERED.reset(cv)
         extra = [m for m in (brief, hint) if m]
@@ -31239,6 +31243,14 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     # The owner's own blocklist, re-checked 2026-10-23 against the shipped set:
     # Code Llama 70B (Jan 2024), an old code model every current one outranks.
     "codellama-70b",
+    # OWNER DECISION 2026-11-07: his newer blocks ship too. LFM 3 1.7B (a tiny model),
+    # and Nemotron 3 Ultra by its full host id: he switched it off on every provider
+    # that lists it, and the bare "nemotron-3-ultra" above is an exact identity that
+    # does not cover that spelling (same as nemotron-3-super-120b-a12b). His Nemotron
+    # 3.5 Lightning blocks are NOT shipped: the 3.5 chat generation is allowed for
+    # every install (2026-10-23, nemotron_gen); they stay on his own machine.
+    "lfm-3-1.7b",
+    "nemotron-3-ultra-550b-a55b",
 })
 # Identities this hub SHIPPED as blocked once and no longer does (the 3.5 chat
 # variants of Nemotron, 2026-10-23: nemotron_gen). Shipping is a one-way door --
@@ -32215,12 +32227,13 @@ def _sk_tool_hint(tools, messages, text):
         return None
 
 
-def _sk_note(text):
+def _sk_note(text, extra=()):
     """Show on the Activity row which skills this request got: "does it use the
     skills?" should be something you can SEE. One log line per request."""
     try:
         friendly = {i: n for i, n, _d in skills.BUILTIN}
-        labels = [friendly.get(n, n.split(":", 1)[-1]) for n in craft.names(text or "")]
+        labels = [friendly.get(n, n.split(":", 1)[-1])
+                  for n in craft.names(text or "", extra=extra)]
         labels += [i[4:] for i in _sk_pick(text) if i.startswith("cli:")]
         if not labels:
             return
@@ -32235,6 +32248,140 @@ def _sk_note(text):
         pass
 
 
+# A CONVERSATION KEEPS ITS SKILLS (2026-11-07, owner: "are skills used inside terminal
+# CLIs? I don't think so"). MEASURED on his terminal OpenCode session (one conversation
+# since 10-27, 265 user messages): the opening request matched App & API testing +
+# Security, every request of the last hour got NO skill. The hub chose skills from the
+# text of the CURRENT request only, and in a long terminal session that text is a
+# short follow-up ("continue", "check the next one") while the CLI's own compaction has
+# taken the opening request out of what it sends. A restart also forgot the picker's
+# verdicts (memory only). So: the skills a conversation's task named are remembered per
+# conversation (ctxwin.conversation_key: OpenCode / Codex / Claude Code / Build alike),
+# on disk, and a request whose own text names no task of its own keeps them. A request
+# that names a new task (craft.settles) replaces them. Only skill ids are stored (the
+# key is hashed), never the user's text. Flag `skill_conversation_memory` (default on).
+_SK_CONV_TTL = 30 * 86400
+_SK_CONV_MAX = 500
+_SK_CONV_LOCK = threading.Lock()
+_SK_CONV = None                     # {hashed key: {"ids": [...], "at": epoch}}, loaded lazily
+
+
+def _sk_conv_on():
+    try:
+        return bool(config.get_flag("skill_conversation_memory", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _sk_conv_path():
+    return os.path.join(config.state_dir(), "conversation-skills.json")
+
+
+def _sk_conv_table():
+    """The table, loaded once (caller holds _SK_CONV_LOCK). A bad file is an empty table."""
+    global _SK_CONV
+    if _SK_CONV is None:
+        rows = {}
+        try:
+            with open(_sk_conv_path(), encoding="utf-8") as fh:
+                raw = json.load(fh)
+            now = time.time()
+            for k, v in ((raw or {}).get("rows") or {}).items():
+                ids = [i for i in (v or {}).get("ids") or () if isinstance(i, str)][:12]
+                at = (v or {}).get("at")
+                if ids and isinstance(at, (int, float)) and now - at < _SK_CONV_TTL:
+                    rows[str(k)] = {"ids": ids, "at": float(at)}
+        except Exception:                                        # noqa: BLE001
+            pass
+        _SK_CONV = rows
+    return _SK_CONV
+
+
+def _sk_conv_save(rows):
+    """Atomic write (caller holds _SK_CONV_LOCK). Never raises."""
+    try:
+        path = _sk_conv_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"v": 1, "rows": rows}, fh)
+        os.replace(tmp, path)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sk_conv_key(conv):
+    return hashlib.sha256(conv.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+_SK_CONV_SCAN = 30                  # earlier instructions read when nothing is remembered yet
+_SK_CONV_CTX = 8                    # ... of which the picker reads the newest, together
+
+
+def _sk_conv_remember(rows, key, ids, now):
+    """Store `ids` for `key` (caller holds _SK_CONV_LOCK); writes only on a change, or
+    hourly to keep a live conversation from expiring."""
+    row = rows.get(key)
+    if row and row.get("ids") == ids[:12] and now - row.get("at", 0) <= 3600:
+        return
+    rows[key] = {"ids": ids[:12], "at": now}
+    if len(rows) > _SK_CONV_MAX:
+        for k in sorted(rows, key=lambda k: rows[k]["at"])[:len(rows) - _SK_CONV_MAX]:
+            rows.pop(k, None)
+    _sk_conv_save(rows)
+
+
+def _sk_inherit(text, messages=None):
+    """Skill ids this request gets from its conversation (see above), or (). Remembers
+    the skills of a text that names a task of its own. With nothing remembered yet, the
+    request's earlier instructions (newest first, at most _SK_CONV_SCAN) are read for
+    the task: a session that began before this feature, or before the CLI's compaction
+    kept only recent turns. Reads a finished picker verdict only; never waits, never
+    raises."""
+    try:
+        if not _sk_conv_on():
+            return ()
+        conv = _cmem_conv()
+        if not conv:
+            return ()
+        own = [i for i in craft.names(text or "") if not i.startswith("cli:")]
+        key = _sk_conv_key(conv)
+        now = time.time()
+        if craft.settles(own):
+            with _SK_CONV_LOCK:
+                _sk_conv_remember(_sk_conv_table(), key, own, now)
+            return ()
+        with _SK_CONV_LOCK:
+            row = dict(_sk_conv_table().get(key) or {})
+        if row and now - row.get("at", 0) < _SK_CONV_TTL:
+            return tuple(i for i in row["ids"] if i not in own)
+        reals = _brief_reals(messages)[-_SK_CONV_SCAN:] if messages else []
+        if text and not craft.has_domain(text):
+            # A verdict lost to a restart, for a loop whose instruction came before it:
+            # ask now (cached, never waits) so the next hop has one.
+            craft.start_picking(text)
+        for earlier in reversed(reals):
+            found = [i for i in craft.names(earlier) if not i.startswith("cli:")]
+            if craft.settles(found):
+                with _SK_CONV_LOCK:
+                    _sk_conv_remember(_sk_conv_table(), key, found, now)
+                return tuple(i for i in found if i not in own)
+        # No single instruction names the task (MEASURED: 33 short follow-ups since the
+        # last compaction). Read the recent ones TOGETHER: the picker gets them as one
+        # request (asked once, cached; the verdict reaches the next hop). Deterministic
+        # for one turn, so every hop of the turn looks up the same verdict.
+        ctx = "\n".join(reals[-_SK_CONV_CTX:])
+        if len(reals) > 1 and ctx.strip():
+            found = [i for i in craft.names(ctx) if not i.startswith("cli:")]
+            if craft.settles(found):
+                with _SK_CONV_LOCK:
+                    _sk_conv_remember(_sk_conv_table(), key, found, now)
+                return tuple(i for i in found if i not in own)
+            craft.start_picking(ctx)
+        return ()
+    except Exception:                                            # noqa: BLE001
+        return ()
+
+
 def _sk_loop_messages(messages, tools):
     """The task's skills for a hop INSIDE a running tool loop (see
     craft.loop_message): [] when none apply, on a CLI's own compaction request, or
@@ -32247,10 +32394,12 @@ def _sk_loop_messages(messages, tools):
             return []
         cv = _SK_OFFERED.set(_sk_offered(tools, messages))
         text = _brief_text(messages)
-        if not text:
+        extra = _sk_inherit(text, messages)
+        if not text and not extra:
             return []
-        out = [m for m in (craft.loop_message(text), _sk_tool_hint(tools, messages, text)) if m]
-        _sk_note(text)
+        out = [m for m in (craft.loop_message(text, extra=extra),
+                           _sk_tool_hint(tools, messages, text)) if m]
+        _sk_note(text, extra)
         return out
     except Exception:                                            # noqa: BLE001
         return []
