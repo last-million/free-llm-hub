@@ -2626,7 +2626,8 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
     try:
         # session_id lets the publish question skip a Multi helper (app's
         # predicate): the PUBLISH line asks the USER, and a helper has none.
-        brief = craft.system_message(text or "", session_id=session_id)
+        brief = craft.system_message(text or "", session_id=session_id,
+                                     pick_wait=craft.PICK_WAIT)
         memory_block = (memory_block or "").strip()
         name = brief_filename(session_id)
         path = os.path.join(project_dir, name)

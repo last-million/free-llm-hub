@@ -225,6 +225,12 @@ TABLE.update({
 # flip. A 9-point gap (GLM 5.3 42 vs GLM 5.3 Flash 33) maps to 0.9, INSIDE the
 # band. AutomationBench is a sub-point tiebreak that never flips the TB4.0 order.
 TB_WEIGHT = 10.0
+# Artificial Analysis's Agentic Index, read live from OpenRouter's public catalog
+# (since 2026-11). It is NOT Terminal-Bench 4.0 and shares no scale with it: Qwen 3.8
+# 27B reads 45.8 there and 6 on TB4.0, GLM 5.3 53.1 against 42. So it never fills the
+# tb4 field. It only speaks for a model with NO table row, at half the weight, so a
+# feed-only model can never outrank one with real board evidence on this alone.
+FEED_WEIGHT = 5.0
 AUTO_WEIGHT = 1.0
 AGENTIC_MAX = TB_WEIGHT + AUTO_WEIGHT        # the bonus can never exceed this
 
@@ -474,6 +480,14 @@ def agentic_delta(ev):
     return d
 
 
+def feed_delta(index):
+    """Points for a model the TABLE does not cover, from the live Agentic Index.
+    0 with no figure. See FEED_WEIGHT."""
+    if index is None:
+        return 0.0
+    return FEED_WEIGHT * _clamp01(float(index) / 100.0)
+
+
 def general_rank(ev):
     """A 0..1 general-strength rank (AA + LMArena averaged), or None when the row
     carries neither. app maps this into the strong band."""
@@ -490,12 +504,13 @@ def general_rank(ev):
 
 
 def parse_openrouter_row(row):
-    """Best-effort KEYLESS enrichment: pull any agentic/coding evaluation field
-    an OpenRouter-catalog row (row['benchmarks']['artificial_analysis'] and a few
-    common shapes) exposes, mapped to our {tb4, automation, aa} keys. Returns {}
-    when none are present -- which is the case today, so the dated TABLE above is
-    what drives ranking until a keyless source publishes these sub-indexes. The
-    hook exists so that the day it does, no code change is needed. Never raises."""
+    """Best-effort KEYLESS read of an OpenRouter-catalog row
+    (row['benchmarks']['artificial_analysis'] and a few common shapes), mapped to our
+    {tb4, automation, aa} keys, plus `agentic_index` under its own name: AA's Agentic
+    Index is published there since 2026-11 but it is a different scale from TB4.0 (see
+    FEED_WEIGHT), so it must never land in `tb4`. Returns {} when nothing is present.
+    Not called by the hub's refresh: app._fetch_aa_scores_keyless reads the row itself.
+    Never raises."""
     out = {}
     try:
         bench = row.get("benchmarks") if isinstance(row, dict) else None
@@ -507,13 +522,15 @@ def parse_openrouter_row(row):
             if aa.get(k) is not None:
                 out["aa"] = float(aa[k])
                 break
-        # Agentic / terminal-coding sub-indexes, under several plausible names
-        # (none published keyless as of 2026-10-10 -- forward-compatible only).
+        # Terminal-Bench itself, under several plausible names (none published
+        # keyless so far -- forward-compatible only).
         for k in ("terminal_bench_4", "terminal_bench", "terminal_bench_4_0",
-                  "tb4", "tb_4", "agentic_coding_index", "agentic_index"):
+                  "tb4", "tb_4"):
             if aa.get(k) is not None:
                 out["tb4"] = float(aa[k])
                 break
+        if aa.get("agentic_index") is not None:
+            out["agentic_index"] = float(aa["agentic_index"])
         for k in ("automation_bench", "automationbench", "automation",
                   "automation_index"):
             if aa.get(k) is not None:

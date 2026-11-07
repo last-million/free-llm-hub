@@ -15186,6 +15186,8 @@
           (a.reasoning === 'deep'
             ? '<span class="af-src af-think deep" title="This model was asked for its highest reasoning effort">deep thinking</span>'
             : (a.reasoning ? '<span class="af-src af-think" title="This model reasons before it answers">reasoning</span>' : '')) +
+          /* The skills the hub gave the model on this request (any language). */
+          (a.skills && a.skills.length ? '<span class="af-src" title="Skills the hub gave the model on this request">skills: ' + esc(a.skills.join(', ')) + '</span>' : '') +
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
             '" data-ms="' + esc(numOr(a.duration_ms, 0)) + '">' + esc(fmtDuration(a.duration_ms)) + '</span>' +
           '<span class="af-status ' + statusClass + '"' + (statusTitle ? ' title="' + esc(statusTitle) + '"' : '') + '><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) +

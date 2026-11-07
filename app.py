@@ -92,6 +92,7 @@ import benchmarks
 import lowres
 import orchestrator
 import skills
+import skillpick
 import ecc
 import perfstats
 import learnstate
@@ -2366,6 +2367,7 @@ def _fetch_aa_scores_keyless():
     (morph-kimik3, llama-3.3-70b-versatile) keep their static tier score. Real
     measurement where it exists, an honest guess elsewhere."""
     raw = {}
+    agentic = {}
     try:
         resp = requests.get(_OPENROUTER_CATALOG_URL,
                             timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
@@ -2380,6 +2382,12 @@ def _fetch_aa_scores_keyless():
             _learn_thinking_from_row(None, row)
             bench = row.get("benchmarks")
             aa = (bench or {}).get("artificial_analysis") if isinstance(bench, dict) else None
+            ag = (aa or {}).get("agentic_index") if isinstance(aa, dict) else None
+            if ag is not None:
+                for slug in (row.get("id"), row.get("canonical_slug")):
+                    norm = _normalize_aa_slug(slug) if slug else ""
+                    if norm:
+                        agentic[norm] = max(agentic.get(norm, 0.0), float(ag))
             idx = (aa or {}).get("intelligence_index") if isinstance(aa, dict) else None
             if idx is None:
                 continue
@@ -2401,6 +2409,7 @@ def _fetch_aa_scores_keyless():
     if raw:
         _log.info("[aa] %d model scores from OpenRouter's public catalog (no key)",
                   len(raw))
+        _aa_agentic_fresh[0] = agentic
     return raw
 
 
@@ -2497,22 +2506,23 @@ def _static_benchmark_score(normalized_model_text):
     return None
 
 
-def _aa_score_for(model_id):
+def _aa_score_for(model_id, table=None):
     """Look up a confident Artificial Analysis score for a hub model id, or
     None if AA has never been fetched / has no matching model. Exact match on
     the normalized core string only — no loose substring fallback here, unlike
     _static_benchmark_score's family-tier matching, because a wrong AA match
     would silently misinform routing with a specific, confident-looking wrong
     number rather than an admittedly-generic tier guess."""
-    if not _aa_scores:
+    table = _aa_scores if table is None else table
+    if not table:
         return None
     norm = _normalize_aa_slug(model_id)
-    hit = _aa_scores.get(norm)
+    hit = table.get(norm)
     if hit is None and norm:
         # Still an EXACT key match: the same core under a vendor namespace a
         # pre-2026-09-27 cache kept joined on ('deepseekdeepseekv41flash').
         for v in _AA_LEGACY_VENDOR_KEYS:
-            hit = _aa_scores.get(v + norm)
+            hit = table.get(v + norm)
             if hit is not None:
                 break
     if hit is None and norm:
@@ -2522,7 +2532,7 @@ def _aa_score_for(model_id):
         # 'nemotron-3.5-super-vl-120b-a12b' scored 32 while the same weights on
         # openrouter ('nemotron-3.5-super-vl:free') scored 76 from AA.
         for alt in _aa_alt_slugs(model_id):
-            hit = _aa_scores.get(alt)
+            hit = table.get(alt)
             if hit is not None:
                 break
     return hit
@@ -2663,14 +2673,63 @@ def _generic_predecessor_score(model_id):
         return None
 
 
+# A SCORE THE FEED DROPS IS KEPT (2026-11-07). MEASURED: on 2026-10-28 OpenRouter's feed
+# went from 421 to 74 scores (a re-scoring, by the look of it: the figures moved and the
+# count has been climbing since, 129 now), and each refresh REPLACED the table, so 347
+# scores vanished in one fetch and the models behind them fell back to a family guess.
+# A figure a feed no longer lists is not wrong, it is old: it stays for AA_KEEP_SECONDS
+# after it was last seen. Hub-scale values, so kept and fresh ones compare directly.
+# Flag `aa_keep_scores`; off = the old replace, and the old file shape.
+AA_KEEP_SECONDS = 45 * 86400
+_aa_seen = {}            # normalized slug -> when the feed last listed it
+_aa_agentic = {}         # normalized slug -> AA Agentic Index (benchmarks.feed_delta)
+_aa_agentic_fresh = [{}]
+
+
+def _aa_merge_kept(new, old, seen, last_refresh, now):
+    """(`new` plus what is still young in `old`, {slug: last seen}). Pure."""
+    merged = dict(new)
+    stamps = {k: now for k in new}
+    for k, v in (old or {}).items():
+        if k in merged:
+            continue
+        at = (seen or {}).get(k) or last_refresh or now
+        if now - at < AA_KEEP_SECONDS:
+            merged[k] = v
+            stamps[k] = at
+    return merged, stamps
+
+
+def _aa_agentic_for(model_id):
+    """The live Agentic Index for a model, or None. Exact key match only, like the
+    score lookup. Never raises."""
+    try:
+        return _aa_score_for(model_id, _aa_agentic) if _aa_agentic else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _aa_refresh_once():
-    global _aa_scores, _aa_last_refresh
+    global _aa_scores, _aa_last_refresh, _aa_seen, _aa_agentic
     scores = _fetch_aa_scores()
     if scores:
+        now = time.time()
+        keep = config.get_flag("aa_keep_scores", True)
+        fresh = _aa_agentic_fresh[0]
         with _aa_cache_lock:
+            cache = {"fetched_at": now}
+            if keep:
+                scores, _aa_seen = _aa_merge_kept(scores, _aa_scores, _aa_seen,
+                                                  _aa_last_refresh, now)
+                cache["seen"] = _aa_seen
+                if fresh and config.get_flag("aa_agentic_feed", True):
+                    _aa_agentic = dict(fresh)
+                if _aa_agentic:
+                    cache["agentic"] = _aa_agentic
+            cache["scores"] = scores
             _aa_scores = scores
-            _aa_last_refresh = time.time()
-            _save_aa_cache({"fetched_at": _aa_last_refresh, "scores": scores})
+            _aa_last_refresh = now
+            _save_aa_cache(cache)
         _log.info("[aa] refreshed %d model scores from Artificial Analysis", len(scores))
 
 
@@ -2678,9 +2737,11 @@ def _aa_refresh_loop():
     # Load whatever was cached from a previous run immediately (no network wait).
     cached = _load_aa_cache()
     if isinstance(cached.get("scores"), dict):
-        global _aa_scores, _aa_last_refresh
+        global _aa_scores, _aa_last_refresh, _aa_seen, _aa_agentic
         _aa_scores = cached["scores"]
         _aa_last_refresh = cached.get("fetched_at") or 0.0
+        _aa_seen = cached.get("seen") if isinstance(cached.get("seen"), dict) else {}
+        _aa_agentic = cached.get("agentic") if isinstance(cached.get("agentic"), dict) else {}
     time.sleep(5)  # let the server finish booting before the first live fetch
     while True:
         if config.get_aa_api_key():
@@ -3062,7 +3123,13 @@ def _ev_agentic_bonus(model_id):
     AutomationBench as a sub-point tiebreak). 0 for a model with no agentic
     evidence -- so a model the boards do not cover keeps exactly today's score."""
     try:
-        return benchmarks.agentic_delta(benchmarks.agentic_evidence(model_id))
+        ev = benchmarks.agentic_evidence(model_id)
+        if ev is not None or not _aa_agentic:
+            return benchmarks.agentic_delta(ev)
+        # No board row: the live Agentic Index speaks for it, on its own scale
+        # (benchmarks.FEED_WEIGHT). It earns points, never the right to lead a tool
+        # turn: _ev_has_agentic_evidence reads the dated table only.
+        return benchmarks.feed_delta(_aa_agentic_for(model_id))
     except Exception:                                            # noqa: BLE001
         return 0.0
 
@@ -10690,6 +10757,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                     and not quota.model_status(pid, m)["exhausted"]):
                 entry = (_benchmark_score(pid, m), pid, m)
                 (cands if _context_ok(pid, m, est) else _compactable).append(entry)
+    # A RESCUE PROVIDER DOES NOT COMPETE (see _rescue_pids): every filter and every
+    # fail-open below runs as if it were switched off. _build_chain gives it the
+    # last hop.
+    _rp = _rescue_pids()
+    if _rp:
+        cands, _compactable = _hold_back_rescue(cands, _compactable, _rp)
     # JUNK BENCH (see _junk_bench_note): a pair caught answering garbage three
     # times in an hour sits out -- out of the chat pick, the spread band, the
     # agentic pool, quality_mode and every session pin (they all draw from
@@ -11935,7 +12008,7 @@ def _session_return_pair(key):
     try:
         with _quiet_lock:
             row = _session_return.get(key)
-        if row and row[2] > time.time():
+        if row and row[2] > time.time() and row[0] not in _rescue_pids():
             return (row[0], row[1])
     except Exception:                                            # noqa: BLE001
         pass
@@ -12843,7 +12916,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             seen.add((pid, m))   # ONE per provider: a fallback, not a fan-out
             if len(chain) >= MAX_HOPS:
                 break
-    return _ensure_permissive_hop(chain)
+    return _rescue_tail(_ensure_permissive_hop(chain), est, require_vision, require_tools,
+                        pinned, _veto)
 
 
 # Key-pool rotation: statuses that mean "this key is bad/throttled, try the
@@ -14760,6 +14834,7 @@ def _ctx_begin(body, messages, est, signal=True):
     # acting after a category switch) must be seen by the router's fresh pick, not only by the
     # chain built afterwards.
     _quiet_context(messages)
+    _sk_start(messages, body)
 
 
 def _ctx_fixed_part_est(messages, body):
@@ -16215,34 +16290,32 @@ def _apply_craft_brief(messages, agentic=False, tools=None):
             # Additive and ~150 tokens: a system message, never a rewrite of the
             # user's text or of the tool history.
             if agentic and config.get_flag("act_every_turn", True):
-                act = craft.act_message()
+                # ...and since 2026-11-07 the task's skills too (_sk_loop_messages):
+                # a brief is never stored in the CLI's history, so "already sent on
+                # turn 1" meant "gone by the time the model writes the HTML".
+                extra = _sk_loop_messages(messages, tools) + [craft.act_message()]
                 i = 0
                 while i < len(messages) and isinstance(messages[i], dict)                         and messages[i].get("role") == "system":
                     i += 1
-                return messages[:i] + [act] + messages[i:]
+                return messages[:i] + extra + messages[i:]
             return messages
-        # The LATEST instruction, not the first. It used to read users[0], so a
-        # session that opened with "hi" and later asked for a landing page
-        # matched the brief against "hi". On turn 1 these are the same message.
-        text = _message_text(users[-1])
-        # ...falling back to the instruction that OPENED the project when the
-        # latest one names no domain of its own. A follow-up is usually short
-        # ("now add the booking page") and says nothing about what is being
-        # built, but the project has not changed underneath it: the design
-        # rules that applied to the homepage apply to the booking page. Without
-        # this, every step after the first is built with no brief at all --
-        # which is the slop the user is asking to be rid of. Costs a brief on
-        # some small follow-ups too; that trade is deliberate, and the cheaper
-        # side of it is the one that produces the bad output.
-        if len(users) > 1 and not craft.match(text or ""):
-            first = _message_text(users[0])
-            if craft.match(first):
-                text = first + "\n" + (text or "")
-        # `agentic` is bool(payload["tools"]) -- the only honest signal for
-        # whether this caller can actually RUN a check. It picks which VERIFY
-        # block ships, so a tool-less client is never told to run anything.
-        brief = craft.system_message(text or "", tools=bool(agentic))
-        extra = [brief] if brief else []
+        # A real client's fresh instruction may wait a moment for the picker to read
+        # it (any language); a hub-internal call never does (see _sk_real_turn).
+        wait = skillpick.WAIT if _sk_on() and _sk_real_turn(messages) else 0.0
+        cv = _SK_OFFERED.set(_sk_offered(tools, messages))
+        try:
+            text = _brief_text(messages, wait)
+            if wait and _SK_OFFERED.get():
+                _sk_pick(text, wait)    # the CLI's own skills are always worth a look
+            # `agentic` is bool(payload["tools"]) -- the only honest signal for
+            # whether this caller can actually RUN a check. It picks which VERIFY
+            # block ships, so a tool-less client is never told to run anything.
+            brief = craft.system_message(text or "", tools=bool(agentic), pick_wait=wait)
+            hint = _sk_tool_hint(tools, messages, text)
+            _sk_note(text)
+        finally:
+            _SK_OFFERED.reset(cv)
+        extra = [m for m in (brief, hint) if m]
         if agentic and config.get_flag("crew_agent_hint", True):
             hint = (_crew_agent_hint(tools)
                     if config.get_flag("honest_crew_hint", True)
@@ -31706,7 +31779,382 @@ def _skill_source():
     return _skills_disabled(), _custom_skills(), _ecc_enabled()
 
 
+# --------------------------------------------------------------------------- #
+# THE HUB READS THE REQUEST AND CHOOSES THE SKILLS, IN ANY LANGUAGE (2026-11-07)
+#
+# Owner: "it should work in any language ... even Arabic or a dialect", and "the
+# harness should be smart to detect the task and job and the available enabled skills
+# and which ones to use". The word lists in craft.py stay as the free shortcut; for
+# everything they miss, skillpick.py asks one short model call which of the skills
+# that are ENABLED right now fit: the hub's briefs, the user's own skills, the enabled
+# ECC skills and the skills the CLI itself offers through a `skill` tool.
+#
+# MEASURED 2026-11-07, why this exists: 4 of 9 real Build requests for web work got no
+# web brief, nearly every French prompt in a test battery missed, and every Arabic one
+# would. Which model answers does not matter much: it is a one-line classification, so
+# the rescue provider (fast, huge free allowance) is asked first when it is on.
+# --------------------------------------------------------------------------- #
+_SK_OFFERED = contextvars.ContextVar("free_llm_hub_sk_offered", default=())
+_SK_HOPS = 3
+_SK_HOP_SECONDS = 12
+_SK_TOOL_RE = re.compile(r"(?:^|__|[._-])skill$", re.I)
+
+
+def _sk_on():
+    try:
+        return bool(config.get_flag("skill_picker", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _brief_every_turn_on():
+    try:
+        return bool(config.get_flag("brief_every_turn", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _sk_catalog():
+    """[(id, what it is for)] of what may be chosen RIGHT NOW: a switched-off skill is
+    simply not on the list, so it can never be picked."""
+    disabled, custom, ecc_on = craft._skill_state()
+    rows = [(sid, skillpick.HINTS[sid]) for sid, _n, _d in skills.BUILTIN
+            if sid not in disabled and sid in skillpick.HINTS]
+    for s in custom:
+        if s.get("id") and s.get("trigger") != "always":
+            rows.append(("custom:%s" % s["id"],
+                         "%s: %s" % (s.get("name", ""), s.get("instructions", ""))))
+    if ecc_on:
+        rows += [(r["id"], r["description"]) for r in ecc.view(ecc_on) if r.get("enabled")]
+    rows += [("cli:%s" % n, d) for n, d in _SK_OFFERED.get()]
+    return rows
+
+
+def _sk_call(messages, ids):
+    """The one model call. A BACKGROUND thread: never a user turn. Never spends a
+    subscription; `_no_craft` keeps it out of the brief injector (and out of itself).
+    -> a tuple of ids, () for NONE, None when no hop gave a readable verdict."""
+    try:
+        _usage_src_tls.name = "skill-pick"
+        with app.app_context():
+            pairs = list(_rescue_pairs())
+            try:
+                pid, model, _d = _route_by_difficulty(messages, 300, require_tools=False,
+                                                      force_difficulty="medium")
+                if pid:
+                    pairs += [e for e in _build_chain(pid, model) if e not in pairs]
+            except Exception:                                    # noqa: BLE001
+                pass
+            tried = 0
+            for hop_pid, hop_model in pairs:
+                if _is_sub(hop_pid):
+                    continue
+                tried += 1
+                if tried > _SK_HOPS:
+                    break
+                payload = {"model": hop_model, "stream": False, "max_tokens": 300,
+                           "temperature": 0, "messages": messages, "_no_craft": True}
+                resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload, _SK_HOP_SECONDS)
+                if resp is None:
+                    continue
+                try:
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json() or {}
+                except ValueError:
+                    continue
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:                            # noqa: BLE001
+                        pass
+                got = skillpick.parse(((data.get("choices") or [{}])[0].get("message") or {})
+                                      .get("content"), ids)
+                if got is not None:
+                    return got
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[skills] picker call failed", exc_info=True)
+    finally:
+        _usage_src_tls.name = None
+    return None
+
+
+_SK_PICKER = skillpick.Picker(_sk_call)
+
+
+def _sk_pick(text, wait=0.0):
+    """Skill ids for `text`: a finished verdict (wait 0), or ask and wait at most `wait`
+    seconds (below 0: ask and return at once). Never raises."""
+    try:
+        if not _sk_on():
+            return ()
+        cat = _sk_catalog()
+        if not wait:
+            return _SK_PICKER.peek(text, cat)
+        return _SK_PICKER.pick(text, cat, max(0.0, wait))
+    except Exception:                                            # noqa: BLE001
+        return ()
+
+
+def _sk_start(messages, body):
+    """Called once a client's request is in (_ctx_begin), so the picker reads a fresh
+    instruction whatever runs next: the swarm tiers' hops run on worker threads with no
+    request of their own, and they could not start it themselves. Never raises."""
+    try:
+        if ctxwin.is_compaction_request(messages) or not _awaiting_new_instruction(messages):
+            return
+        reals = _brief_reals(messages)
+        tools = body.get("tools") if isinstance(body, dict) else None
+        if not reals:
+            return
+        cv = _SK_OFFERED.set(_sk_offered(tools, messages))
+        try:
+            if _SK_OFFERED.get() or not craft.has_domain(reals[-1]):
+                craft.start_picking(reals[-1])
+        finally:
+            _SK_OFFERED.reset(cv)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sk_real_turn(messages):
+    """True for the request a real client sent, False for a hub-internal call made
+    from inside one (a recap, a verdict, a classifier): their text is the hub's, and
+    one of those must never cost a model call and a wait."""
+    try:
+        own = _ctx_g("_ctx_pin_msgs")
+        if not own:
+            return False
+        return _brief_reals(own)[-1:] == _brief_reals(messages)[-1:] != []
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _brief_reals(messages):
+    """What the USER said, oldest first: CLI wrapper blocks are not the user speaking.
+    MEASURED 2026-11-07: "what is 2 plus 2?" got ~13,000 chars of briefs because the
+    matcher read a CLAUDE.md reminder (Claude Code) or an AGENTS.md block (codex)."""
+    out = []
+    for m in messages or ():
+        if ctxwin.is_real_instruction(m):
+            out.append(ctxwin.instruction_text(ctxwin.message_text(m)))
+    return out
+
+
+def _brief_text(messages, pick_wait=0.0):
+    """The request the skills are chosen from. The LATEST instruction, not the first:
+    a session that opened with "hi" and later asked for a landing page must not match
+    "hi". It falls back to the instruction that OPENED the project when the latest
+    names no domain of its own: a follow-up is usually short ("now add the booking
+    page") but the project has not changed underneath it. Costs a brief on some small
+    follow-ups too; that trade is deliberate."""
+    reals = _brief_reals(messages)
+    if not reals:
+        return ""
+    text = reals[-1]
+    if len(reals) > 1 and not craft.match(text, pick_wait):
+        first = reals[0]
+        if craft.match(first, pick_wait):
+            text = first + "\n" + text
+    return text
+
+
+def _sk_skill_tool(tools):
+    """(name, description) of the `skill` tool this request offers, or (None, "")."""
+    for t in tools or ():
+        fn = t.get("function") if isinstance(t, dict) else None
+        row = fn if isinstance(fn, dict) else (t if isinstance(t, dict) else {})
+        name = row.get("name")
+        if isinstance(name, str) and _SK_TOOL_RE.search(name):
+            return name, str(row.get("description") or "")
+    return None, ""
+
+
+def _sk_offered(tools, messages):
+    """[(name, description)] of the skills the CLI offers through its own `skill` tool:
+    from the tool's description (opencode), else from the reminder that lists them
+    (Claude Code). Never raises."""
+    try:
+        name, desc = _sk_skill_tool(tools)
+        if not name:
+            return ()
+        rows = skillpick.parse_listing(desc)
+        if not rows:
+            for m in (messages or ())[:8]:
+                t = ctxwin.message_text(m)
+                i = t.find("skills are available")
+                if i >= 0:
+                    end = t.find("</system-reminder>", i)
+                    rows = skillpick.parse_listing(t[i:end if end > 0 else i + 20000])
+                    break
+        return tuple(rows)
+    except Exception:                                            # noqa: BLE001
+        return ()
+
+
+def _sk_tool_hint(tools, messages, text):
+    """"Load this skill" when the picker chose one of the CLI's own skills and the
+    model has not loaded it yet (flag `skill_tool_hint`). A system message or None.
+    Told by name, because free models rarely reach for an optional tool unprompted:
+    on this machine a `skill` tool was called 61 times against 21,407 bash calls."""
+    try:
+        if not config.get_flag("skill_tool_hint", True) or not _SK_OFFERED.get():
+            return None
+        name, _desc = _sk_skill_tool(tools)
+        names = [i[4:] for i in _sk_pick(text) if i.startswith("cli:")]
+        if not name or not names:
+            return None
+        for m in messages or ():
+            for c in (m.get("tool_calls") or ()) if isinstance(m, dict) else ():
+                if ((c.get("function") or {}).get("name")) == name:
+                    return None
+        return {"role": "system", "content":
+                "SKILLS: you have a `%s` tool. For this task load %s with it before you "
+                "start, then follow what it says." % (name, " and ".join("`%s`" % n for n in names))}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _sk_note(text):
+    """Show on the Activity row which skills this request got: "does it use the
+    skills?" should be something you can SEE. One log line per request."""
+    try:
+        friendly = {i: n for i, n, _d in skills.BUILTIN}
+        labels = [friendly.get(n, n.split(":", 1)[-1]) for n in craft.names(text or "")]
+        labels += [i[4:] for i in _sk_pick(text) if i.startswith("cli:")]
+        if not labels:
+            return
+        act = getattr(g, "act", None)
+        if act is not None:
+            with _activity_lock:
+                act["skills"] = labels[:6]
+        if not getattr(g, "sk_logged", False):
+            g.sk_logged = True
+            _log.info("[skills] %s", ", ".join(labels[:6]))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sk_loop_messages(messages, tools):
+    """The task's skills for a hop INSIDE a running tool loop (see
+    craft.loop_message): [] when none apply, on a CLI's own compaction request, or
+    with flag `brief_every_turn` off. Never waits, never raises."""
+    if not _brief_every_turn_on():
+        return []
+    cv = None
+    try:
+        if ctxwin.is_compaction_request(messages):
+            return []
+        cv = _SK_OFFERED.set(_sk_offered(tools, messages))
+        text = _brief_text(messages)
+        if not text:
+            return []
+        out = [m for m in (craft.loop_message(text), _sk_tool_hint(tools, messages, text)) if m]
+        _sk_note(text)
+        return out
+    except Exception:                                            # noqa: BLE001
+        return []
+    finally:
+        if cv is not None:
+            _SK_OFFERED.reset(cv)
+
+
+# --------------------------------------------------------------------------- #
+# A RESCUE PROVIDER CATCHES WHAT WOULD FAIL, AND DOES NOTHING ELSE (2026-11-07)
+#
+# Owner: "when I enable Mercury it uses it always, maybe because it is the fastest."
+# He is right, and there were four doors, none of them a preference for it:
+#   1. The health filters run first. One failure in the last 10 minutes takes a strong
+#      model out of the candidates, so on a flaky fleet the only one left was the
+#      score-26 model with a clean record ("[spread] ... pool 1", 168 times in 4 days).
+#      The strong pairs then got no traffic, so they never earned their way back.
+#   2. The stall backup: "nvidia/z-ai/glm-5.3 silent 30s -> backup inception/mercury-3".
+#      A fast model beats any thinking model in a race, whatever the quality.
+#   3. The best/max fallback sorts by speed.
+#   4. The session watch "returned" a conversation to whoever had acted, i.e. to it.
+#
+# A provider listed here never competes. The router behaves as if it did not exist, so
+# every fail-open fires as it does with the provider off (a strong model that failed a
+# minute ago is tried again rather than skipped for a weak one). It is never the stall
+# backup or a fallback pick. It gets ONE hop, the LAST one, past the hop cap, and the
+# clock keeps _RESCUE_RESERVE_S back so that hop can always run: a turn the strong
+# models lost still gets answered, instead of a 503 or a deadline.
+#
+# An explicit "provider/model" request and a chosen orchestrator are still obeyed.
+# Setting `rescue_only_provider_ids` (default inception), flag `rescue_only_providers`.
+# --------------------------------------------------------------------------- #
+_RESCUE_DEFAULT = ("inception",)
+_RESCUE_RESERVE_S = 45.0
+_RESCUE_HOPS = 1
+
+
+def _rescue_pids():
+    """Providers that may only catch a turn. Never raises."""
+    try:
+        if not config.get_flag("rescue_only_providers", True):
+            return frozenset()
+        v = config.get_setting("rescue_only_provider_ids", None)
+        return frozenset(v if isinstance(v, (list, tuple)) else _RESCUE_DEFAULT)
+    except Exception:                                            # noqa: BLE001
+        return frozenset()
+
+
+def _hold_back_rescue(cands, compactable, rescue):
+    """`cands` and `compactable` without the rescue providers, unless nothing else
+    exists at all (then they ARE the fleet). Router only."""
+    rest = [c for c in cands if c[1] not in rescue]
+    comp = [c for c in compactable if c[1] not in rescue]
+    return (rest, comp) if (rest or comp) else (cands, compactable)
+
+
+def _rescue_pairs(est=0, tools=False):
+    """[(pid, model)] of the usable rescue models, strongest first. Never raises."""
+    out = []
+    try:
+        rp = _rescue_pids()
+        if not rp:
+            return []
+        for pid in _available_providers():
+            if pid not in rp:
+                continue
+            for m in _auto_models(pid):
+                if (not prov.is_model_allowed(m) or _is_model_skipped(pid, m)
+                        or quota.is_model_throttled(pid, m)
+                        or (tools and not _supports_tools(pid, m))
+                        or (est and not _window_fits(pid, m, _rr_fit(est)))):
+                    continue
+                out.append((_benchmark_score(pid, m), pid, m))
+        out.sort(key=lambda c: -c[0])
+    except Exception:                                            # noqa: BLE001
+        return []
+    return [(p, m) for _s, p, m in out]
+
+
+def _rescue_tail(chain, est=0, require_vision=False, require_tools=False, pinned=False,
+                 veto=()):
+    """`chain` with the rescue provider's hop last, added if the hop cap cut it (a
+    score-26 model never reaches a capped chain on its own). A pinned head stays. A
+    chain of nothing else is returned as it is. Never raises."""
+    try:
+        rp = _rescue_pids()
+        if not rp or not chain:
+            return chain
+        head = list(chain[:1]) if pinned else []
+        body = list(chain[1:]) if pinned else list(chain)
+        others = [e for e in body if e[0] not in rp]
+        if not others and not head:
+            return chain
+        tail = [e for e in body if e[0] in rp][:_RESCUE_HOPS]
+        if not tail and not require_vision:
+            tail = [e for e in _rescue_pairs(est, require_tools)
+                    if _normalize_model_identity(e[1]) not in veto and e not in head][:_RESCUE_HOPS]
+        return head + others + tail
+    except Exception:                                            # noqa: BLE001
+        return chain
+
+
 craft.set_skill_source(_skill_source)
+craft.set_skill_picker(_sk_pick)
 # A Build session's brief file carries the project's goal brief (taskboard).
 agentic_chat.set_goal_brief_source(_goal_brief_for_project)
 
@@ -39852,6 +40300,11 @@ def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
         def keep(cands, pred):
             return [c for c in cands if pred(c)] or cands
 
+        # This pick sorts by speed, so a rescue provider would win every time. It
+        # is the LAST hop, reached by the walk (see _rescue_pids).
+        _rp = _rescue_pids()
+        if _rp:
+            pool = keep(pool, lambda c: c[1] not in _rp)
         # A pick that cannot hold the request is dropped outright (not fail-open
         # like the preference filters below): handing it the turn only overflows.
         # Sized on the post-clear size a hop will send (fix #1).
@@ -40025,6 +40478,7 @@ class _ChainClock:
         self._ensure_ledgers()
         original = list(chain or ())
         self._rest = rest = list(original)
+        self._rescue = _rescue_pids()
         try:
             noticed = _relay_notice_servers()
             # Fail-open: a backend is only skipped while something else is left.
@@ -40086,6 +40540,9 @@ class _ChainClock:
                     # (the first hop) never move; an idle hub is a no-op.
                     i = _rh_walk_pick(rest, i, tools=self.tools,
                                       ok=lambda e: not self._demoted(e[0]))
+                j = self._rescue_jump(rest)
+                if j is not None:
+                    i = j        # only the rescue hop's reserve of the clock is left
                 first = False
                 yield rest.pop(i)
             self._close_hop()
@@ -40099,6 +40556,23 @@ class _ChainClock:
             self._net_rewalked = True
             self._net_streak = []
             rest.extend(original)
+
+    def _rescue_jump(self, rest):
+        """The index of the rescue hop once only its reserve of the clock is left,
+        else None: a turn the strong models lost still gets answered."""
+        rp = getattr(self, "_rescue", None)
+        if not rp or getattr(self, "deadline_at", None) is None:
+            return None
+        if self.left() > _RESCUE_RESERVE_S:
+            return None
+        return next((k for k, e in enumerate(rest) if e[0] in rp), None)
+
+    def _rescue_waiting(self, pid):
+        """True while a rescue hop still waits behind this (other) provider's hop."""
+        rp = getattr(self, "_rescue", None)
+        if not rp or pid in rp:
+            return False
+        return any(e[0] in rp for e in (getattr(self, "_rest", None) or ()))
 
     def _roomy_first(self, entries):
         """`entries` with the hops whose KNOWN window cannot hold this request
@@ -40393,6 +40867,9 @@ class _ChainClock:
             budget = room if budget is None else min(budget, room)
         left = self.left()
         if left is not None:
+            # No hop may spend the time the rescue hop is waiting for.
+            if self._rescue_waiting(pid):
+                left = max(0.0, left - _RESCUE_RESERVE_S)
             budget = left if budget is None else min(budget, left)
         return None if budget is None else max(0.0, budget)
 
@@ -40451,11 +40928,13 @@ class _ChainClock:
         try:
             chain = plan["chain"]
             i = chain.index((pid, model)) if (pid, model) in chain else -1
+            _rp = _rescue_pids()
             rest = [e for e in chain[i + 1:]
                     if e != (pid, model) and e not in self._consumed
                     and not _is_sub(e[0]) and prov.is_model_allowed(e[1])
                     and not _is_provider_dead(e[0])
-                    and not _recent_hop_failure(e[0], e[1])]
+                    and not _recent_hop_failure(e[0], e[1])
+                    and e[0] not in _rp]    # it would win every race
             # A different PROVIDER first: a sibling model behind the same
             # rate limit or the same slow gateway is the likeliest to be slow
             # for the same reason.
@@ -48154,9 +48633,10 @@ def _role_candidates(chain, producer, failed=(), kind=None):
     pairs = []
     bad = {tuple(p) for p in failed or ()}
     prod = tuple(producer)[:2]
+    _rp = _rescue_pids()
     for e in chain or ():
         p, m = e[0], e[1]
-        if (p, m) == prod or (p, m) in bad or _is_sub(p):
+        if (p, m) == prod or (p, m) in bad or _is_sub(p) or p in _rp:
             continue
         if _swarm_member_sick(p, m) or _pair_resting(p, m):
             continue

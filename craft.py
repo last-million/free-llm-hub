@@ -58,6 +58,47 @@ def skill_enabled(name):
     return name not in _skill_state()[0]
 
 
+# THE REQUEST IS READ, NOT GREPPED (2026-11-07, owner: "it should work in any
+# language, even Arabic or a dialect"). The trigger regexes below are the free,
+# instant shortcut; when they find no domain, app.py's picker (skillpick.py) asks one
+# short model call which of the ENABLED skills fit. fn(text, wait) -> skill ids: wait
+# 0 only reads a finished verdict, wait > 0 asks and waits at most that long.
+# Unregistered (tests, other processes) = the regexes alone, the old behaviour.
+_SKILL_PICKER = None
+
+PICK_WAIT = 4.0         # a Build brief file is written before the CLI starts
+IS_WEB_WAIT = 3.0       # is_web_ui(): a plan's design block, the slop check
+
+
+def set_skill_picker(fn):
+    global _SKILL_PICKER
+    _SKILL_PICKER = fn
+
+
+def _picked(text, wait=0.0):
+    """Skill ids the picker chose for `text`. () without a picker. Never raises."""
+    if _SKILL_PICKER is None:
+        return ()
+    try:
+        return tuple(_SKILL_PICKER(text, wait) or ())
+    except Exception:                                            # noqa: BLE001
+        return ()
+
+
+def start_picking(text):
+    """Start reading `text` now and return at once: the request's first moment, so
+    the verdict is there for whichever thread a hop runs on."""
+    _picked(text, -1.0)
+
+
+def has_domain(text, disabled=None):
+    """True when the word lists already know what `text` is about, so no model call
+    is needed. `ship` does not count: "preview" and "localhost" appear in every Multi
+    helper's rules, and they must not hide an Arabic goal from the picker."""
+    off = _skill_state()[0] if disabled is None else disabled
+    return any(n != "ship" and n not in off and rx.search(text) for n, rx, _b in _BRIEFS)
+
+
 # --------------------------------------------------------------------------- #
 # Briefs. Each is (name, trigger regex, text).
 #
@@ -369,39 +410,60 @@ _ORTHOGONAL = [
 ]
 
 
-def match(text):
-    """[(name, brief)] for the domains this text is actually about.
+def match(text, pick_wait=0.0):
+    """[(name, brief)] for the domains this text is actually about, in any
+    language: the regexes first, and when they find no domain the picker's verdict
+    (see set_skill_picker). `pick_wait` > 0 lets this call ask for one and wait that
+    long; 0 only reads a verdict that is already there.
 
     Capped at MAX_BRIEFS, most specific first: "build me an online store landing
-    page" should get LANDING + ECOMMERCE, not five overlapping briefs."""
+    page" should not get five overlapping briefs. WEB_DESIGN always keeps a slot: it
+    carries the design rules and it decides whether DESIGN_FIRST and WEB_MOTION ship,
+    so losing it to LANDING + ECOMMERCE or SHIP + LANDING dropped all of them on
+    exactly the pages that need them most (MEASURED 2026-11-07)."""
     if not isinstance(text, str) or not text.strip():
         return []
     disabled, custom, ecc_on = _skill_state()
-    out = []
+    picked = _picked(text, 0.0 if has_domain(text, disabled) else pick_wait)
     # An authorized-testing task replaces the build briefs (_TESTING_REPLACES);
     # with the app_testing skill switched off nothing is replaced.
     skip = (_TESTING_REPLACES if "app_testing" not in disabled
-            and _TARGET_TESTING_RE.search(text) else frozenset())
-    for name, rx, brief in _BRIEFS:
-        if name in disabled or name in skip:
-            continue
-        if rx.search(text):
-            out.append((name, brief))
-            if len(out) >= MAX_BRIEFS:
-                break
+            and (_TARGET_TESTING_RE.search(text) or "app_testing" in picked)
+            else frozenset())
+    hits = [(name, brief) for name, rx, brief in _BRIEFS
+            if name not in disabled and name not in skip
+            and (rx.search(text) or name in picked)]
+    out = hits[:MAX_BRIEFS]
+    web = next((h for h in hits if h[0] == "web_design"), None)
+    if web is not None and web not in out:
+        out[-1] = web
     extra = 0
     for name, rx, brief in _ORTHOGONAL:
         if name in disabled or name in skip:
             continue
-        if rx.search(text):
+        if rx.search(text) or name in picked:
             out.append((name, brief))
             extra += 1
             if extra >= MAX_ORTHOGONAL:
                 break
     # The user's own skills (Settings -> Skills) ride along like the orthogonal
     # briefs, with their own cap (skills.MAX_CUSTOM_PER_TURN); then the opt-in
-    # ECC skills (default off), with their own cap (ecc.MAX_PER_TURN).
-    return out + skills.custom_hits(text, custom) + ecc.hits(text, ecc_on)
+    # ECC skills (default off), with their own cap (ecc.MAX_PER_TURN). The picker
+    # can name them too: a keyword list has the same language problem.
+    own = skills.custom_hits(text, custom)
+    for pid in picked:
+        if pid.startswith("custom:") and len(own) < skills.MAX_CUSTOM_PER_TURN \
+                and all(n != pid for n, _b in own):
+            row = next((c for c in custom if "custom:%s" % c.get("id") == pid), None)
+            if row is not None:
+                own.append((pid, skills.render(row)))
+    opt = ecc.hits(text, ecc_on)
+    for pid in picked:
+        if pid in ecc_on and len(opt) < ecc.MAX_PER_TURN and all(n != pid for n, _b in opt):
+            block = ecc.render(pid)
+            if block:
+                opt.append((pid, block))
+    return out + own + opt
 
 
 # --------------------------------------------------------------------------- #
@@ -548,7 +610,7 @@ def set_publish_source(fn):
 
 def publish_wanted(text, session_id=None):
     """True when the publish question belongs in the brief for `text`."""
-    if not is_web_ui(text):
+    if not is_web_ui(text, wait=0.0):
         return False
     if _PUBLISH_SOURCE is None:
         return True
@@ -640,9 +702,17 @@ _WEB_UI_RE = re.compile(
     r"\bpage d'accueil\b", re.I)
 
 
-def is_web_ui(text):
-    """True when `text` asks for web / UI work (a page, a site, a front end)."""
-    return isinstance(text, str) and bool(_WEB_UI_RE.search(text))
+_PICK_WEB = frozenset(("web_design", "landing", "ecommerce"))
+
+
+def is_web_ui(text, wait=IS_WEB_WAIT):
+    """True when `text` asks for web / UI work (a page, a site, a front end), in any
+    language: the word list first, then the picker's verdict (see _picked)."""
+    if not isinstance(text, str):
+        return False
+    if _WEB_UI_RE.search(text):
+        return True
+    return any(i in _PICK_WEB for i in _picked(text, wait))
 
 
 def is_app_testing(text):
@@ -689,7 +759,42 @@ def act_message():
     return {"role": "system", "content": ACT_RUN}
 
 
-def system_message(text, tools=True, session_id=None):
+# THE BRIEF STAYS WITH THE WORK (2026-11-07). A brief is added to what one hop SENDS;
+# it never enters the CLI's own history, so the next hop did not have it. MEASURED
+# through the real injector: hop 1 got 16,893 chars, every later hop 733 (ACT alone).
+# A model usually looks around first, so the design rules were gone at the moment it
+# wrote the HTML. loop_message() carries the task's skills on those hops. It is
+# bounded (~3K tokens), and it leaves out what is about STARTING (PLAN) and ENDING
+# (VERIFY, ACT ships on its own). Domain first, then the design block, then the
+# user's own skills, then the ride-along briefs, each only if it still fits.
+LOOP_BRIEF_MAX_CHARS = 12000
+_LOOP_HEAD = ("STILL APPLIES (the user's task has not changed; keep following these "
+              "skills while you work)")
+
+
+def loop_message(text):
+    """The task's skills for a hop inside a running tool loop, or None. Reads a
+    finished picker verdict only: a hop in the loop never waits."""
+    hits = match(text)
+    if not hits:
+        return None
+    ortho = {n for n, _rx, _b in _ORTHOGONAL}
+    domain = [b for n, b in hits
+              if n not in ortho and not n.startswith("custom:") and not n.startswith("ecc:")]
+    own = [b for n, b in hits if n.startswith("custom:") or n.startswith("ecc:")]
+    rides = [b for n, b in hits if n in ortho]
+    design = [DESIGN_FIRST, WEB_MOTION] if any(n == "web_design" for n, _b in hits) else []
+    parts, used = [_LOOP_HEAD], len(_LOOP_HEAD)
+    for block in domain + design + own + rides:
+        if used + len(block) + 2 <= LOOP_BRIEF_MAX_CHARS:
+            parts.append(block)
+            used += len(block) + 2
+    if len(parts) == 1:
+        return None
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
+def system_message(text, tools=True, session_id=None, pick_wait=0.0):
     """One system message for `text`, or None when nothing applies.
 
     `tools` says whether the CALLER can actually execute a check. It selects
@@ -706,7 +811,7 @@ def system_message(text, tools=True, session_id=None):
     VERIFY_RUN names its own check and does not reference "the ANTI lines
     above", so it stands alone with no domain brief present. VERIFY_READ does
     reference ANTI lines, so the tools=False path stays gated on a real hit."""
-    hits = match(text)
+    hits = match(text, pick_wait)
     # The publish question (web/UI deliverable, tool-carrying, flag on, not a
     # Multi helper) rides right after the briefs and BEFORE the loop: the loop
     # must stay last (its "every brief above" back-references), and this is

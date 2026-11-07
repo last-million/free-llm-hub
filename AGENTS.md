@@ -4116,6 +4116,9 @@ rating), with SOURCE/DATE. All app.py names added for this are `_ev_*`.
   the flagship floor, newest-first; WITH board evidence it is placed by the boards
   (Qwen 3.8 27B ~133.08, below GLM 5.3 Flash and DeepSeek V4.1 Flash). qwen3.8-max
   (not listed) keeps the full qwen floor.
+- SUPERSEDED 2026-11-07 for the hook named in the next bullet: it was never called, and it
+  would have filed the agentic index as Terminal-Bench 4.0. See "The feed's agentic index" in
+  "Benchmark scores survive the feed" at the end of this file.
 - **Keyless auto-refresh where a source has the field.** General AA is already
   refreshed 6-hourly keylessly from OpenRouter's catalog
   (`_fetch_aa_scores_keyless`). `benchmarks.parse_openrouter_row` is a
@@ -9898,3 +9901,117 @@ persona name appears in any new text.
   reviewer line; not built.
 
 Release-note: improved: the hub now tells agents to run the relevant tests before changing existing code, asks its code reviewers to hunt races, leaks, swallowed errors and tests that prove nothing, tells sub-agents what a work order contains, and nudges a stuck auto-continue to change approach instead of repeating itself.
+
+
+## Skills are chosen by reading the request, in any language (2026-11-07)
+
+Covered by `tests/test_skills_any_language.py`. Owner: "it should work in any language, not just
+in English, even Arabic or a dialect or anything, you understand, with natural language", and "the
+harness should be smart to detect the task and job and the available enabled skills and which ones
+to use". New: `skillpick.py` (pure, stdlib, `call` injected). App names are `_sk_*` and `_brief_*`.
+
+- **MEASURED first (four separate faults, all reproduced through the real injector).**
+  1. Word lists. Almost every French prompt in a test battery missed, and so did "create a site for
+     my gym", "create a dashboard", "improve the design"; 4 of the 9 real Build requests for web work
+     got no web brief. Arabic could only ever miss.
+  2. Slots. `MAX_BRIEFS` let LANDING + ECOMMERCE or SHIP + LANDING push WEB_DESIGN out, and DESIGN_FIRST
+     and WEB_MOTION ship only with it, so "build a landing page for my online store" got no design rules.
+  3. The brief is added to what a hop SENDS and never enters the CLI's history. Hop 1 got 16,893 chars,
+     every later hop 733 (ACT alone), so the rules were gone when the model wrote the HTML. The old
+     "opening turn only" rule assumed the model kept them.
+  4. Matching read the wrappers: "what is 2 plus 2?" got ~13,000 chars because of the words in a
+     CLAUDE.md reminder (Claude Code) or an AGENTS.md block (codex).
+- **The picker** (flag `skill_picker`, default on; `craft.set_skill_picker`). When the word lists find
+  no domain (`craft.has_domain`; `ship` does not count, every Multi helper's rules say "localhost"), one
+  short model call gets the request (first 2/3 and last 1/3 of 900 chars, fenced as data) plus the skills
+  ENABLED right now, and answers ids or NONE. `_sk_catalog` lists built-ins not switched off, the user's
+  own skills, the ECC skills switched on, and what the CLI offers through a `skill` tool (`cli:<name>`);
+  `skillpick.parse` drops anything else, so a reply cannot name a disabled skill. MEASURED on the live
+  fleet before building it: 15 of 15 answers right across Arabic, Gulf, Egyptian, Darija in both scripts,
+  French, Spanish, Chinese, Hindi, Turkish, English typos and NONE cases; 5-18 s each on relays, and 2 of
+  17 hit an 80 s client timeout.
+- **So it never holds a turn.** `_sk_start` (end of `_ctx_begin`) starts the call the moment a real
+  fresh instruction arrives, on its own thread, because swarm-tier hops run on worker threads with no
+  request. Only the FIRST hop waits, at most `skillpick.WAIT` (3 s), and only a real client's request
+  (`_sk_real_turn`: a recap or a classifier made inside a request has other text and never waits). A
+  later verdict reaches the next hop. One call per (request, catalog), 24 h cache, `FAIL_TTL` 120 s when
+  no model answered, `MAX_PER_HOUR` 240, 3 hops of 12 s, a rescue provider first (fast, cheap for a
+  one-line answer), `_no_craft` so it cannot re-enter the injector, never a paid subscription. Usage is
+  labelled `skill-pick`. A word or two ("continue", in any language) is not asked: it keeps its task.
+- **The skills stay with the work** (flag `brief_every_turn`, default on). `craft.loop_message` carries the
+  task's skills on every hop inside a tool loop: domain briefs, then DESIGN_FIRST + WEB_MOTION, then the
+  user's own and ECC skills, then the ride-along briefs, each only if it still fits under
+  `LOOP_BRIEF_MAX_CHARS` (12,000 chars, ~3K tokens). PLAN and VERIFY stay out; ACT stays last. Never on a
+  CLI's own compaction request, never for a tool-less client. This reverses the old opening-turn-only rule
+  on purpose; `tests/test_act_every_turn.py` still pins the flag-off shape.
+- **What counts as the request**: `_brief_reals` = `ctxwin.instruction_text` of real instructions only.
+  `_brief_text` keeps the old rule (latest instruction, falling back to the one that opened the project).
+- **WEB_DESIGN always keeps a slot** in `craft.match`; `craft.is_web_ui` asks the picker too (the plan's
+  design block, the slop check), but `publish_wanted` never waits.
+- **The CLI's own skills** (flag `skill_tool_hint`, default on). `_sk_offered` reads them from the `skill`
+  tool's description (opencode's `<name>`/`<description>` pairs) or Claude Code's reminder list; when the
+  picker chooses one, one system line names it ("load `x` with your `skill` tool"), until that tool has
+  been called. Measured reason: `skill` was called 61 times against 21,407 bash calls here. The format
+  parsers were written from each CLI's known shape; opencode's binary did not yield the string to verify.
+- **You can see it**: Activity rows carry `skills` (a chip, by name), and one `[skills]` log line per
+  request names skills only, never the request.
+- `tests/conftest.py::_skill_work_and_rescue_off_unless_tested` turns the picker and the loop brief off for
+  every other test file.
+- **Limits, plainly.** The first hop of a request the picker has not answered in 3 s has no domain brief; on
+  a tool-free reply there is no next hop, so that reply goes without. Each instruction the word lists miss
+  sends its first 900 chars to one more model (the rescue provider when on). ~3K tokens more per hop on
+  skill-carrying loops. A wrong verdict adds or omits a brief, nothing else. `envprobe.wants_block`,
+  `_CREATION_INTENT_RE` and `crews.detect_crew` are still word lists.
+
+## A rescue provider catches what would fail, and does nothing else (2026-11-07)
+
+Covered by `tests/test_rescue_only_provider.py`. Owner: "when I enable Mercury it uses it always, maybe
+because it is the fastest." Setting `rescue_only_provider_ids` (default `["inception"]`), flag
+`rescue_only_providers` (default on; off = an ordinary provider). Names are `_rescue_*`.
+
+- **MEASURED**: hub.log, 10-25 to 10-28: 168 picks "inception/mercury-3 (pool 1 ...)". Hub score 26, so it
+  never won on merit. Four doors: (1) the health filters run first, so one failure in the last 10 minutes
+  removes a strong model and the clean weak model is what is left, after which the strong pairs get no
+  traffic and cannot earn their way back; (2) the stall backup ("glm-5.3 silent 30s -> backup
+  inception/mercury-3"), a race a fast model always wins; (3) the best/max fallback sorts by speed;
+  (4) the session watch "returned" a conversation to whoever had acted.
+- **The rule**: it never competes. `_hold_back_rescue` removes it from the router's candidates, so every
+  filter and fail-open runs as if it were off (a strong model that failed a minute ago is tried again
+  rather than skipped for a weak one). Never a hedge partner, a best/max fallback pick while anything
+  else is left, a session-return target, a verifier or a specialist. A pin left on it lets go as soon as
+  a stronger candidate is in the pool.
+- **It gets exactly one hop, the last** (`_rescue_tail`, end of `_build_chain`), added past the hop cap
+  when the cap cut it (a score-26 model never reaches a capped chain). `_ChainClock` keeps
+  `_RESCUE_RESERVE_S` (45 s): no other hop's budget may spend it (`_budget_for`), and when only the reserve
+  is left the walk jumps to it (`_rescue_jump`). So a turn the strong models lost is answered instead of
+  ending in a 503 or a deadline.
+- Still obeyed: an explicit `provider/model`, a chosen orchestrator. With nothing else alive it serves.
+  It does not take an image turn, a tool turn it cannot do, or a request over its window.
+- **Limits.** A turn is as slow with it on as with it off, until the rescue: it only catches failures.
+  The swarm tiers' roles walk has 4 actor hops, so it reaches the rescue through the `best` fallback.
+
+## Benchmark scores survive the feed (2026-11-07)
+
+Covered by `tests/test_aa_scores_survive_the_feed.py`. New names: `_aa_merge_kept`, `_aa_seen`,
+`_aa_agentic`, `benchmarks.feed_delta`.
+
+- **MEASURED**: on 2026-10-28 12:29 OpenRouter's catalog went from 421 scores to 74 in one refresh (129 by
+  2026-11-07). Each refresh REPLACED the table, so 347 scores vanished and those models fell to a family
+  guess. It looks like a re-scoring, not a loss: the figures moved and the count keeps climbing, but that
+  is an inference. The old table is gone (nothing kept a copy), so what was lost stays lost. Owner floors
+  held the top of the ranking; the middle got rougher.
+- **Kept** (flag `aa_keep_scores`, default on): a score the feed stops listing stays `AA_KEEP_SECONDS`
+  (45 days) after it was last seen. aa_scores.json gains `seen`. Off = the old replace and file shape.
+- **The feed's agentic index** (flag `aa_agentic_feed`, default on). The catalog now carries
+  `benchmarks.artificial_analysis.agentic_index` for 135 entries (and `coding_index` for 167, unused: it
+  does not track the other indexes). It is NOT Terminal-Bench 4.0 and shares no scale with it: Qwen 3.8 27B
+  45.8 vs 6, GLM 5.3 53.1 vs 42, Kimi K3 29.3 vs 13. So `_ev_agentic_bonus` uses it only for a model with no
+  dated table row, at half weight (`FEED_WEIGHT` 5 per 100), and it never grants the right to lead a tool
+  turn (`_ev_has_agentic_evidence` reads the table only). `parse_openrouter_row` was documented as picking
+  such a field up "with no code change"; it was never called and it mapped this index to `tb4`. Corrected.
+
+## Providers switched by the owner (2026-11-07)
+
+`freemodel` (0 answers in 145 calls over 7 days, HTTP 429 and connection resets, its card said OK) and
+`uncloseai` (0 of 30, HTTP 401 "public beta is closed") are switched OFF in the owner's config; the
+registry rows stay. `inception` is back ON, now as the rescue provider. `llm7` (2 of 56) was left on.

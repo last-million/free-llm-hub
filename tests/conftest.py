@@ -803,6 +803,26 @@ def _graceful_update_stays_in_the_test(monkeypatch):
     _reset()
 
 
+@pytest.fixture(autouse=True)
+def _skill_work_and_rescue_off_unless_tested(request, monkeypatch):
+    """THE SKILL PICKER makes a model call, THE LOOP BRIEF changes what a mid-loop hop
+    sends and THE RESCUE PROVIDER changes routing: each is on by default and off for
+    every test file but its own, which is how the other files stay as they were."""
+    try:
+        import app
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+    mod = getattr(request.node, "module", None)
+    name = mod.__name__.rsplit(".", 1)[-1] if mod is not None else ""
+    if name != "test_skills_any_language":
+        monkeypatch.setattr(app.craft, "_SKILL_PICKER", None)
+        monkeypatch.setattr(app, "_brief_every_turn_on", lambda: False)
+    if name != "test_rescue_only_provider":
+        monkeypatch.setattr(app, "_rescue_pids", lambda: frozenset())
+    yield
+
+
 _DEPLOY_TEST_FILES = {"test_deploy_perfect", "test_deploy_after_run"}
 
 
