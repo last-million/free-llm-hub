@@ -67,6 +67,7 @@ def skill_enabled(name):
 _SKILL_PICKER = None
 
 PICK_WAIT = 4.0         # a Build brief file is written before the CLI starts
+_UNSETTLED = frozenset(("ship", "ecommerce"))
 IS_WEB_WAIT = 3.0       # is_web_ui(): a plan's design block, the slop check
 
 
@@ -93,10 +94,13 @@ def start_picking(text):
 
 def has_domain(text, disabled=None):
     """True when the word lists already know what `text` is about, so no model call
-    is needed. `ship` does not count: "preview" and "localhost" appear in every Multi
-    helper's rules, and they must not hide an Arabic goal from the picker."""
+    is needed. Two briefs do not settle it. `ship`: "preview" and "localhost" appear in
+    every Multi helper's rules, and they must not hide an Arabic goal from the picker.
+    `ecommerce`: "build an online store" names no web word, so it got the store brief
+    and no design rules at all."""
     off = _skill_state()[0] if disabled is None else disabled
-    return any(n != "ship" and n not in off and rx.search(text) for n, rx, _b in _BRIEFS)
+    return any(n not in _UNSETTLED and n not in off and rx.search(text)
+               for n, rx, _b in _BRIEFS)
 
 
 # --------------------------------------------------------------------------- #
@@ -634,7 +638,9 @@ _ENV_SOURCE = None
 # app build anyway.
 # 0.135 -> 0.16 on 2026-10-27, deliberately and once, for WEB_MOTION (the owner's web-design perfection ask);
 # the heaviest request is still a saas landing page and still a small slice of even the 32K floor.
-BRIEF_CEILING_CHARS = int(32768 * 0.16 * 4)
+# 0.16 -> 0.165 on 2026-11-07, deliberately and once: WEB_DESIGN now keeps its slot (see match), so
+# SHIP or CHAIN_DEV beside it costs more than LANDING did. The heaviest bundle is 21,481 chars.
+BRIEF_CEILING_CHARS = int(32768 * 0.165 * 4)
 
 
 def set_env_source(fn):

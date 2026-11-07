@@ -268,6 +268,29 @@ def test_the_web_brief_keeps_its_slot_on_the_pages_that_need_it_most():
         assert craft.DESIGN_FIRST[:40] in craft.system_message(text)["content"], text
 
 
+def test_a_store_request_is_read_for_its_design_too(monkeypatch):
+    """"build an online store" names no web word, so the word list alone gave it the
+    store brief and no design rules."""
+    asked = []
+
+    def fake(text, wait=0.0):
+        asked.append(wait)
+        return ("ecommerce", "web_design")
+    monkeypatch.setattr(craft, "_SKILL_PICKER", fake)
+    assert craft.has_domain("build an online store") is False
+    assert {"ecommerce", "web_design"} <= set(craft.names("build an online store"))
+    craft.match("build an online store", 2.0)
+    assert 2.0 in asked
+
+
+def test_every_heavy_bundle_stays_inside_the_ceiling():
+    for text in ("deploy a landing page for my saas",
+                 "build a landing page for my online store and deploy it",
+                 "build a defi dapp landing page with login, seo and images and deploy it",
+                 "build a web3 nft marketplace website with stripe checkout and deploy it"):
+        assert len(craft.system_message(text)["content"]) <= craft.BRIEF_CEILING_CHARS, text
+
+
 def test_the_domain_cap_still_holds():
     got = [n for n in craft.names("build a landing page for my online store, deploy it")
            if n in {b[0] for b in craft._BRIEFS}]

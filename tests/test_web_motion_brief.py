@@ -89,7 +89,7 @@ def test_the_cost_ceiling_still_holds_for_the_heaviest_request():
                           "create a landing page for my saas",
                           "build me a restaurant website"))
     assert worst <= craft.BRIEF_CEILING_CHARS
-    assert craft.BRIEF_CEILING_CHARS <= int(0.16 * 32768 * 4)        # one deliberate raise, not a drift
+    assert craft.BRIEF_CEILING_CHARS <= int(0.165 * 32768 * 4)       # deliberate raises, not a drift
     # and the motion plan is not what gets dropped when the machine block does not fit
     assert craft.WEB_MOTION in craft.system_message("create a landing page for my saas")["content"]
 

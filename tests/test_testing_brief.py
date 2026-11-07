@@ -209,7 +209,7 @@ def test_switched_off_the_old_behaviour_is_back(monkeypatch):
     monkeypatch.setattr(craft, "_SKILL_SOURCE", lambda: ({"app_testing"}, []))
     off = craft.names(text)
     assert "app_testing" not in off
-    assert off[:2] == ["landing", "ecommerce"]           # the build briefs come back
+    assert off[:2] == ["landing", "web_design"]          # the build briefs come back
     body = craft.system_message(text, tools=True)["content"]
     assert "TESTING BRIEF" not in body
     monkeypatch.setattr(craft, "_SKILL_SOURCE", lambda: (set(), []))

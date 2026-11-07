@@ -22,7 +22,9 @@ def _domains(text):
 
 
 @pytest.mark.parametrize("text,expected", [
-    ("Build me an online store landing page for solar panels", ["landing", "ecommerce"]),
+    # WEB_DESIGN keeps a slot (2026-11-07): this pair used to be landing + ecommerce, which
+    # left a store's landing page with no design rules, DESIGN_FIRST or WEB_MOTION at all.
+    ("Build me an online store landing page for solar panels", ["landing", "web_design"]),
     ("write the copy for our sales page", ["landing"]),
     ("add a shopping cart and stripe checkout", ["ecommerce"]),
     ("write a blog post and optimise it for SEO", []),

@@ -9946,8 +9946,12 @@ to use". New: `skillpick.py` (pure, stdlib, `call` injected). App names are `_sk
   on purpose; `tests/test_act_every_turn.py` still pins the flag-off shape.
 - **What counts as the request**: `_brief_reals` = `ctxwin.instruction_text` of real instructions only.
   `_brief_text` keeps the old rule (latest instruction, falling back to the one that opened the project).
-- **WEB_DESIGN always keeps a slot** in `craft.match`; `craft.is_web_ui` asks the picker too (the plan's
-  design block, the slop check), but `publish_wanted` never waits.
+- **WEB_DESIGN always keeps a slot** in `craft.match` (it takes the second one when the slots are full, so
+  a store's landing page is LANDING + WEB_DESIGN, no longer LANDING + ECOMMERCE). That raised the heaviest
+  bundle to 21,481 chars, so `BRIEF_CEILING_CHARS` moved 0.16 -> 0.165 of the 32K floor, deliberately and
+  once. `craft.is_web_ui` asks the picker too (the plan's design block, the slop check), but
+  `publish_wanted` never waits. `ship` and `ecommerce` do not settle a request (`_UNSETTLED`): "build an
+  online store" names no web word, so the picker is asked and it gets the design rules.
 - **The CLI's own skills** (flag `skill_tool_hint`, default on). `_sk_offered` reads them from the `skill`
   tool's description (opencode's `<name>`/`<description>` pairs) or Claude Code's reminder list; when the
   picker chooses one, one system line names it ("load `x` with your `skill` tool"), until that tool has
