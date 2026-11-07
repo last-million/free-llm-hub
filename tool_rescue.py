@@ -200,7 +200,52 @@ def _usable(call, schemas=None):
 # The dialects
 # --------------------------------------------------------------------------- #
 
-def _from_mapping(obj):
+def _repair_args(name, raw, obj, schemas):
+    """The arguments a model MEANT, from an `arguments` string that is not JSON, or None.
+
+    MEASURED 2026-11-07, the reply that ended a real OpenCode run: arguments were the
+    string {"command":"node -e "const fs=...;" with the inner quotes unescaped, and
+    `workdir` sat beside `arguments` instead of inside it. The call was thrown away
+    although what it wanted to run was all there. Only the keys the tool's own schema
+    declares are read, a key the schema requires must be found, and each value is the
+    text the model typed: a repair never invents anything. A JSON closing quote is
+    dropped only when the quotes in the value do not balance without it (here the last
+    quote belongs to `node -e "..."`, so it stays)."""
+    props = ((schemas or {}).get(name) or {}).get("properties")
+    if not isinstance(props, dict) or not props or not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        json.loads(text)
+        return None                     # not broken
+    except ValueError:
+        pass
+    keys = "|".join(re.escape(k) for k in sorted(props, key=len, reverse=True))
+    marks = list(re.finditer(r'"(%s)"\s*:\s*"' % keys, text))
+    if not marks:
+        return None
+    args = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        value = text[m.end():end].rstrip().rstrip(",").rstrip()
+        if i + 1 == len(marks) and value.endswith("}"):
+            value = value[:-1].rstrip()
+        if value.endswith('"') and value.count('"') % 2:
+            value = value[:-1]
+        args.setdefault(m.group(1), value)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in props and k not in args and k not in _NAME_KEYS and k not in _ARG_KEYS:
+                args[k] = v
+    required = (schemas.get(name) or {}).get("required")
+    if isinstance(required, list) and any(r not in args for r in required):
+        return None
+    return args
+
+
+def _from_mapping(obj, schemas=None):
     """A dict that might BE a call, or might carry one."""
     if not isinstance(obj, dict):
         return []
@@ -236,7 +281,8 @@ def _from_mapping(obj):
             # Some models put the arguments at the top level next to the name.
             args = {k: v for k, v in obj.items()
                     if k not in _NAME_KEYS and k not in _ARG_KEYS}
-        return [_call(name.strip(), args)]
+        fixed = _repair_args(name.strip(), args, obj, schemas)
+        return [_call(name.strip(), args if fixed is None else fixed)]
     return []
 
 
@@ -351,6 +397,63 @@ def _markup_start(text, ticks=0):
 def has_model_markup(text):
     """True when `text` carries a model-native tool-call opener (outside code)."""
     return _markup_start(text) is not None
+
+
+# A CALL TYPED AS A BARE JSON OBJECT, ON A STREAM (2026-11-07). The non-streamed path has
+# rescued these for a long time; the stream only knew tags, so on every CLI (they all
+# stream) {"name":"bash","arguments":{...}} reached the client as text and ended the
+# turn, valid or not. Only an OFFERED tool's name opens it, and never inside backticks.
+_JSON_KEYS = ("name", "tool", "tool_name", "recipient_name")
+_JSON_HEADS = tuple('{"%s":"' % k for k in _JSON_KEYS) + tuple(
+    '{"function":{"%s":"' % k for k in _JSON_KEYS)
+_JSON_FIELDS = ('{"tool_calls":', '{"function_call":')
+_JSON_CALL_RE = re.compile(
+    r'\{\s*(?:"function"\s*:\s*\{\s*)?"(?:%s)"\s*:\s*"([^"\n]{1,80})"|'
+    r'\{\s*"(?:tool_calls|function_call)"\s*:' % "|".join(_JSON_KEYS))
+_JSON_HOLD_CHARS = 140
+
+
+def _json_call_start(text, ticks, names):
+    """The first typed JSON call in `text` naming an offered tool, outside code."""
+    if not isinstance(text, str) or "{" not in text:
+        return None
+    for m in _JSON_CALL_RE.finditer(text):
+        if (ticks + text.count("`", 0, m.start())) % 2:
+            continue
+        if m.group(1) is None or m.group(1) in names:
+            return m
+    return None
+
+
+def _may_open_json(text, names):
+    """True when `text` ENDS with what could still become a typed call: ordinary text
+    is held only until it stops looking like one, and then passes untouched."""
+    i = text.rfind("{")
+    if i < 0 or len(text) - i > _JSON_HOLD_CHARS:
+        return False
+    tail = re.sub(r"\s+", "", text[i:])
+    for head in _JSON_FIELDS:
+        if head.startswith(tail):
+            return True
+    for head in _JSON_HEADS:
+        if head.startswith(tail):
+            return True
+        if tail.startswith(head):
+            rest = tail[len(head):]
+            return any(str(n).startswith(rest) for n in names)
+    return False
+
+
+def _strip_typed(markup):
+    """What is left of held text once the call is real: no raw markup or JSON beside it."""
+    if has_model_markup(markup):
+        return strip_model_markup(markup)
+    out, last = [], 0
+    for _obj, start, end in _json_objects(markup):
+        out.append(markup[last:start])
+        last = end
+    out.append(markup[last:])
+    return re.sub(r"^[\s}]+|[\s}]+$", "", "".join(out))
 
 
 def _attrs(blob):
@@ -583,13 +686,13 @@ def _parse_all(text, allowed_names=None, schemas=None):
     if not found:
         for fenced in _FENCE.findall(text):
             for obj, _s, _e in _json_objects(fenced):
-                found.extend(_from_mapping(obj))
+                found.extend(_from_mapping(obj, schemas))
             if found:
                 break
 
     if not found:
         for obj, _s, _e in _json_objects(text):
-            found.extend(_from_mapping(obj))
+            found.extend(_from_mapping(obj, schemas))
 
     # de-duplicate: the same call often matches two dialects at once
     unique = dedupe_calls(found)[0]
@@ -839,7 +942,7 @@ def rescue_stream(items, tools, framing="lines"):
                 pass
             yield emit(_STREAM_ERROR)
             return
-        rest = strip_model_markup(markup)
+        rest = _strip_typed(markup)
         if rest:
             yield chunk({"content": rest})
         for i, c in enumerate(calls):
@@ -900,7 +1003,7 @@ def rescue_stream(items, tools, framing="lines"):
         if not text:
             yield unit
             continue
-        m = _markup_start(text, ticks)
+        m = _markup_start(text, ticks) or _json_call_start(text, ticks, names)
         if m:
             if text[:m.start()]:
                 yield chunk({"content": text[:m.start()]})
@@ -909,7 +1012,7 @@ def rescue_stream(items, tools, framing="lines"):
                 yield from finalize(obj)
                 mode = "done"
             continue
-        if not fin and _may_open_marker(text):
+        if not fin and (_may_open_marker(text) or _may_open_json(text, names)):
             if not held_text:
                 held, pending = [unit], text
             mode = "hold"

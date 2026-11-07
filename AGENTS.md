@@ -10019,3 +10019,30 @@ Covered by `tests/test_aa_scores_survive_the_feed.py`. New names: `_aa_merge_kep
 `freemodel` (0 answers in 145 calls over 7 days, HTTP 429 and connection resets, its card said OK) and
 `uncloseai` (0 of 30, HTTP 401 "public beta is closed") are switched OFF in the owner's config; the
 registry rows stay. `inception` is back ON, now as the rescue provider. `llm7` (2 of 56) was left on.
+
+
+## A tool call typed as JSON no longer ends a streamed turn (2026-11-07)
+
+Covered by `tests/test_typed_json_calls.py`. MEASURED in a real OpenCode run through the live hub: the
+last reply was prose plus `{"name":"bash","arguments":"{\"command\":\"node -e \"...","workdir":"..."}}`,
+so the check the model wanted to run never ran and the turn ended on that text. No flag, like every other
+dialect in `tool_rescue` (it only turns a typed call into a real one, or into a failed hop).
+
+- **The stream only knew tags.** The non-streamed `rescue()` has read bare JSON for a long time, but
+  `rescue_stream` looked for `_markup_start` alone, so on every CLI (they all stream) a JSON call reached the
+  client as text, valid or not. `_json_call_start` now opens the held path too: `{"name":"<tool>"`, `tool`,
+  `tool_name`, `recipient_name`, `{"function":{...`, `{"tool_calls":`, `{"function_call":`. Only an OFFERED
+  tool's name counts and never inside backticks. `_may_open_json` holds a partial opener typed token by token
+  and lets ordinary text go the moment it stops looking like one, byte for byte. `_strip_typed` keeps the
+  prose and drops the JSON beside the real call.
+- **Broken arguments are repaired** (`_repair_args`, generic JSON path only). The usual fault is unescaped
+  quotes inside a command, so `arguments` is not JSON. Only keys the tool's schema declares are read, required
+  keys must be found, a sibling key beside `arguments` counts only if the schema declares it, and each value
+  is the text the model typed. A JSON closing quote is dropped only when the quotes do not balance without it,
+  so `node -e "..."` keeps its own last quote. Valid arguments and tools with no schema are never touched.
+- **Past saving = a failed hop**, not a final answer: `_STREAM_ERROR` from `finalize`, and `_judge_peeked` now
+  gives `_looks_like_text_tool_call` the tools on a whole reply (`typed_call_unusable`).
+- **Limits.** A fenced ```json block on a stream is left to the older detector (a failed hop, not a rescue).
+  A repaired command runs as the model typed it, through the CLI's normal permissions; if the repair guessed
+  wrong the command fails and the model sees why. A call whose OUTER JSON is broken is not repaired: it fails
+  the hop. A leaked `<think>` in a streamed reply is still shown as text.

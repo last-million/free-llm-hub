@@ -41616,7 +41616,9 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
         if tools_turn and complete and _ends_with_announcement(text):
             _set_nonanswer_kind("announced")
             return "nonanswer"
-        if (_looks_like_text_tool_call(text)
+        # With the tools on a whole reply: a typed call no repair could save is a
+        # failed hop, not a final answer (tool_rescue.typed_call_unusable).
+        if (_looks_like_text_tool_call(text, check.get("tools") if check and complete else None)
                 or (not tools_turn and _looks_like_announced_not_acted(text))
                 or _looks_like_refusal(text)
                 or _is_upstream_nonanswer(text, prompt)
