@@ -5976,8 +5976,13 @@ _recent_hop_fail = {}                # (pid, model) -> (epoch, kind)
 _recent_fail_lock = threading.Lock()
 
 
-def _note_recent_hop_failure(pid, model, kind):
-    """Remember that this hop 429'd or ran out its time. Never raises."""
+def _note_recent_hop_failure(pid, model, kind, streak=True):
+    """Remember that this hop 429'd or ran out its time. Never raises.
+
+    `streak=False` keeps the short ordering mark (this pair goes to the tail for
+    _RECENT_FAIL_TTL) but does NOT feed the persisted failure streak, whose rests
+    run 30 min -> 6 h. Used for a hop the hub itself cut shorter than that pair's
+    own measured first-content time (see _qf_cut_too_short)."""
     if not (pid and model):
         return
     if _client_gone():
@@ -5989,7 +5994,7 @@ def _note_recent_hop_failure(pid, model, kind):
             _recent_hop_fail[(pid, model)] = (time.time(), str(kind or "fail"))
     except Exception:                                            # noqa: BLE001
         pass
-    if kind in _RECENT_STALL_KINDS:
+    if streak and kind in _RECENT_STALL_KINDS:
         # "No answer in time" is one of the same-way failures a streak counts
         # (see _note_pair_failure); a 429 / junk / invalid kind is not.
         _note_pair_failure(pid, model, "reasoning_stall" if kind == "reasoning_stall"
@@ -40666,6 +40671,55 @@ def _qf_big_request(est):
         return False
 
 
+# A GOOD BUT SLOW MODEL IS NOT A FAILED ONE (flags `cut_not_a_streak`,
+# `qf_let_proven_finish`, default on). The hub cuts a hop at the fallback mark (or
+# at a provider's share of the deadline) so a stalled pool cannot hang a turn.
+# That cut is the hub's choice, yet it was filed as the model's failure, and the
+# failure streak (30 min -> 6 h of rest) then kept the strongest models off the
+# chain. nvidia glm-5.3-flash's measured first token is 48-130 s (median ~90 s)
+# against a 108 s mark, and a hop that starts late gets only what is left of it.
+#   1. A hop cut EARLIER than the pair's own measured median first-content time
+#      still goes to the tail for the short recent-failure TTL, but no longer
+#      feeds the persisted streak (`_qf_cut_too_short`).
+#   2. A pair with a real record (>= _QF_EXT_MIN_SAMPLES answers, not failing
+#      now) may keep waiting up to ~its own p90 when that is longer than the room
+#      the mark leaves, once per walk and never past _QF_EXT_CAP_SHARE of the
+#      deadline beyond the mark, so the fallback always keeps time to serve.
+_QF_EXT_MIN_SAMPLES = 5
+_QF_EXT_MULT = 1.1
+_QF_EXT_CAP_SHARE = 0.25
+
+
+def _qf_first_content_ms(pid, model, tools):
+    """(p50_ms, p90_ms, n) of this pair's MEASURED time to first content (the
+    tool-turn samples when the turn has tools and enough exist, else the streamed
+    ones), or None while the record is thin. Never raises."""
+    try:
+        with _outcome_lock:
+            s = list(_tool_ttft.get((pid, model)) or []) if tools else []
+            if len(s) < _QF_EXT_MIN_SAMPLES:
+                s = list(_ttft.get((pid, model)) or [])
+        if len(s) < _QF_EXT_MIN_SAMPLES:
+            return None
+        return (_percentile(s, 50), _percentile(s, 90), len(s))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _qf_cut_too_short(pid, model, waited_s, tools):
+    """True when the hub stopped waiting for this pair EARLIER than the pair's own
+    measured median first-content time: our impatience, not evidence it is broken.
+    False for an unmeasured pair, an unknown wait, or with the flag off. Never
+    raises."""
+    try:
+        if waited_s is None or not config.get_flag("cut_not_a_streak", True):
+            return False
+        m = _qf_first_content_ms(pid, model, tools)
+        return bool(m) and float(waited_s) * 1000.0 < float(m[0])
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
     """Up to _QUALITY_FALLBACK_PAIRS (pid, model) of `entries` (the chain not
     walked yet) to serve a best/max turn whose strong pool did not answer in
@@ -41273,6 +41327,43 @@ class _ChainClock:
         left = self.left()
         return left is not None and left <= 0
 
+    def _qf_room(self, pid, model, qf):
+        """Seconds a hop may keep waiting before the best/max fallback mark cuts
+        it: what is left of the mark, floored at _ADAPTIVE_HOP_FLOOR. A pair whose
+        own record says it usually answers, but later than that, may run on to
+        about its measured p90 (see _qf_cut_too_short): ONE such pair per walk,
+        never for a trivial ask, a pair that failed recently or measures sick, and
+        never past _QF_EXT_CAP_SHARE of the deadline beyond the mark. Never
+        raises; falls back to the plain room."""
+        now = time.monotonic()
+        room = max(_ADAPTIVE_HOP_FLOOR, qf["at"] - now)
+        try:
+            if qf.get("trivial") or not config.get_flag("qf_let_proven_finish", True):
+                return room
+            used = getattr(self, "_qf_ext", None)
+            if used is not None and used != (pid, model):
+                return room
+            m = _qf_first_content_ms(pid, model, self.tools)
+            if (not m or _recent_hop_failure(pid, model)
+                    or _chain_reliability_band(pid, model) >= 2):
+                return room
+            need = _QF_EXT_MULT * float(m[1]) / 1000.0
+            if need <= room:
+                return room
+            cap = (qf["at"] + _QF_EXT_CAP_SHARE * float(self.limit or 0)) - now
+            longer = min(need, cap)
+            if longer <= room:
+                return room
+            self._qf_ext = (pid, model)
+            return longer
+        except Exception:                                        # noqa: BLE001
+            return room
+
+    def _hop_waited(self):
+        """Seconds the current hop has been running, or None."""
+        s = getattr(self, "_hop_started", None)
+        return None if s is None else time.monotonic() - s
+
     def _budget_for(self, pid, model, stream=None):
         budget = None
         # A local subscription CLI is a subprocess that cold-starts in tens of
@@ -41295,7 +41386,7 @@ class _ChainClock:
         # -- only while something is left to fall back to.
         qf = self._qf
         if qf and not qf["fired"] and self._rest and not _is_sub(pid):
-            room = max(_ADAPTIVE_HOP_FLOOR, qf["at"] - time.monotonic())
+            room = self._qf_room(pid, model, qf)
             budget = room if budget is None else min(budget, room)
         left = self.left()
         if left is not None:
@@ -41706,7 +41797,10 @@ class _ChainClock:
             # Only a budget big enough to be a fair wait is evidence: a hop
             # squeezed into the last second of the request deadline is not.
             if (self._hop_budget or 0) >= _ADAPTIVE_HOP_FLOOR:
-                _note_recent_hop_failure(pid, model, "deadline")
+                _note_recent_hop_failure(
+                    pid, model, "deadline",
+                    streak=not _qf_cut_too_short(pid, model, self._hop_waited(),
+                                                 self.tools))
             self._note_long_stall(pid, model)
             raise
         except requests.exceptions.Timeout:
@@ -41769,7 +41863,10 @@ class _ChainClock:
                 _clear_recent_hop_failure(pid, model)
             elif status == "timeout" and max(self._hop_budget or 0,
                                              self._last_peek or 0) >= _ADAPTIVE_HOP_FLOOR:
-                _note_recent_hop_failure(pid, model, "deadline")
+                _note_recent_hop_failure(
+                    pid, model, "deadline",
+                    streak=not _qf_cut_too_short(pid, model, self._hop_waited(),
+                                                 self.tools))
         except Exception:                                        # noqa: BLE001
             pass
 

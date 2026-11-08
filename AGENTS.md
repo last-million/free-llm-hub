@@ -10254,3 +10254,46 @@ some [weak] models sometimes when he has much better ones available".
     those hosts answer; the strong g4f Claude Opus copies DID serve whenever they answered (18-66 s).
 
 Release-note: fix: on a very long session, a short follow-up like "continue" no longer makes the hub give up on the strongest models after 30 seconds and hand the turn to weak fast ones.
+
+## A good but slow model is not a failed one (2026-11-08)
+
+Covered by `tests/test_slow_but_good_is_not_failed.py` (22, hermetic: fake clock and measured samples, no
+network, no sleeping). Flags `cut_not_a_streak` and `qf_let_proven_finish` (`config.get_flag`, default ON; a
+flag read that raises counts as off = the previous behaviour). Follow-up to "A bare continue on a huge session
+is not a trivial turn": the owner asked why the hub-side items left on that list were not fixed.
+
+- **The problem.** The hub cuts a hop at the best/max fallback mark (or at a provider's share of the deadline)
+  so a stalled pool cannot hang a turn. That cut is the hub's choice, but it was filed as the MODEL's failure and
+  fed the persisted failure streak (`_note_pair_failure`: rests of 30 min doubling to 6 h). nvidia glm-5.3-flash's
+  measured first token on tool turns is 48-130 s (median ~90 s) against a 108-128 s mark, and a hop that starts
+  after another one used part of the mark gets only the rest of it: it could not win, and the cut benched it.
+- **1. A cut shorter than the pair's own median is not a streak** (`_qf_cut_too_short`, `_qf_first_content_ms`;
+  `_note_recent_hop_failure(..., streak=False)`). Judged on the pair's own measured first-content samples
+  (tool-turn samples when the turn has tools and `_QF_EXT_MIN_SAMPLES` = 5 exist, else the streamed ones): a hop
+  the hub stopped waiting for BEFORE that median still goes to the tail for the short recent-failure TTL
+  (10 min, ordering only) but no longer feeds the streak. A cut after the median, an unmeasured or thinly
+  measured pair, and an unknown wait are judged exactly as before. Wired at the two places that file a deadline
+  cut on the single-model chains (`_ChainClock._plain`, `note_peek`). The hedge legs and the roles path are not
+  changed.
+- **2. A pair with a record may finish** (`_ChainClock._qf_room`, used by `_budget_for`). When the room the mark
+  leaves is shorter than ~1.1 x the pair's own measured p90, the hop may keep waiting up to that, bounded to
+  `_QF_EXT_CAP_SHARE` (25%) of the deadline beyond the mark so the fallback keeps time to serve. ONE pair per walk;
+  never for a trivial ask; never for a pair with a recent failure or a measured-to-fail band; a pair that answers
+  before the mark is untouched. With the extension the late nvidia hop of the example above waits ~120 s instead of
+  being cut at ~40 s.
+- **Negative controls**: disabling the extension fails 3 tests, disabling the streak rule fails 4. 672 related
+  tests pass.
+- **What the hub still cannot change** (provider side, measured the same day): dahl answers HTTP 429
+  `model_concurrency` (documented capacity; already no key cooldown and no strike), g4f's Pollinations and other
+  backends answer HTTP 500 / 403 or stall, and nvidia often does not answer in time on big requests. A model that
+  is measured slow AND has no samples yet (never answered) is still cut at the mark, because there is nothing to
+  trust.
+- **Not done on purpose**: no clean-up of old rests (on 2026-11-07 the only pair resting was
+  nvidia deepseek-v4.1-flash, level 3, ending within the hour; its new `deadline` events came after the size-gate
+  fix, from hops that had no measured record), and no change to the mark itself (it is what stopped a Max turn
+  hanging for 421 s on 2026-09-27).
+- **Limits.** A pair whose measured samples are old (the file keeps them 7 days) may be extended although it is
+  slower now; the extension is capped, so the worst case is a fallback that starts ~25% of the deadline later.
+  The samples include the hub's own silent-hop samples from the roles path, which only make p90 longer.
+
+Release-note: fix: a strong model that is slow but usually answers is no longer cut off by the hub and then locked out for hours, so it keeps its place ahead of weaker fast models.
