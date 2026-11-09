@@ -10707,9 +10707,20 @@ def _fair_spread_band(band, est=0):
 # punishes the models it has evidence about. Fail-open must be judged INSIDE the strong tier.
 #
 # Rule: the recent-failure filter is applied exactly as before while a healthy candidate at or
-# above the tier floor remains. When none does but strong candidates exist, the strong ones stay
-# (those that did not STALL first -- a 429 fails in milliseconds, a stall costs a hop budget) and
-# the weak healthy ones leave the primary pick. Nothing is dropped from the chain behind it.
+# above the tier floor remains. When none does, the strong candidates that failed FAST (a 429,
+# an HTTP error: milliseconds) stay ahead of the weak healthy ones; nothing is dropped from the
+# chain behind them.
+#
+# NARROWED THE SAME EVENING, after watching it live. The first version also kept strong pairs
+# that had STALLED. MEASURED on 3269e2e (21:53-22:12 UTC, six OpenCode `coding-max` turns): every
+# turn opened on a strong model as intended, and every one then waited on it -- nvidia glm-5.3-
+# flash / deepseek-v4.1-flash "_HopBudgetExceeded", 143-210 s per turn -- before a weak model
+# served anyway (Mercury x3, glm-4.7, glm-4.5). The same turns had taken 12-45 s. A stall costs a
+# whole hop budget, so retrying it on EVERY turn buys nothing while the provider is down; the old
+# rule already retries it once its ten-minute mark runs out. So a pair that STALLED, or that the
+# hub has measured to keep failing (resting, never chains, benched), is not promoted: it keeps
+# the place it always had. What stays is the free part: dahl's "429, at capacity" costs
+# milliseconds, so those strong models are still asked first on every turn.
 # --------------------------------------------------------------------------- #
 def _keep_strong_on_recent_failure_on():
     try:
@@ -10718,21 +10729,34 @@ def _keep_strong_on_recent_failure_on():
         return False
 
 
+def _fast_failed_strong(c, floor):
+    """True for a candidate at or above `floor` whose recent failure was a FAST one (not a
+    stall) and that the hub has not measured to keep failing. Only such a pair is worth
+    asking again before a weak model: a retry costs milliseconds. Never raises (False)."""
+    try:
+        if not floor or c[0] < floor:
+            return False
+        pid, model = c[1], c[2]
+        if not _recent_hop_failure(pid, model) or _recent_hop_stall(pid, model):
+            return False
+        return not (_pair_resting(pid, model) or _never_chains(pid, model)
+                    or _is_pair_benched(pid, model))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _drop_recent_failures(cs, floor):
     """`cs` without the pairs that failed recently, as the router always did (healthy ones; else
-    the ones that did not stall; else everything) -- except that a candidate set whose healthy
-    members are ALL under `floor` while strong ones exist keeps the strong ones instead of
-    promoting the weak. Never raises."""
+    the ones that did not stall; else everything) -- except that when every healthy member is
+    under `floor`, the strong ones that failed FAST open instead of the weak
+    (see _fast_failed_strong). Never raises."""
     try:
         healthy = [c for c in cs if not _recent_hop_failure(c[1], c[2])]
         if healthy:
             if (not floor or any(c[0] >= floor for c in healthy)
                     or not _keep_strong_on_recent_failure_on()):
                 return healthy
-            strong = [c for c in cs if c[0] >= floor]
-            if strong:
-                return [c for c in strong if not _recent_hop_stall(c[1], c[2])] or strong
-            return healthy
+            return [c for c in cs if _fast_failed_strong(c, floor)] or healthy
         return [c for c in cs if not _recent_hop_stall(c[1], c[2])] or cs
     except Exception:                                            # noqa: BLE001
         return cs
@@ -12841,17 +12865,19 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # each half.
         _recent = ([e for e in _recent if not _recent_hop_stall(e[1], e[2])]
                    + [e for e in _recent if _recent_hop_stall(e[1], e[2])])
-        # ...BUT a STRONG pair that only failed recently still comes before a WEAK one that
-        # has no record (2026-11-09, see _drop_recent_failures): the tool bar says a weak
-        # model "only ever appears later in the fallback CHAIN once the strong ones are
-        # exhausted", and a stall ten minutes ago is not exhaustion. They go in right after
-        # the last healthy strong hop, so nothing healthy moves and nothing is dropped.
-        # Only when a weak healthy hop would otherwise precede them.
+        # ...BUT a STRONG pair that failed FAST (a 429, an HTTP error) still comes before a
+        # WEAK one that has no record (2026-11-09, see _drop_recent_failures): asking it again
+        # costs milliseconds, and the tool bar says a weak model "only ever appears later in
+        # the fallback CHAIN once the strong ones are exhausted". A pair that STALLED, or that
+        # is resting / never chains / benched, keeps its place in the tail (see the note on
+        # _fast_failed_strong: retrying a stall every turn cost 2-3 minutes each, measured).
+        # They go in right after the last healthy strong hop, so nothing healthy moves and
+        # nothing is dropped. Only when a weak healthy hop would otherwise precede them.
         try:
             if _keep_strong_on_recent_failure_on():
                 _cf = (_TOOLS_MIN_SCORE if require_tools
                        else (0 if _simple_turn() else _DIFFICULTY_FLOOR.get("medium", 0)))
-                _rs = [e for e in _recent if e[0] >= _cf] if _cf else []
+                _rs = [e for e in _recent if _fast_failed_strong(e, _cf)] if _cf else []
                 if _rs:
                     _at = 0
                     for _ix, _en in enumerate(ordered):
@@ -12859,7 +12885,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
                             _at = _ix + 1
                     if any(_en[0] < _cf for _en in ordered[_at:]):
                         ordered = ordered[:_at] + _rs + ordered[_at:]
-                        _recent = [e for e in _recent if e[0] < _cf]
+                        _recent = [e for e in _recent if e not in _rs]
                         # They used to ride PAST the hop cap (the tail rule above); in the
                         # ranked part they must not take a healthy hop's slot, so the cap
                         # grows by what moved: the same models, in a better order.

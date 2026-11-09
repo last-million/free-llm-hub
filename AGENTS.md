@@ -10481,3 +10481,32 @@ looking at the Activity page: "he used glm 4.5 -- it is old, and newer, better m
   that served is `model`.
 
 Release-note: fix: when the strongest models have all just stalled, the hub now tries them again before falling back to old weak models like GLM 4.5, instead of opening the turn on a weak one.
+
+## ...narrowed to FAST failures after watching it live (2026-11-09, same evening)
+
+SUPERSEDES, for stalls, the section just above ("A recent failure does not hand the turn to a weak model"): its rule bullet,
+its "Result in the hermetic fleet" bullet and the test count (now 26 tests in `tests/test_recent_failure_keeps_strong.py`).
+
+- **MEASURED live on 3269e2e** (21:53-22:12 UTC, six OpenCode `coding-max` turns, Activity `hops`). The first version worked
+  as designed and made things worse. Every turn opened on a strong model (none on GLM 4.5; 23 of the 34 turns before the restart
+  had). Then every turn waited on it: `dahl ... HTTP 429` twice (milliseconds), `nvidia/deepseek-v4.1-flash` or `nvidia/z-ai/
+  glm-5.3-flash` `_HopBudgetExceeded` (2 minutes), and a weak model served anyway -- Mercury x3, glm-4.7-flash, glm-4.5-flash. 143
+  to 210 s per turn, where the turns before had taken 12 to 45 s on GLM 4.5 directly. 0 of 5 completed turns were served by a
+  strong model. The owner was told so, and asked for the fix "if the quality really gets better": it does not (nothing in the hub
+  makes dahl or nvidia answer); it removes the wait.
+- **The narrowed rule** (`_fast_failed_strong(c, floor)`, used by `_drop_recent_failures` and by `_build_chain`): only a strong
+  pair whose recent failure was FAST (a 429, an HTTP error; not `_recent_hop_stall`: deadline / timeout / reasoning_stall) and
+  that the hub has not measured to keep failing (`_pair_resting`, `_never_chains`, `_is_pair_benched`) stays ahead of the weak
+  healthy models. A pair that STALLED keeps the place it always had: out of the opening pick and in the chain's tail until its
+  ten-minute mark (`_RECENT_FAIL_TTL`) runs out, then one new try. Asking dahl again costs milliseconds, so it is still asked
+  first on every turn and serves whenever it has capacity.
+- **Expected shape of a turn while nvidia is down**: dahl 429, dahl 429 (ms), then the healthy weak models, with the stalled
+  nvidia pairs last. About one slow turn per stalled model per ten minutes (its retry) instead of every turn.
+- **Negative controls**: without the stall exclusion 5 of the 26 tests fail; with promotion disabled 10 fail.
+  `tests/test_rescue_only_provider.py` pins both sides (all stalled = the old opening pick; all 429'd = strong opens).
+- **Limits, said plainly.** This is the speed-versus-quality trade the owner accepted on the stated condition: when a stalled
+  strong model has recovered, up to ten minutes can pass before it is tried again, and a weak model answers meanwhile. Not
+  measured live after this narrowing. A provider that fails fast but never answers (dahl with this key: mostly "at capacity")
+  still takes the first two hops of every turn; they cost milliseconds each, and its capacity 429 is not a reliability strike.
+
+Release-note: fix: the hub no longer waits two to three minutes on a strong model that just stalled before answering; it still asks the strong models that refuse instantly first.
