@@ -74,9 +74,19 @@ def test_the_reported_case_every_strong_model_just_failed(fleet, monkeypatch):
 
 
 def test_the_case_reproduced_on_the_old_code(fleet, monkeypatch):
+    """Both rules off = the old code. Since 2026-11-09 a second rule closes the same door
+    for EVERY weak model (`recent_fail_keeps_strong`: a strong model that only failed
+    recently stays ahead of a weak one with no record), so it is switched off here too."""
     monkeypatch.setattr(A, "_rescue_pids", lambda: frozenset())
+    monkeypatch.setattr(A, "_keep_strong_on_recent_failure_on", lambda: False)
     _all_out(monkeypatch)
     assert _route() == RESCUE
+
+
+def test_without_the_rescue_rule_the_newer_rule_still_keeps_it_out(fleet, monkeypatch):
+    monkeypatch.setattr(A, "_rescue_pids", lambda: frozenset())
+    _all_out(monkeypatch)
+    assert _route()[0] != "inception"
 
 
 def test_resting_strong_models_do_not_hand_it_the_turn(fleet, monkeypatch):

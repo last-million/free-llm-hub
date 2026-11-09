@@ -10688,6 +10688,56 @@ def _fair_spread_band(band, est=0):
         return list(band or ())
 
 
+# --------------------------------------------------------------------------- #
+# A RECENT FAILURE DOES NOT HAND THE TURN TO A WEAK MODEL (2026-11-09)
+#
+# Owner, looking at Activity: "he used glm 4.5 -- it is old, and newer, better models are
+# available". MEASURED on the live hub (OpenCode `coding-max`, 20:44-20:57 UTC): the router
+# opened turns on glm/glm-4.5-flash (hub score 10), glm/glm-4.7-flash, zenmux glm-4.6v and
+# kilocode's nemotron-3.5-super-vl -- "[spread] ... -> glm/glm-4.5-flash (pool 1, held elsewhere
+# 4)" -- while nvidia deepseek-v4.1-flash (134.1), nvidia and dahl glm-5.3-flash (133.6) were
+# state "ok". The weak pick then spent its hop (one ended "only reasoning for 58s ... handed to
+# the next model") and the best->auto fallback served a strong model after 109-146 s.
+#
+# Cause: the pair that 429'd or ran out its time in the last ten minutes is dropped from the
+# primary pick (_RECENT_FAIL_TTL). On a day when every strong model has stalled on a huge
+# request, that leaves ONLY the models with no failure record -- the never-tried weak tail --
+# and `agentic` (score >= _TOOLS_MIN_SCORE, else the whole pool) then fails open onto them.
+# The same trap as the 2026-09-05 "score-10 laguna leads an agentic build": the evidence
+# punishes the models it has evidence about. Fail-open must be judged INSIDE the strong tier.
+#
+# Rule: the recent-failure filter is applied exactly as before while a healthy candidate at or
+# above the tier floor remains. When none does but strong candidates exist, the strong ones stay
+# (those that did not STALL first -- a 429 fails in milliseconds, a stall costs a hop budget) and
+# the weak healthy ones leave the primary pick. Nothing is dropped from the chain behind it.
+# --------------------------------------------------------------------------- #
+def _keep_strong_on_recent_failure_on():
+    try:
+        return bool(config.get_flag("recent_fail_keeps_strong", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _drop_recent_failures(cs, floor):
+    """`cs` without the pairs that failed recently, as the router always did (healthy ones; else
+    the ones that did not stall; else everything) -- except that a candidate set whose healthy
+    members are ALL under `floor` while strong ones exist keeps the strong ones instead of
+    promoting the weak. Never raises."""
+    try:
+        healthy = [c for c in cs if not _recent_hop_failure(c[1], c[2])]
+        if healthy:
+            if (not floor or any(c[0] >= floor for c in healthy)
+                    or not _keep_strong_on_recent_failure_on()):
+                return healthy
+            strong = [c for c in cs if c[0] >= floor]
+            if strong:
+                return [c for c in strong if not _recent_hop_stall(c[1], c[2])] or strong
+            return healthy
+        return [c for c in cs if not _recent_hop_stall(c[1], c[2])] or cs
+    except Exception:                                            # noqa: BLE001
+        return cs
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
                          force_difficulty=None, quality_mode=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
@@ -10782,11 +10832,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # stops a session pin from re-choosing the pair that just cost it a whole
     # hop budget -- the pinned pair is simply not in the pool the pin is
     # checked against, so the session re-picks.
-    cands = ([c for c in cands if not _recent_hop_failure(c[1], c[2])]
-             or [c for c in cands if not _recent_hop_stall(c[1], c[2])] or cands)
-    _compactable = ([c for c in _compactable if not _recent_hop_failure(c[1], c[2])]
-                    or [c for c in _compactable if not _recent_hop_stall(c[1], c[2])]
-                    or _compactable)
+    # ...judged INSIDE the strong tier: see _drop_recent_failures (2026-11-09).
+    _rf_floor = _TOOLS_MIN_SCORE if require_tools else _DIFFICULTY_FLOOR.get(difficulty, 0)
+    cands = _drop_recent_failures(cands, _rf_floor)
+    _compactable = _drop_recent_failures(_compactable, _rf_floor)
     # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING.
     #
     # _context_ok is LEARNED from real 413s, so only a model the hub has actually
@@ -12792,6 +12841,31 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # each half.
         _recent = ([e for e in _recent if not _recent_hop_stall(e[1], e[2])]
                    + [e for e in _recent if _recent_hop_stall(e[1], e[2])])
+        # ...BUT a STRONG pair that only failed recently still comes before a WEAK one that
+        # has no record (2026-11-09, see _drop_recent_failures): the tool bar says a weak
+        # model "only ever appears later in the fallback CHAIN once the strong ones are
+        # exhausted", and a stall ten minutes ago is not exhaustion. They go in right after
+        # the last healthy strong hop, so nothing healthy moves and nothing is dropped.
+        # Only when a weak healthy hop would otherwise precede them.
+        try:
+            if _keep_strong_on_recent_failure_on():
+                _cf = (_TOOLS_MIN_SCORE if require_tools
+                       else (0 if _simple_turn() else _DIFFICULTY_FLOOR.get("medium", 0)))
+                _rs = [e for e in _recent if e[0] >= _cf] if _cf else []
+                if _rs:
+                    _at = 0
+                    for _ix, _en in enumerate(ordered):
+                        if _en[0] >= _cf:
+                            _at = _ix + 1
+                    if any(_en[0] < _cf for _en in ordered[_at:]):
+                        ordered = ordered[:_at] + _rs + ordered[_at:]
+                        _recent = [e for e in _recent if e[0] < _cf]
+                        # They used to ride PAST the hop cap (the tail rule above); in the
+                        # ranked part they must not take a healthy hop's slot, so the cap
+                        # grows by what moved: the same models, in a better order.
+                        hop_cap += len(_rs)
+        except Exception:                                        # noqa: BLE001
+            pass
         # ...but the JUNK BENCH stays the very last rule. Partitioning on
         # recent failures alone moved every 429'd pair BEHIND the one pair
         # that had not failed recently -- a benched one -- so it opened the
@@ -25986,6 +26060,54 @@ _MULTI_INTENT_DEADLINE = 12
 _MULTI_INTENT_HOPS = 2
 
 
+# --------------------------------------------------------------------------- #
+# THE HUB'S OWN TINY CALLS TRY A FAST, CAPABLE MODEL FIRST (2026-11-09)
+#
+# Owner: "groq is almost never used, even though qwen 3.8 on it is better than glm 4.6/4.7".
+# MEASURED: Groq's free tier caps ONE request at ~7,000 input tokens (its own 413 body:
+# "ITPM Limit 7000"; docs: 8K tokens per minute for qwen/qwen3.8-27b), while every CLI agent
+# turn is 15K-150K tokens. In the hub log Groq was tried on those turns and refused 120 of the
+# 234 requests that ended in a 503 (all 37K-150K tokens) -- a provider limit, not a routing
+# bug, and no number of keys changes it (the limit is per organization). A request that FITS
+# does go to it: two tiny probes through `auto` and `best` were both served by
+# groq/qwen/qwen3.8-27b in about a second.
+#
+# What fits are the hub's own one-line classifications, and two of them (the skill picker and
+# the Multi "work or chat" verdict) were routed down the "medium" path = the strongest model,
+# often a slow thinker, for a reply of one word. `_fast_helper_pairs` puts the router's SIMPLE
+# pick first when it is a real model (>= _HELPER_MIN_SCORE, not a rescue provider, not a
+# subscription) and the old path stays behind it, so a refusal or a 429 costs one fast hop.
+# --------------------------------------------------------------------------- #
+_HELPER_MIN_SCORE = 100.0
+
+
+def _helper_fast_on():
+    try:
+        return bool(config.get_flag("helpers_fast_first", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _fast_helper_pairs(messages, max_tokens):
+    """[(pid, model)]: at most ONE fast pair for a tiny hub-internal call, or [].
+    The router's SIMPLE pick (cheapest fast model that fits this request size and clears
+    the tier floor, health and quota filters included) -- accepted only when it is a real
+    model. Never a rescue provider (those only catch what failed) and never a paid
+    subscription. The simple path pins no session. Never raises."""
+    try:
+        if not _helper_fast_on():
+            return []
+        pid, model, _d = _route_by_difficulty(messages, max_tokens, require_tools=False,
+                                              force_difficulty="simple")
+        if not pid or not model or _is_sub(pid) or pid in _rescue_pids():
+            return []
+        if _benchmark_score(pid, model) < _HELPER_MIN_SCORE:
+            return []
+        return [(pid, model)]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
 def _multi_intent_by_model(text):
     """"work" | "chat" from a quick model verdict, or None when no hop gave a
     clear one. Language-independent -- the reason it exists (owner,
@@ -25996,10 +26118,13 @@ def _multi_intent_by_model(text):
     try:
         pid, model, _diff = _route_by_difficulty(messages, 8, require_tools=False,
                                                  force_difficulty="medium")
-        if not pid:
+        chain = list(_fast_helper_pairs(messages, 8))
+        if pid:
+            chain += [e for e in _build_chain(pid, model) if e not in chain]
+        if not chain:
             return None
         hops = 0
-        for hop_pid, hop_model in _build_chain(pid, model):
+        for hop_pid, hop_model in chain:
             if _is_sub(hop_pid):
                 continue
             hops += 1
@@ -32087,7 +32212,8 @@ def _sk_call(messages, ids):
     try:
         _usage_src_tls.name = "skill-pick"
         with app.app_context():
-            pairs = list(_rescue_pairs())
+            pairs = list(_fast_helper_pairs(messages, 300))
+            pairs += [e for e in _rescue_pairs() if e not in pairs]
             try:
                 pid, model, _d = _route_by_difficulty(messages, 300, require_tools=False,
                                                       force_difficulty="medium")

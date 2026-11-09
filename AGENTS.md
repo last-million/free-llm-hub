@@ -10398,3 +10398,86 @@ benchmark, from this documentation" (https://hy.tencent.ai/research/hy4, Tencent
   `gpt_below_claude_tools`), not a figure.
 
 Release-note: improved: Tencent's new Hy4 model now ranks above GLM 5.3 and DeepSeek V4.1 Flash on coding-agent turns (from Tencent's own Terminal-Bench figure), while Kimi K3.1 Pro stays ahead of it.
+
+## Why Groq is rarely used, and what small calls now use it (2026-11-09)
+
+Covered by `tests/test_helpers_fast_first.py` (18, hermetic: router, dispatch and scores faked). Owner: "groq is
+almost never used, even though qwen 3.8 on it is better than glm 4.6/4.7 -- I don't understand".
+
+- **It is a provider limit, not a routing bug (MEASURED).** Groq's free tier caps ONE request at about 7,000 input
+  tokens: the hub learned `ctx=7000` from Groq's own 413 body ("ITPM Limit 7000"), and Groq's rate-limit page lists
+  8K tokens per minute for `qwen/qwen3.8-27b` (and `openai/gpt-oss-120b` / `-20b`) with 30 requests per minute and
+  1K per day, enforced PER ORGANIZATION, so more keys do not raise it. Every CLI agent turn is 15K-150K tokens (Claude
+  Code's opening turn alone is ~13.5K). In hub.log, Groq was tried on those turns and refused 120 of the 234 requests
+  that ended in a CHAT-503 (`groq: _ContextOverflow`, requests of 37K to 150K tokens, one at est=150856 on
+  2026-11-09). Live check the same day: provider-load shows groq `routed_24h` 0 and four healthy keys, and two tiny
+  requests through `auto` and `best` were both served by `groq/qwen/qwen3.8-27b`. So a request that fits does go to
+  it; a coding-agent turn never can, on the free tier. A higher Groq plan would be needed to raise the cap (not
+  checked: the rate-limit page says its table is the Developer plan's base and shows no separate free table).
+- **What was improvable: the hub's own tiny calls.** The skill picker (`_sk_call`) asked the rescue provider
+  (Mercury, hub score 26) first and then the router's "medium" path, and the Multi "work or chat" verdict
+  (`_multi_intent_by_model`) used the "medium" path alone, i.e. the strongest model, often a slow thinker, for a reply
+  of one word. `_fast_helper_pairs(messages, max_tokens)` now puts the router's SIMPLE pick first: the cheapest FAST
+  model that fits this request size and clears the floor, with health and quota filters included. Accepted only when it is
+  a real model (`_HELPER_MIN_SCORE` 100), not a rescue provider and not a paid subscription; the simple path pins no
+  session. The old order stays behind it (picker: fast pick, then the rescue pair, then the routed chain; verdict: fast
+  pick, then the routed chain), so a refusal or a 429 costs one fast hop. Flag `helpers_fast_first` (default on; off =
+  both calls byte for byte as before). A router that raises, or a fleet with nothing routable, gives no fast pair.
+- **Not changed, on purpose.** Agent turns, the planner, compaction and every other big call still go where their
+  size allows; Groq's window is a hard cap (`_PROVIDER_HARD_REQUEST_CAP`), so nothing here can send it a big request.
+  The prompt enhancer stays on its forced "medium" route (a weak model answers instead of rewriting; see that section).
+  The memory fact extractor and the other `simple` calls already take this route.
+- **Limits, said plainly.** Not measured live: the effect on picker latency and on Groq's call count is shown by
+  fakes and by the two probes above, not by a before/after run. Groq's 8K tokens per minute is shared by every call, so
+  a burst of picker calls can get a 429 and fall through to the next hop (one fast failed hop). The simple route can still
+  pick another fast provider than Groq when it is the cheaper one at that moment.
+- **Asked in the same message, answered but NOT built:** automatic Gmail sign-up and key collection through a browser.
+  Creating many accounts to multiply free quotas breaks almost every provider's terms (bans of keys and accounts),
+  needs CAPTCHAs and phone checks to be bypassed, and would store Gmail, Discord and GitHub logins in the hub. The hub keeps
+  its guided setup (sign-up link, one account, paste the key, automatic test).
+
+Release-note: improved: the hub's own one-word helper calls (picking skills, deciding if a Multi request is real work) now try a fast, strong model such as Groq's Qwen 3.8 first instead of the slowest strongest one.
+
+## A recent failure does not hand the turn to a weak model (2026-11-09)
+
+Covered by `tests/test_recent_failure_keeps_strong.py` (20, hermetic: fake providers, scores and failure ledger). Owner,
+looking at the Activity page: "he used glm 4.5 -- it is old, and newer, better models are available". Flag
+`recent_fail_keeps_strong` (`config.get_flag`, default ON; a flag read that raises counts as off = the previous behaviour).
+
+- **MEASURED** (live hub, OpenCode `coding-max`, 20:44-20:57 UTC, Activity rows and hub.log). The router's own pick
+  (`routed`) was `glm/glm-4.5-flash` (hub score 10), `glm/glm-4.7-flash`, `zenmux/z-ai/glm-4.6v-flash-free` and `kilocode/
+  nvidia/nemotron-3.5-super-vl:free`, each as the FIRST and ONLY hop (`[spread] f0b1f2b8 -> glm/glm-4.5-flash (pool 1, held
+  elsewhere 4)`), while `nvidia/deepseek-v4.1-flash` (134.1), `nvidia/z-ai/glm-5.3-flash` and `dahl/zai-org/GLM-5.3-Flash` (133.6)
+  were state "ok". A weak pick then spent its hop (`[reasoning-stall] glm/glm-4.5-flash: only reasoning for 58s ... handed to the
+  next model`) and the best->auto fallback served a strong model only after 109-146 s (`[quality-fallback] max->auto: nothing
+  served after 109s`). The 493c565 fix ordered that FALLBACK by quality; it did not touch the opening pick.
+- **Cause, two places, one rule.** A pair that 429'd or ran out its time in the last ten minutes (`_RECENT_FAIL_TTL`) does not
+  open a turn and goes to the tail of the chain. On a day when every strong model has stalled on a huge request, (1) the router
+  (`_route_by_difficulty`) is left with only the models that have NO failure record, the never-tried weak tail, so `agentic`
+  (score >= `_TOOLS_MIN_SCORE`, else the whole pool) fails open onto them; and (2) `_build_chain` moves every recent failure behind
+  every healthy hop "whatever tier", so even a strong pick is re-ordered behind the weak healthy ones. The same trap as the
+  2026-09-05 "score-10 laguna leads an agentic build": the evidence punishes the models it has evidence about.
+- **The rule** (the fail-open is judged INSIDE the strong tier): the filter is exactly what it was while a healthy candidate at
+  or above the tier floor remains. When none does but strong ones exist, they stay -- those that did not STALL first, because a
+  429 fails in milliseconds and a stall costs a hop budget -- and the weak healthy ones leave the primary pick. Router:
+  `_drop_recent_failures(cands, floor)` with floor `_TOOLS_MIN_SCORE` for tool turns, `_DIFFICULTY_FLOOR[difficulty]` otherwise
+  (also for the compactable list). Chain: strong recent failures are inserted right after the last healthy strong hop, only when a
+  weak healthy hop would otherwise precede them (floor `_TOOLS_MIN_SCORE`; a non-tool chain uses the medium floor 50; a simple
+  small turn uses none), and the hop cap grows by what moved, so the chain holds the same models in a better order -- nothing is
+  dropped or added (a test pins that). Old tail rule: only `_RECENT_FAIL_TAIL` (2) recent failures survived a small cap; they now
+  bring their slots with them.
+- **Result in the hermetic fleet** (strong 134.1 / 133.6 / 133.6 all stalled, weak 10 and 30 healthy): before, the weak model
+  opened; now a strong one opens and the chain reads healthy strong, then strong that stalled, then weak. With a healthy strong
+  model nothing changes; with no failures nothing changes; with every candidate weak nothing changes.
+- **Limits, said plainly.** Not measured live after the change: the live hub was still on the earlier commit when this was
+  written. Opening on a strong model that stalled ten minutes ago can cost one hop budget again if its provider is still
+  stalling (nvidia's gateway often is); the walk's stall demotion (a provider that stalled a hop goes behind the others), the
+  quality-fallback mark and the provider-share cap bound that to one stall per provider per walk, and a weak model's first hop was
+  not free either (58 s of reasoning above). A strong model that fails again is still demoted by the same ledger, so the effect
+  is "weak models come after the strong ones are tried", the design `_TOOLS_MIN_SCORE` already states, not a promise that a
+  strong model answers.
+- **Not changed:** the 10-minute TTL, the failure streak rests (`_pair_rest`), the owner's blocklist, Groq's 7K cap, the order of
+  healthy hops, and the rescue provider (still the last hop). The Activity page's `routed` field is the router's pick; the model
+  that served is `model`.
+
+Release-note: fix: when the strongest models have all just stalled, the hub now tries them again before falling back to old weak models like GLM 4.5, instead of opening the turn on a weak one.
