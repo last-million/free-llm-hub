@@ -10510,3 +10510,35 @@ its "Result in the hermetic fleet" bullet and the test count (now 26 tests in `t
   still takes the first two hops of every turn; they cost milliseconds each, and its capacity 429 is not a reliability strike.
 
 Release-note: fix: the hub no longer waits two to three minutes on a strong model that just stalled before answering; it still asks the strong models that refuse instantly first.
+
+## A resting model does not open a turn while a working one exists (2026-11-09)
+
+Covered by `tests/test_sick_yields_to_working.py` (21, hermetic: fake providers, scores, category and sickness). Flag
+`sick_yields_to_working` (`config.get_flag`, default ON; a flag read that raises counts as off = the previous behaviour).
+
+- **MEASURED live on 36f8a07** (22:46:54 UTC, OpenCode `coding-max`): `[spread] f0b1f2b8 -> nvidia/z-ai/glm-5.3-flash (pool 1,
+  held elsewhere 0)` while `learned-state.json` (`pair_rest`) had that pair RESTING for five more hours (level 7, class
+  `deadline`). The turn waited 174 s on it (`_HopBudgetExceeded`) and Mercury served. Twenty-four seconds earlier
+  `glm/glm-4.5-flash` had answered the same session in 22 s.
+- **Cause.** The router drops tool-sick pairs (`_tool_turn_sick`: resting, never chains, provider stalling, measured to mostly
+  fail tool turns) with `[...] or agentic`, and `agentic` holds only the candidates at or above `_TOOLS_MIN_SCORE` that the
+  category mode kept. With every one of those sick the filter failed open onto a sick one: the working models under the bar, or
+  outside the category (GLM 4.5 / 4.7 are not in `coding`), were never looked at. The chain already said the opposite
+  (`ordered = _fit + _sick`; "the pair stays reachable as the LAST resort"), but only among the in-mode hops.
+- **The rule.** Router: `_sick_yields_to_working(agentic, _before_mode)`, right after the sick filter. When EVERY candidate left
+  for the opening pick is tool-sick, the pick is made among the working tool-capable candidates from before the mode filter
+  (not vision-specialised, not a relay server failing tool turns): those at or above the tool bar if any, else the rest. Chain:
+  `_sick_mode_hops_behind_tail` moves the in-mode sick hops behind the WORKING hops of the mode's way-out tail (`chain[0]` never
+  moves). Reorder only: both lists together hold exactly what they held (pinned by a test). Tool turns only.
+- **The session pin follows by itself.** The pin is checked against the list the rule produced, so a session pinned to a pair
+  that is now resting re-picks; and a session pinned to the weak model while everything rested goes back to a strong one as soon
+  as one works (the weak model is then no longer in the pick list). Both pinned by tests.
+- **Negative controls**: without the router call 6 of the 21 tests fail; without the chain call 1 fails.
+- **Limits, said plainly.** This trades quality for speed only in the case where the strong models are measured to keep failing:
+  the turn opens on a weak model (GLM 4.7 / 4.5, Nemotron) and stays there until a strong pair's rest ends or a strong provider
+  works again. A strong pair that is NOT resting still gets its retry when its ten-minute stall mark runs out (about one slow turn
+  per such pair per ten minutes): nvidia deepseek-v4.1-flash was in that state the same evening, because a cut shorter than a
+  pair's own median first-token time is not counted toward a rest (`cut_not_a_streak`). "Sick" also covers a pair that never
+  chains tool calls and a provider stalling on two models at once, not only a rest. Not measured live after the change.
+
+Release-note: fix: a model the hub has already set aside for repeatedly timing out no longer opens a turn while another model is working, so turns stop waiting minutes on it.

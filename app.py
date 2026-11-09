@@ -10762,6 +10762,75 @@ def _drop_recent_failures(cs, floor):
         return cs
 
 
+# --------------------------------------------------------------------------- #
+# A RESTING MODEL DOES NOT OPEN A TURN WHILE A WORKING ONE EXISTS (2026-11-09)
+#
+# MEASURED live on 36f8a07 (22:46:54 UTC, OpenCode `coding-max`): "[spread] f0b1f2b8 ->
+# nvidia/z-ai/glm-5.3-flash (pool 1 ...)" while learned-state.json had that pair RESTING until
+# five hours later (level 7, class "deadline": it keeps running out its time). The turn waited
+# 174 s on it and Mercury served. Twenty-four seconds earlier glm/glm-4.5-flash had answered the
+# same session in 22 s.
+#
+# Why: the router drops tool-sick pairs (_tool_turn_sick: resting, never chains, provider
+# stalling, measured to mostly fail tool turns) with `[...] or agentic`, and `agentic` holds only
+# the candidates at or above the tool bar that the category mode kept. When every one of those
+# is sick the filter fails open onto a sick one -- the working models under the bar, or outside
+# the category, were never looked at. The chain already says the opposite (`ordered = _fit +
+# _sick`, "the pair stays reachable as the LAST resort"); the opening pick did not.
+#
+# Rule: when EVERY candidate left for the opening pick is tool-sick, the pick is made among the
+# working tool-capable candidates from before the mode filter instead: those at or above the tool
+# bar if any, else the rest. The sick ones stay in the chain behind them (see
+# _sick_mode_hops_behind_tail). A session pin follows by itself: the pin is checked against this
+# list, so it lets go of a resting model, and lets go of the weak one again as soon as a strong
+# model works (then `agentic` is the strong tier again). Flag sick_yields_to_working, default on.
+# --------------------------------------------------------------------------- #
+def _sick_yield_on():
+    try:
+        return bool(config.get_flag("sick_yields_to_working", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _sick_yields_to_working(agentic, before):
+    """`agentic` unless every member is tool-turn-sick while `before` (the candidates before
+    the category mode) holds a working tool-capable one: then those, the ones at or above the
+    tool bar first. Never raises (`agentic` on any error)."""
+    try:
+        if not agentic or not _sick_yield_on():
+            return agentic
+        if not all(_tool_turn_sick(c[1], c[2]) for c in agentic):
+            return agentic
+        alt = [c for c in (before or ())
+               if not _tool_turn_sick(c[1], c[2]) and _supports_tools(c[1], c[2])
+               and not _is_vision_specialised(c[2]) and not _relay_tool_sick(c[1], c[2])]
+        if not alt:
+            return agentic
+        strong = [c for c in alt if c[0] >= _TOOLS_MIN_SCORE]
+        return strong or alt
+    except Exception:                                            # noqa: BLE001
+        return agentic
+
+
+def _sick_mode_hops_behind_tail(chain, tail, require_tools):
+    """(chain, tail) with the in-mode hops that are tool-turn-sick moved behind the WORKING
+    hops of the mode's way-out tail, when there is at least one. `chain[0]` never moves; tool
+    turns only. Both lists together hold exactly what the inputs held. Never raises."""
+    try:
+        if not (require_tools and chain and tail) or not _sick_yield_on():
+            return chain, tail
+        ok = [e for e in tail if not _tool_turn_sick(e[0], e[1])]
+        if not ok:
+            return chain, tail
+        sick = [e for e in chain[1:] if _tool_turn_sick(e[0], e[1])]
+        if not sick:
+            return chain, tail
+        kept = [e for e in chain if e not in sick]
+        return kept, ok + sick + [e for e in tail if e not in ok]
+    except Exception:                                            # noqa: BLE001
+        return chain, tail
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
                          force_difficulty=None, quality_mode=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
@@ -10956,6 +11025,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         agentic = [c for c in agentic if not _is_vision_specialised(c[2])] or agentic
         agentic = [c for c in agentic if not _relay_tool_sick(c[1], c[2])] or agentic
         agentic = [c for c in agentic if not _tool_turn_sick(c[1], c[2])] or agentic
+        # ...and that last fail-open looked only INSIDE the strong tier of the category
+        # (see _sick_yields_to_working): a pair the hub had rested for six hours opened a
+        # turn while working models outside that set existed.
+        agentic = _sick_yields_to_working(agentic, _before_mode)
         # ════════════════════════════════════════════════════════════════════
         # SESSION AFFINITY — one model per TASK, rotation only between tasks.
         # Rotating per-TURN spread the load nicely but wrecked the OUTPUT: a
@@ -12960,6 +13033,9 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # (see _weak_mode_hops_behind_tail): a score-26 model must not answer first
     # while a healthy 130 waits at the end of the chain.
     chain, _tail = _weak_mode_hops_behind_tail(chain, _tail, require_tools)
+    # ...and the in-mode hops the hub measured to keep failing (resting, never chains ...)
+    # behind the tail's working ones (see _sick_yields_to_working).
+    chain, _tail = _sick_mode_hops_behind_tail(chain, _tail, require_tools)
     for e in _tail:
         chain.append(e)
         seen.add(e)
