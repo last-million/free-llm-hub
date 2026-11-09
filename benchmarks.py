@@ -215,6 +215,44 @@ TABLE.update({
                      "2026-10-20)", _FROM_CHART)},
 })
 
+# Tencent Hy4 (released 2026-11-04). VENDOR-REPORTED, not an independent board:
+# read 2026-11-09 from Tencent's own release post (hy.tencent.ai/research/hy4, the
+# "Appendix: benchmark results" table). Artificial Analysis does not list it yet (its
+# Terminal-Bench 4.0 page names no Hy4 entry), so there is no AA Index, no
+# AutomationBench-AA figure and no LMArena row: those stay None and the model keeps its
+# owner floor (app._PREF_FLOORS[5]) for chat. Only Terminal-Bench 4.0 is taken.
+#   * The post's Terminal-Bench 4.0 column (Claude Code harness, 500 turns, 13 h per
+#     trial, "highest available reasoning setting"): Hy4 44.4, Hy4 preview 26.3,
+#     GLM-5.3 42.9, DeepSeek-V4.1-Flash-1017 42.3 / 40.0*, Kimi K3.1 Pro 65.7 / 66.8*,
+#     GPT-6.1 Sol 55.9 / 55.5*, Claude Opus 5.5 66.4 / 66.4*. Where this table shares a
+#     model with the AA rows above it agrees within ~1.5 points (GLM 5.3 42.9 vs 42,
+#     Kimi K3.1 Pro 66.8 vs 67.2, Sol 55.5 vs 56.1); it does NOT for Opus 5.5 (66.4 vs
+#     59.6) nor DeepSeek V4.1 Flash (42.3 vs 27: another checkpoint). So 44.4 is used as
+#     is, next to GLM 5.3's 42 -- on the rows that matter for the order below it.
+#   * NOT taken: the post's AutomationBench column (Zapier's 600-task v1.0.6 run by
+#     Tencent: Kimi K3.1 Pro 65.6, Opus 5.5 58.8, Sol 51.4 -- not AutomationBench-AA's
+#     partial score, 73.3 / 69.5 / 64.9 above; the two scales are never mixed), and the
+#     many "Hy-*" internal benchmarks (Tencent designed and ran every model on those).
+#   * What the same table says about the order: Hy4 beats GLM-5.3 on most of it and is
+#     level with DeepSeek-V4.1-Flash, but Kimi K3.1 Pro is clearly ahead on the public
+#     ones (Terminal-Bench 4.0 65.7 vs 44.4, SWE-Marathon 51.7 vs 43.8, HLE 70.0 vs 59.1,
+#     AutomationBench 65.6 vs 56.2), and Opus 5.5 / GPT-6.1 Sol are ahead on
+#     Terminal-Bench 4.0 and ProgramBench. Hence tool turns put it above GLM 5.3 and
+#     DeepSeek V4.1 Flash and well under Kimi K3.1 Pro.
+#   * The PREVIEW (hy4-preview, 2026-08-28) is a much weaker model (26.3 above) and has
+#     NO row: _resolve refuses to answer it with this one (it would credit the preview
+#     with the final's figure).
+_HY_RELEASE = "https://hy.tencent.ai/research/hy4"
+TABLE.update({
+    "tencent/hy4": {
+        "tb4": 44.4, "automation": None, "aa": None, "arena": None,
+        "date": "2026-11-09",
+        "source": "Tencent Hy4 release post %s (2026-11-04), VENDOR-REPORTED Terminal-Bench "
+                  "4.0 (Tencent's own run, Claude Code harness, 500 turns); not on the "
+                  "Artificial Analysis board yet. No AutomationBench-AA, AA Index or "
+                  "LMArena figure." % _HY_RELEASE},
+})
+
 # --------------------------------------------------------------------------- #
 # Mappings (monotone, bounded, documented). Both are product decisions, not
 # capability estimates, so they live here beside the numbers they consume.
@@ -303,7 +341,7 @@ def _groups():
                 p = modelrank.parse(mid)
                 if p is None:
                     continue
-                gkey = (p.family, p.tier, _size_of(str(mid).lower()))
+                gkey = (p.family, p.tier, _size_key(p.family, str(mid).lower()))
                 out.setdefault(gkey, {})[tuple(p.version)] = (mid, dict(ev))
             except Exception:
                 continue
@@ -373,10 +411,40 @@ def _line_codename(low):
     return None
 
 
+_PREVIEW_TOKEN = "preview"
+
+
+def _is_preview(low):
+    """True when an id names itself a PREVIEW build ('tencent/hy4-preview')."""
+    try:
+        return _PREVIEW_TOKEN in set(re.split(r"[^a-z0-9]+", low or ""))
+    except Exception:
+        return False
+
+
+def _size_key(family, low):
+    """The parameter size an id names, as it is keyed here. Hy ids may carry the
+    flagship's own count ('hy4-770b', '...-770b-a49b'); that is the model the row
+    describes, not a small size variant (a size variant must not inherit the
+    flagship's row: _SIZE_RE's job), so a large count reads as unsized for the hy
+    family. Every other family keeps _size_of exactly."""
+    size = _size_of(low)
+    if family == "hy" and size is not None and size >= 70:
+        return None
+    return size
+
+
 def _resolve(group, parsed, low, size):
     """Evidence for `parsed` from ONE version group -> (row id, evidence dict) or
     None: its exact row, the newest row plus a version bump for a newer unlisted
     release, or None (older / between rows)."""
+    if parsed.family == "hy" and _is_preview(low):
+        # A PREVIEW build is not the release: Tencent's own table has Hy4 preview at
+        # Terminal-Bench 4.0 26.3 against Hy4's 44.4, and both parse to the same
+        # (hy, '', (4, 0)) key. Answering the preview with the release's row would
+        # credit it with a figure it did not earn (the same refusal as gpt-6-sol vs
+        # gpt-6-astra below). It keeps its owner floor and gets no board points.
+        return None
     ver = tuple(parsed.version)
     if ver in group:
         mid, ev = group[ver]
@@ -416,7 +484,7 @@ def _evidence(model_id):
         if p is None:
             return None
         low = str(model_id or "").lower()
-        size = _size_of(low)
+        size = _size_key(p.family, low)
         groups = _groups()
         group = groups.get((p.family, p.tier, size))
         hit = _resolve(group, p, low, size) if group else None

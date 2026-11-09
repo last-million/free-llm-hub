@@ -10344,3 +10344,57 @@ the best available models from ALL providers, we may have other models better th
   - Not verified against live traffic: the effect is shown by the tests and the state check above.
 
 Release-note: improved: when the strongest models are down, the hub now tries the best model that still works from any provider before falling back to weak, older ones.
+
+## Hy4 ranks by its own numbers on tool turns (2026-11-09)
+
+Covered by `tests/test_hy4_release_evidence.py` (16, hermetic: no network, no live hub). Owner: "hy4 is
+perfect and surpasses all Chinese models in many benchmarks; if it is available he should have a higher
+benchmark, from this documentation" (https://hy.tencent.ai/research/hy4, Tencent's release post of
+2026-11-04). Nothing was changed in `_PREF_FLOORS`: the gap was elsewhere.
+
+- **MEASURED first** (sandbox import, nothing live touched; same fixture as the other ranking sections):
+  chat 138.00 for hy4 (the owner's 2026-08-31 floor for hy4-and-up), already above GLM 5.3 (134.03) and
+  DeepSeek V4.1 Flash (134.05), level with Claude. On TOOL turns hy4 was also 138.00 -- BELOW GLM 5.3
+  (138.85) and DeepSeek V4.1 Flash (141.07) -- because it had no `benchmarks.TABLE` row, so it earned no
+  agentic bonus. `hy4-preview` scored exactly like the release (one floor, one parse). Live fleet: 0 hy
+  rows (priced $0.834 / $2.501 per million tokens on the vendor's own page, so nothing free lists it yet):
+  this only takes effect the day a keyed provider serves it.
+- **What the post's table says** (appendix image, read 2026-11-09; the page is a client-rendered app whose
+  text carries no numbers, the table is one 1965x3756 image). Terminal-Bench 4.0, Tencent's own run (Claude
+  Code harness, 500 turns, 13 h per trial): Hy4 44.4, Hy4 preview 26.3, GLM-5.3 42.9, DeepSeek-V4.1-Flash
+  42.3, Kimi K3.1 Pro 65.7, GPT-6.1 Sol 55.9, Claude Opus 5.5 66.4. So it beats GLM 5.3, matches DeepSeek
+  Flash, and is NOT ahead of Kimi K3.1 Pro on the public benchmarks (TB4.0 65.7 vs 44.4, SWE-Marathon 51.7 vs
+  43.8, HLE 70.0 vs 59.1, AutomationBench 65.6 vs 56.2); Opus 5.5 and Sol are ahead on TB4.0 too. Most of
+  its other wins are on Tencent's own "Hy-*" internal benchmarks, which Tencent designed and ran for every
+  model. The claim "better than all Chinese models" is therefore NOT what the numbers say; "above GLM 5.3 and
+  DeepSeek Flash, below Kimi K3.1 Pro" is.
+- **The change** (`benchmarks.py`): one row, `tencent/hy4` = `{tb4: 44.4, automation: None, aa: None,
+  arena: None}`, dated 2026-11-09 and marked VENDOR-REPORTED in its `source` (Artificial Analysis lists no Hy4
+  entry yet; its Terminal-Bench 4.0 page was checked). Only Terminal-Bench 4.0 is taken: the post's
+  AutomationBench is a different scale from AutomationBench-AA (Kimi K3.1 Pro 65.6 vs 73.3, Opus 58.8 vs 69.5),
+  and there is no AA Index or LMArena figure, so those stay None and nothing is invented. Where the post's TB4.0
+  shares a model with the AA rows it agrees within ~1.5 points (GLM 5.3 42.9 vs 42, Kimi K3.1 Pro 66.8 vs
+  67.2, Sol 55.5 vs 56.1); it does not for Opus 5.5 (66.4 vs 59.6) nor DeepSeek V4.1 Flash (another checkpoint),
+  so 44.4 is used as is, next to GLM 5.3's 42.
+- **Result** (first-party, healthy fleet): tool turns Kimi K3.1 Pro 148.05 > Opus 5.5 144.66 > GPT-6.1 Sol
+  143.46 > **hy4 142.44** (was 138.00) > DeepSeek V4.1 Flash 141.07 > GLM 5.3 138.85. Chat is unchanged
+  (hy4 138.00). hy4 is 1.4 over DeepSeek Flash, inside `_AUTO_TOP_BAND`, so the weighted pick still mixes
+  them; it is 3.2 clear of GLM 5.3. A newer unlisted release (`hy5`) inherits the row plus the usual bump and
+  ranks above it; hy3 is untouched (134.50).
+- **Two guards in `benchmarks.py`.** (1) A PREVIEW build never reads the release's row (`_resolve`,
+  `_is_preview`): both parse to `(hy, '', (4, 0))` (a test in `test_model_version_ranking.py` pins that parse, so
+  `modelrank` is left alone), and the post gives the preview its own much lower 26.3. It keeps the owner's floor
+  and gets no board points, so on tool turns the release ranks 4.4 above it (same refusal as gpt-6-sol vs
+  gpt-6-astra). (2) `_size_key`: an hy id that names the flagship's own size (`hy4-770b`, `...-770b-a49b`) reads
+  as unsized so it finds the row; a small cut (`hy-4-lite-8b`) keeps its size and never inherits it (every other
+  family keeps `_size_of` exactly). Each guard has tests that fail without it.
+- **Limits, said plainly.** The 44.4 is Tencent's own run, not an independent board; when Artificial Analysis
+  lists Hy4 its row should replace this one. The hub cannot tell whether a provider's `hy4` id is the release
+  or something else that a relay renamed (relay discount and the measured record still apply). On tool turns hy4
+  now sits level with GPT-6.1 Sol once the owner's GPT cap applies (Sol 143.46 uncapped, 142.64 capped, hy4
+  142.44), although the post has Sol ahead on Terminal-Bench 4.0 (55.9 vs 44.4): that is because the owner's chat
+  floor (138, level with Claude) is added to the board points. The floor is the owner's 2026-08-31 decision and was
+  not changed. If the owner wants hy4 under the GPT line on tool turns, that needs a cap (like
+  `gpt_below_claude_tools`), not a figure.
+
+Release-note: improved: Tencent's new Hy4 model now ranks above GLM 5.3 and DeepSeek V4.1 Flash on coding-agent turns (from Tencent's own Terminal-Bench figure), while Kimi K3.1 Pro stays ahead of it.
