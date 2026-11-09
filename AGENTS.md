@@ -10297,3 +10297,50 @@ is not a trivial turn": the owner asked why the hub-side items left on that list
   The samples include the hub's own silent-hop samples from the roles path, which only make p90 longer.
 
 Release-note: fix: a strong model that is slow but usually answers is no longer cut off by the hub and then locked out for hours, so it keeps its place ahead of weaker fast models.
+
+## The way out of a failing turn is ordered by quality first (2026-11-09)
+
+Covered by `tests/test_fallback_best_overall.py` (16, hermetic: fake fleet, no network). Flag
+`fallback_best_overall` (`config.get_flag`, default ON; a flag read that raises counts as off = the
+previous behaviour). Owner: "when GLM 5.3 is not available, why does he use the old 4.5 / 4.7 -- check
+the best available models from ALL providers, we may have other models better than those old versions".
+
+- **MEASURED** (Activity + hub.log, 2026-11-09): every `coding-max` tool turn (~105K tokens, ~72K sent)
+  walked dahl 429 / dahl 429 / nvidia (cut after ~110-140 s), then the `max->auto` fallback served
+  glm/glm-4.5-flash (hub score 10) or inception/mercury-3, ~150 s per turn.
+- **What the data does and does not say.** A first reproduction forced GLM into the `coding` category and so
+  "confirmed" a category trap that is not real: `_mode_allows("coding", ...)` is False for glm-4.5-flash,
+  glm-4.7-flash and zenmux's glm-4.7. The check that settles it lists every tool-capable model scoring 45+ and
+  the first reason each cannot serve right now: of the 9 at 90+ that are not g4f, 8 were unavailable for a
+  stated reason (resting after repeated deadlines x2, a recent failure x2, the owner's blocklist x3 -- step-5-
+  preview, MiniMax-M2.7 and others --, state dead, window too small for the SENT size (groq qwen3.8, ~8K cap)),
+  and exactly ONE could serve: nvidia/minimax-m3.1-flash (99.1). Of 208 tool-capable models, 71 were state ok and
+  127 sat on an exhausted provider (g4f). So old GLM served mostly because nothing better was routable, not
+  because the router prefers old versions.
+- **The real flaw.** Two orderings put "who has not failed lately" before "how strong": `_mode_fallback_tail`
+  (the chain's way out of a category: healthy first, then strongest) and `_quality_fallback_pick` (the best/max
+  fallback: `_apply_mode`, then fast, then not stalled, then a sort led by "recent failure"). A score-10 or -30
+  model with no recent failure beat the 99.1 one that had stalled ten minutes ago -- or whose provider's OTHER
+  models had (`_provider_stalling` makes every model of a stalling provider tool-sick). And `_apply_mode` kept the
+  category's own survivors, which were the resting strong pairs: the fallback lines of the day name nvidia/
+  glm-5.3-flash 100+ times, each a ~140 s hop that had failed the turn before.
+- **The rule** (tool turns only, reorder only). `_fb_strong_ok(score, pid, model)`: at or above
+  `_TOOLS_MIN_SCORE` (90) and the pair's OWN record is clean (not `_pair_resting`, not `_never_chains`, not
+  reliability band 2, not benched). A failure in the last ten minutes or a stalling sibling does NOT disqualify.
+  In `_mode_fallback_tail` such a candidate sorts first. In `_quality_fallback_pick`: the category's own clean
+  strong candidates lead when it has any, else the clean strong candidates from ANY provider; with none, the pool
+  the mode left, exactly as before. A resting / measured-to-fail strong pair gets no promotion. Tool-free turns,
+  window fit (`_window_fits`), the owner's blocklist and every other filter are unchanged.
+- **Negative control**: with the rule off, 3 of the 16 tests fail. 824 related tests pass.
+- **Limits, said plainly.**
+  - Today it changes ONE model's place (nvidia/minimax-m3.1-flash). With the strong GLM / DeepSeek pairs
+    resting, the owner's blocklist covering step-5-preview and MiniMax-M2.7, and g4f exhausted, there is little
+    above the old GLMs to prefer. The rule matters more on a day with more healthy strong models.
+  - It costs speed when the preferred model is slow: nvidia's gateway stalled on its other models the same day,
+    so minimax-m3.1-flash may use a hop budget before a faster weak model answers. Quality-first was the owner's
+    instruction; a stall still hands over to the next hop.
+  - The 140 s hop on nvidia's resting DeepSeek is NOT changed here (it is the strong pair's own place in the
+    chain, a speed-versus-quality decision left to the owner).
+  - Not verified against live traffic: the effect is shown by the tests and the state check above.
+
+Release-note: improved: when the strongest models are down, the hub now tries the best model that still works from any provider before falling back to weak, older ones.

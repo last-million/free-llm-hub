@@ -12378,6 +12378,32 @@ def _spread_by_provider(entries, per, already=()):
         return entries
 
 
+def _fb_floor_on():
+    """Flag `fallback_best_overall` (default on; a flag read that raises = off, i.e. the
+    previous behaviour)."""
+    try:
+        return bool(config.get_flag("fallback_best_overall", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _fb_strong_ok(score, pid, model):
+    """True for a candidate at or above the tool bar (_TOOLS_MIN_SCORE) whose OWN
+    record is clean: not resting after repeated failures, not one that never chains a
+    tool call, not measured to fail (reliability band 2), not benched. A failure in the
+    last ten minutes, or a sibling model stalling on the same provider, does NOT
+    disqualify it -- those are exactly what put strong models behind weak healthy ones.
+    Never raises."""
+    try:
+        if score is None or score < _TOOLS_MIN_SCORE:
+            return False
+        return not (_pair_resting(pid, model) or _never_chains(pid, model)
+                    or _chain_reliability_band(pid, model) >= 2
+                    or _is_pair_benched(pid, model))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _mode_fallback_tail(entries, seen, require_tools=False, require_vision=False,
                         cap=None):
     """Up to `cap` (default _MODE_FALLBACK_TAIL) (pid, model) hops from
@@ -12407,10 +12433,17 @@ def _mode_fallback_tail(entries, seen, require_tools=False, require_vision=False
             return []
         simple = _simple_turn()
         sustain = _model_identity_min_penalty(pool) if require_tools else None
+        # QUALITY FIRST on a tool turn (flag `fallback_best_overall`): a model at or
+        # above the tool bar whose OWN record is clean leads the way out, even when it
+        # failed or stalled in the last ten minutes. "Healthy first" alone put a
+        # score-10 model that had not failed ahead of a score-99 one (see
+        # _fb_strong_ok). A resting / measured-to-fail strong pair keeps its old place.
+        _floor = bool(require_tools) and _fb_floor_on()
 
         def key(e):
             pid, m = e[1], e[2]
-            return (_recent_hop_failure(pid, m) is not None,
+            return (not (_floor and _fb_strong_ok(e[0], pid, m)),
+                    _recent_hop_failure(pid, m) is not None,
                     _chain_reliability_band(pid, m) >= 2
                     or (require_tools and _tool_turn_sick(pid, m)),
                     _is_low_quality(m),
@@ -40759,7 +40792,22 @@ def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
         # The chain now ends with hops from OUTSIDE a category mode (see
         # _mode_fallback_tail): they are the mode's last resort, not its
         # fallback's first pick while an in-mode hop is left. Fail-open.
+        _before_mode = pool
         pool = _apply_mode(pool)
+        if tools and _fb_floor_on():
+            # QUALITY BEFORE CATEGORY AND SPEED on a tool turn. A strong model (at or
+            # above the tool bar) whose own record is clean leads: from the category
+            # when it has one, else from ANY provider -- the category's survivors are
+            # often the very models that just failed (MEASURED 2026-11-09: the way out
+            # kept re-trying resting in-category pairs, then served a score-10 model).
+            # Nothing strong with a clean record anywhere = the pool the mode left,
+            # exactly as before (fail-open).
+            _strong = [c for c in _before_mode if _fb_strong_ok(c[0], c[1], c[2])]
+            _strong_in = [c for c in pool if c in _strong]
+            if _strong_in:
+                pool = _strong_in
+            elif _strong:
+                pool = _strong
         pool = keep(pool, lambda c: _is_fast(c[1], c[2]))
         pool = keep(pool, lambda c: c[1] not in stalled)
         pool = keep(pool, lambda c: not _recent_hop_stall(c[1], c[2]))
