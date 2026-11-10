@@ -10542,3 +10542,76 @@ Covered by `tests/test_sick_yields_to_working.py` (21, hermetic: fake providers,
   chains tool calls and a provider stalling on two models at once, not only a rest. Not measured live after the change.
 
 Release-note: fix: a model the hub has already set aside for repeatedly timing out no longer opens a turn while another model is working, so turns stop waiting minutes on it.
+
+## A provider that keeps stalling rests for 30 minutes, with one probe at a time (2026-11-09)
+
+Covered by `tests/test_provider_long_rest.py` (57, hermetic: a fake wall clock, fake upstreams, fresh ledgers, no network, no
+sleeping). Flag `provider_stall_long_rest` (`config.get_flag`, default ON; a flag read that raises counts as off = the previous
+behaviour). It EXTENDS the 2026-10-24 rule ("A provider that stalls on two different models rests as a whole"), so
+`provider_stall_rest` must be on too. App names are `_psr_*` and `_provider_rest`, right after `_provider_stalling`.
+
+- **MEASURED live (2026-11-09, evening).** The provider `nvidia` was timing out on ALL its models. The hub learns that one model
+  at a time, and only after each ~2 minute timeout has finished. Several OpenCode sessions started a tool turn on nvidia in the
+  same minute, before the first timeout was recorded, so each waited 127-171 s and then a weak model served anyway. Each stalled
+  model gets a new try when its ten-minute mark (`_RECENT_FAIL_TTL`) expires, so the burst repeated about every ten minutes.
+  (The older park after three requests in a row with a READ timeout, `_note_provider_timeout`, does not count a hop the hub
+  itself stopped waiting for, `_HopBudgetExceeded`.)
+- **The rest.** When a stall (deadline / timeout / reasoning_stall) is filed (`_note_recent_hop_failure` -> `_psr_note_stall`)
+  and two DIFFERENT models of that direct provider carry a stall mark inside the ten minutes -- the existing condition of
+  `_provider_stalling` -- the PROVIDER rests until now + `_PROVIDER_STALL_REST_S` (1800 s). `_provider_stalling(pid)` stays true
+  for that long, also after the per-model marks have expired, so everything that already reads it follows with no change of its
+  own: the tool-sick group (`_tool_turn_sick`), the sibling "timeout" of `_recent_hop_failure`, the opening pick, the two helpers
+  of the section above. While the two-model condition still holds at a later stall, the same rest runs on (30 minutes from that
+  stall); one lone stall during a rest changes nothing.
+- **Probation: one test request.** When the rest runs out the provider is on probation. The next hop really dispatched to it
+  takes the single probe slot (`_psr_claim_probe`), and while that request is in flight `_provider_stalling` is true again for
+  everybody else. Then:
+  - an answer from that provider on ANY model (`_record_outcome(..., True)` -> `_psr_note_answer`; also a passing provider Test)
+    lifts the rest and the probation;
+  - a stall filed for that provider on probation starts a new 30-minute rest at once (one is enough, no second model needed);
+  - a test request that ends with no verdict frees the slot: a refusal, an HTTP error or a request that never left frees it at
+    once (`_psr_probe_done`); a 200 that is never judged an answer, or a timeout nobody filed, after `_PROVIDER_PROBE_S` (300 s);
+  - a probation nobody resolved is forgotten after `_PROVIDER_PROBATION_S` (6 h).
+- **Where the slot is taken: `_dispatch_chat`.** It is the one function every real hop passes through (the three chain loops via
+  `_ChainClock._plain`, hedge legs, the roles actor and swarm stages via `_dispatch_chat_with_deadline`). `_ChainClock.dispatch`
+  would miss the roles and swarm paths; `_upstream_chat` also serves the hub's own probes (provider Test, canary) and is entered
+  once per hop but may post several times. The claim never blocks or delays a call: a hop that reaches a resting or probing
+  provider anyway (its last resort, or the user named `provider/model`) is sent as before. The pure queries
+  (`_provider_stalling`, `_psr_holds`) never take the slot (pinned by a test).
+- **The walk re-checks** (`_psr_walk_pick` in `_ChainClock.walk`). A chain is built before its hops are sent, so a request that
+  had the provider at hop 2 could still walk into it minutes after the rest began or after another request took the probe. At pop
+  time such a hop steps behind the first later hop whose provider is not resting. Reorder only; skipped while nothing rests; the
+  user-named head and the orchestrator's pick never move; a benched pair and the rescue hop are never what it promotes; with
+  nothing else left the resting provider is walked as before.
+- **Guards.** Direct providers only (the relay exclusion of `_provider_stalling`). Nothing is filed for a client that left or for
+  this computer's network (the guards of `_note_recent_hop_failure` run first). Every helper fails open: an error is the
+  ten-minute rule alone. The two flags are read through `_psr_on`, which keeps the answer 2 seconds (`config.get_flag` re-reads
+  config.json, and a resting provider is asked about once per candidate).
+- **Persisted** in learned-state.json, section `provider_rest` (`["provider", pid, {until, n}]`): a probation that ran out is
+  dropped on save and on restore, a live entry is never overwritten, a relay row is ignored, a restored rest is never longer than
+  a fresh one, and the probe slot is not saved (after a restart the first hop is the test request).
+  `tests/test_learned_state_survives_restart.py` pins the section list and was updated.
+- **Log**, provider id and counts only: `[provider-rest] nvidia: 2 of its models stalled inside 10 min; the whole provider rests
+  30 min`, `... rest over, one test request sent ...` (at most once a minute per provider), `... stalled again after its rest;
+  resting another 30 min (rest 2 in a row)`, `... answered again: its rest is lifted ...`.
+- **Negative controls** (app.py copied aside, one piece disabled at a time, restored with `cp`, `cmp` identical): the query
+  (`_psr_holds`) off -> 21 of the 57 tests fail; the recording (`_psr_note_stall`) off -> 34; the probe claim off -> 13; the answer
+  hook off -> 7; the walk re-check off -> 6; the early slot release off -> 4; persistence off -> 3.
+- **Limits, said plainly.**
+  - Recovery is noticed up to 30 minutes late: while a provider rests it is asked only as a last resort or when the user names
+    it, and a weaker model answers meanwhile. A recovered provider then needs one test request to answer before the others return.
+  - Not measured live: the hub was not restarted on this code when this was written.
+  - The two-model condition counts every stall mark, as it always did, including a hop the hub cut before that pair's own median
+    first-token time (`cut_not_a_streak`). Two slow-but-good models cut short inside ten minutes now rest their provider for 30
+    minutes instead of 10.
+  - "One at a time" is not a lock. Two requests that dispatch in the same instant, a hop already sent when the rest began, the
+    user naming `provider/model`, or a chain with nothing else left still reach the provider.
+  - An answer on ANY model lifts the rest, an embedding included. If the provider's other models still stall, it takes two more
+    stalled models (two more slow hops) to rest it again.
+  - A test request that returns 200 and is then judged empty or junk gives no verdict, so the provider reads as stalling for up
+    to 300 s more.
+  - The rest is written by the throttled learned-state save (up to 60 s late); a hard kill inside that minute forgets it.
+  - While a provider rests, `_recent_hop_failure` still reads `provider_stall_any_turn` once per sibling candidate (existing
+    code, now for 30 minutes instead of 10). The cost was not measured.
+
+Release-note: fix: when a provider stops answering on all its models, the hub now sets the whole provider aside for 30 minutes and checks it with one request at a time, instead of letting several sessions wait two minutes on it every ten minutes.

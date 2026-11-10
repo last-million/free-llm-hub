@@ -4578,6 +4578,7 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
         _junk_bench_note(pid, model, junk_source)
     if ok:
         _clear_empty_200(pid, model)    # one delivery ends a failure streak / rest
+        _psr_note_answer(pid)           # ...and the provider-wide rest: it answers again
     _note_tool_turn_outcome(pid, model, ok)
     _save_perf_stats()
 
@@ -5871,6 +5872,7 @@ def _unpark_after_verified_generation(pid, ok_models=()):
             for m in (ok_models or ()):
                 if isinstance(m, str):
                     _dead_models.pop((pid, m), None)
+        _psr_note_answer(pid)        # ...and a provider-wide stall rest: it answers
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -5999,6 +6001,10 @@ def _note_recent_hop_failure(pid, model, kind, streak=True):
         # (see _note_pair_failure); a 429 / junk / invalid kind is not.
         _note_pair_failure(pid, model, "reasoning_stall" if kind == "reasoning_stall"
                            else "deadline")
+    if kind in _RECENT_STALL_KINDS:
+        # Two stalled models, or a stalled test request after a rest: the PROVIDER
+        # rests as a whole (see A PROVIDER THAT KEEPS STALLING RESTS FOR 30 MINUTES).
+        _psr_note_stall(pid)
     _save_learned_state()
 
 
@@ -8650,6 +8656,11 @@ def _dispatch_chat(pid, payload, stream):
     # stream, which is exactly the contention a slow host creates. Fail-open.
     _inflight_inc(pid)
     _released = False
+    # ONE TEST REQUEST AFTER A PROVIDER'S LONG REST (see _psr_claim_probe): this is
+    # the point a hop is really dispatched, so it is where the provider's single
+    # probe slot is taken. None for every ordinary hop; never blocks or delays one.
+    _probe = _psr_claim_probe(pid)
+    _probe_exc = resp = None
     try:
         if stream:
             # A streaming call returns once headers are in, so there is no total
@@ -8696,11 +8707,14 @@ def _dispatch_chat(pid, payload, stream):
         # the hop so no ledger files it against the provider (see
         # _local_net_failed) and the chain clock can pause instead of burning
         # every hop at once. The exception itself passes through unchanged.
+        _probe_exc = exc
         _mark_local_net_failure(pid, (payload or {}).get("model"), exc)
         if isinstance(payload, dict) and payload.get("tools"):
             _note_pair_failure(pid, payload.get("model"), "exc")   # skips a local-net mark
         raise
     finally:
+        if _probe is not None:
+            _psr_probe_done(pid, _probe, resp, _probe_exc)
         if not _released:
             _inflight_dec(pid)
 
@@ -12180,22 +12194,286 @@ def _session_return_pair(key):
 _PROVIDER_STALL_MODELS = 2
 
 
+def _provider_stalled_models(pid, now):
+    """The models of `pid` that carry a fresh stall mark."""
+    with _recent_fail_lock:
+        return {m for (p, m), rec in _recent_hop_fail.items()
+                if p == pid and rec[1] in _RECENT_STALL_KINDS
+                and now - rec[0] <= _RECENT_FAIL_TTL}
+
+
 def _provider_stalling(pid):
     """True while >= _PROVIDER_STALL_MODELS different models of `pid` carry a fresh
-    stall mark. Never raises."""
+    stall mark, and for as long as the provider-wide rest that follows holds (see A
+    PROVIDER THAT KEEPS STALLING RESTS FOR 30 MINUTES, just below). A pure query: it
+    never takes the probe slot. Never raises."""
     try:
         if not pid:
             return False
         now = time.time()
-        with _recent_fail_lock:
-            seen = {m for (p, m), rec in _recent_hop_fail.items()
-                    if p == pid and rec[1] in _RECENT_STALL_KINDS
-                    and now - rec[0] <= _RECENT_FAIL_TTL}
-        if len(seen) < _PROVIDER_STALL_MODELS:
-            return False                       # the common case: no flag read, no relay check
+        if len(_provider_stalled_models(pid, now)) < _PROVIDER_STALL_MODELS:
+            # The common case: no flag read, no relay check -- and nothing on record
+            # in _provider_rest, so _psr_holds answers False without taking a lock.
+            return _psr_holds(pid, now)
         return (not _is_relay_pid(pid)) and bool(config.get_flag("provider_stall_rest", True))
     except Exception:                                            # noqa: BLE001
         return False
+
+
+# A PROVIDER THAT KEEPS STALLING RESTS FOR 30 MINUTES, WITH ONE TEST REQUEST AT A TIME
+# (2026-11-09).
+# MEASURED live the same evening: nvidia timed out on ALL its models. The hub learns that
+# one model at a time, and only once each ~2 minute timeout has finished, so several
+# OpenCode sessions that opened a tool turn on nvidia in the same minute each waited
+# 127-171 s before a weak model served anyway. And every stalled pair gets a fresh try
+# when its ten-minute mark (_RECENT_FAIL_TTL) runs out, so the burst came back about every
+# ten minutes.
+# THE RULE. When a stall is filed and the two-model condition above holds, the PROVIDER
+# rests until now + _PROVIDER_STALL_REST_S, and _provider_stalling stays true for that
+# long whatever the per-pair marks do -- so everything that already reads it (the
+# tool-sick group, the sibling "timeout" of _recent_hop_failure, the opening pick) follows
+# with no change of its own. When the rest runs out the provider is on PROBATION: the next
+# hop really dispatched to it (_dispatch_chat) is its ONE TEST REQUEST, and while that is
+# in flight every other request still sees the provider as stalling. An answer from any of
+# its models (_record_outcome) lifts everything. A stall filed on probation starts a new
+# rest at once: one is enough. A test request that ends with no verdict frees its slot (a
+# refusal or an error: at once; anything else after _PROVIDER_PROBE_S), and a probation
+# nobody resolved is forgotten after _PROVIDER_PROBATION_S.
+# GUARDS. Direct providers only (the relay exclusion above). Nothing is filed for a client
+# that left or for this computer's network (_note_recent_hop_failure's own guards run
+# first). Reorder only, never a block: a chain with nothing else left, or an explicit
+# provider/model request, still goes to it, test request in flight or not. Every helper
+# fails open (an error = the ten-minute marks alone). Persisted with the learned state
+# (section "provider_rest"; the probe slot is not). Flag `provider_stall_long_rest`
+# (default on; it extends `provider_stall_rest`, so that one must be on too); off = the
+# behaviour before it, exactly.
+_PROVIDER_STALL_REST_S = 1800.0
+_PROVIDER_PROBE_S = 300.0            # a test request with no verdict frees its slot
+_PROVIDER_PROBATION_S = 6 * 3600.0   # a probation nobody resolved is forgotten
+_PSR_FLAG_TTL = 2.0
+_PSR_PROBE_LOG_S = 60.0              # "test request sent" is logged at most this often
+_provider_rest = {}      # pid -> {"until": epoch, "n": rests in a row, "probe": None | {"at": epoch}}
+_provider_rest_lock = threading.Lock()
+_psr_flag_cache = {}     # {"v": (config.get_flag, monotonic, on)}
+
+
+def _psr_on():
+    """Both switches on: `provider_stall_long_rest` and the `provider_stall_rest` it
+    extends. config.get_flag re-reads config.json and this is asked once per candidate
+    while a provider rests, so the answer is kept _PSR_FLAG_TTL seconds -- per reader, so
+    a replaced config.get_flag (the tests) is never served another reader's answer. A
+    read that raises counts as off."""
+    try:
+        fn = config.get_flag
+        now = time.monotonic()
+        hit = _psr_flag_cache.get("v")
+        if hit and hit[0] is fn and now - hit[1] < _PSR_FLAG_TTL:
+            return hit[2]
+        try:
+            on = (bool(fn("provider_stall_long_rest", True))
+                  and bool(fn("provider_stall_rest", True)))
+        except Exception:                                        # noqa: BLE001
+            on = False
+        _psr_flag_cache["v"] = (fn, now, on)
+        return on
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _psr_holds(pid, now=None):
+    """True while `pid` is inside its provider-wide rest, or on probation with a test
+    request in flight. A pure query (it never takes the probe slot); the only thing it
+    writes is the removal of a probation that ran out. Never raises."""
+    if not _provider_rest:
+        return False                 # the common case: nothing rests, no lock, no flag
+    try:
+        now = time.time() if now is None else now
+        with _provider_rest_lock:
+            rec = _provider_rest.get(pid)
+            if not rec:
+                return False
+            until = float(rec["until"])
+            if now < until:
+                held = True
+            elif now >= until + _PROVIDER_PROBATION_S:
+                _provider_rest.pop(pid, None)
+                held = False
+            else:
+                probe = rec.get("probe")
+                held = bool(probe) and now - float(probe["at"]) < _PROVIDER_PROBE_S
+        return bool(held and _psr_on() and not _is_relay_pid(pid))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _psr_note_stall(pid):
+    """A stall was just filed for one of `pid`'s models (by _note_recent_hop_failure,
+    which has already ruled out a client that left and a local network failure).
+    Two different stalled models start the provider-wide rest; while they still stall
+    a running rest runs on; on probation ONE stall starts a new rest at once. Never
+    raises."""
+    try:
+        if not pid or _is_relay_pid(pid) or not _psr_on():
+            return
+        now = time.time()
+        stalled = len(_provider_stalled_models(pid, now))
+        event = None
+        with _provider_rest_lock:
+            rec = _provider_rest.get(pid)
+            if rec and now >= float(rec["until"]) + _PROVIDER_PROBATION_S:
+                _provider_rest.pop(pid, None)       # a forgotten probation: start over
+                rec = None
+            if rec is None:
+                if stalled < _PROVIDER_STALL_MODELS:
+                    return                          # one stalled model: that pair's business
+                rec = {"until": now + _PROVIDER_STALL_REST_S, "n": 1, "probe": None}
+                _provider_rest[pid] = rec
+                event = "rest"
+            elif now < float(rec["until"]):
+                if stalled >= _PROVIDER_STALL_MODELS:
+                    rec["until"] = now + _PROVIDER_STALL_REST_S     # still stalling
+            else:
+                rec["until"] = now + _PROVIDER_STALL_REST_S
+                rec["n"] = int(rec.get("n") or 1) + 1
+                rec["probe"] = None
+                event = "again"
+            n = int(rec.get("n") or 1)
+        mins = int(_PROVIDER_STALL_REST_S // 60)
+        if event == "rest":
+            _log.info("[provider-rest] %s: %d of its models stalled inside %d min; the whole "
+                      "provider rests %d min", pid, stalled, int(_RECENT_FAIL_TTL // 60), mins)
+        elif event == "again":
+            _log.info("[provider-rest] %s stalled again after its rest; resting another %d min "
+                      "(rest %d in a row)", pid, mins, n)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _psr_note_answer(pid):
+    """A real answer from `pid`, on any model: it is answering again, so its rest and
+    its probation go. Never raises."""
+    if not _provider_rest:
+        return                       # the common case: nothing rests, no lock taken
+    try:
+        with _provider_rest_lock:
+            rec = _provider_rest.pop(pid, None)
+        if rec:
+            _log.info("[provider-rest] %s answered again: its rest is lifted (after %d rest(s) "
+                      "in a row)", pid, int(rec.get("n") or 1))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _psr_claim_probe(pid):
+    """Called where a hop is really dispatched (_dispatch_chat), never by a query. When
+    `pid`'s rest has run out and no test request is in flight, THIS hop becomes the
+    provider's one test request: the token to hand back to _psr_probe_done. None for
+    every other hop -- which is still sent: nothing here blocks or delays a call.
+    Never raises."""
+    if not _provider_rest:
+        return None
+    try:
+        if not _psr_on():
+            return None
+        now = time.time()
+        with _provider_rest_lock:
+            rec = _provider_rest.get(pid)
+            if not rec:
+                return None
+            until = float(rec["until"])
+            if now < until:
+                return None                         # still resting: a last-resort hop
+            if now >= until + _PROVIDER_PROBATION_S:
+                _provider_rest.pop(pid, None)
+                return None
+            probe = rec.get("probe")
+            if probe and now - float(probe["at"]) < _PROVIDER_PROBE_S:
+                return None                         # another request's test is in flight
+            token = {"at": now}
+            rec["probe"] = token
+            say = now - float(rec.get("said") or 0) >= _PSR_PROBE_LOG_S
+            if say:
+                rec["said"] = now
+            n = int(rec.get("n") or 1)
+        if say:
+            _log.info("[provider-rest] %s: rest over, one test request sent (after %d rest(s) "
+                      "in a row); the others wait for its answer", pid, n)
+        return token
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _psr_probe_done(pid, token, resp, exc):
+    """The hop that holds `pid`'s test request (`token`) has returned or raised. A 200
+    is not a verdict yet (the answer is judged later: _record_outcome lifts the rest, a
+    stall mark renews it) and neither is a timeout (the caller files that stall), so
+    the slot stays taken, at most _PROVIDER_PROBE_S. Anything else -- a refusal, an
+    HTTP error, a request that never left -- frees it now for the next request. Never
+    raises."""
+    if token is None:
+        return
+    try:
+        if isinstance(exc, requests.exceptions.Timeout):
+            return
+        if exc is None and getattr(resp, "status_code", None) == 200:
+            return
+        with _provider_rest_lock:
+            rec = _provider_rest.get(pid)
+            if rec and rec.get("probe") is token:
+                rec["probe"] = None
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _psr_walk_pick(rest, i, ok=None):
+    """For _ChainClock.walk: the index to pop instead of `i` when rest[i]'s provider is
+    inside its provider-wide rest or waiting on another request's test request -- the
+    first LATER hop the walk may take (`ok`) whose provider is not. A chain is built
+    before its hops are sent, so without this a request that had the provider at hop 2
+    still walked into it minutes after the rest began. `i` when nothing rests or nothing
+    else is left (the resting provider is then the last resort it always was). Reorder
+    only; never raises."""
+    if not _provider_rest:
+        return i
+    try:
+        if not _psr_holds(rest[i][0]):
+            return i
+        for k in range(i + 1, len(rest)):
+            e = rest[k]
+            if not _psr_holds(e[0]) and (ok is None or ok(e)):
+                return k
+    except Exception:                                            # noqa: BLE001
+        pass
+    return i
+
+
+def _psr_pack(now):
+    """The "provider_rest" section of the learned state: ["provider", pid, {until, n}]
+    (the first two slots are what _ls_rows requires). A probation that ran out is left
+    out; the probe slot is never saved. Never raises."""
+    try:
+        with _provider_rest_lock:
+            return [["provider", str(pid), {"until": float(rec["until"]),
+                                            "n": int(rec.get("n") or 1)}]
+                    for pid, rec in list(_provider_rest.items())
+                    if pid and now < float(rec["until"]) + _PROVIDER_PROBATION_S]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _psr_restore_row(pid, saved, now):
+    """One saved row back into _provider_rest. Skipped: a relay, a probation that ran
+    out, an entry already live. A rest never comes back longer than a fresh one."""
+    until = float(saved["until"])
+    if not pid or _is_relay_pid(pid) or now >= until + _PROVIDER_PROBATION_S:
+        return False
+    until = min(until, now + _PROVIDER_STALL_REST_S)
+    with _provider_rest_lock:
+        if pid in _provider_rest:
+            return False
+        _provider_rest[pid] = {"until": until, "n": max(1, int(saved.get("n") or 1)),
+                               "probe": None}
+    return True
 
 
 def _tool_turn_sick(pid, model):
@@ -41251,6 +41529,20 @@ class _ChainClock:
                     if i is None:
                         i = next((k for k, e in enumerate(rest)
                                   if not _is_pair_benched(e[0], e[1])), 0)
+                if _provider_rest and len(rest) > 1 and not (
+                        first and (self.pinned
+                                   or _is_orchestrator_lead(rest[0][0], rest[0][1]))):
+                    # The hop's PROVIDER began its provider-wide rest, or another
+                    # request took its one test request, after this chain was built
+                    # (see A PROVIDER THAT KEEPS STALLING RESTS FOR 30 MINUTES): the
+                    # hops that need not wait for it go first. Only REORDERS; the
+                    # user-named head and the orchestrator's pick never move, a
+                    # benched pair and the rescue hop are never what it promotes,
+                    # and with nothing resting (the usual case) this is skipped.
+                    i = _psr_walk_pick(
+                        rest, i, ok=lambda e: (not self._demoted(e[0])
+                                               and not _is_pair_benched(e[0], e[1])
+                                               and e[0] not in (self._rescue or ())))
                 if self._rate_spread and len(rest) > 1 and not (
                         first and (self.pinned
                                    or _is_orchestrator_lead(rest[0][0], rest[0][1]))):
@@ -48342,6 +48634,7 @@ def _bandit_credit(messages):
 # from turn-roles.jsonl), _REASONING_REJECTED / _PARAM_REJECTED (no expiry; re-learned for
 # the price of one transparently retried 400), _PLANNER_FAILED (10 minutes). Flag
 # `persist_learned_state` (default on); off = nothing saved or restored, the old boot.
+# Added 2026-11-09: the provider-wide rests (_provider_rest, section "provider_rest").
 _LS_TTFT_KEEP = 40
 _LS_TTFT_TTL = 7 * 86400.0
 _ls_ttft_sig = {}            # (pid, model) -> ((len, last sample), epoch that list last changed)
@@ -48415,6 +48708,9 @@ def _ls_pack(now=None):
                               "at": float(e.get("at") or 0), "src": str(e.get("src") or "probe")}]
                 for k, e in list(_TRUNC.items())
                 if e.get("ceiling") and now - float(e.get("at") or 0) <= _trunc_ttl(e.get("src"))]
+        # providers inside their provider-wide rest or on probation after it:
+        # ["provider", pid, {until, n}] (see _psr_pack)
+        out["provider_rest"] = _psr_pack(now)
         return out
     except Exception:                                            # noqa: BLE001
         return {}
@@ -48548,6 +48844,7 @@ def _ls_restore(blob, now=None):
             _TRUNC[k] = {"ceiling": c, "at": at, "src": src}
         return True
     each("trunc", trunc)
+    each("provider_rest", lambda key, row: _psr_restore_row(row[1], row[2], now))
     return n
 
 

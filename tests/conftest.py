@@ -70,9 +70,12 @@ def _clear_recent_hop_failures():
     if isinstance(ledger, dict):
         ledger.clear()
     # Tool-turn ledgers (per-pair TTFT/outcomes, per-relay-server failures).
+    # _provider_rest / _psr_flag_cache: the provider-wide rest that two stalled
+    # models start (app._psr_note_stall) and its 2-second flag memo; tests share
+    # provider ids ("nvidia", "pa"...), so a rest would follow them into the next test.
     for name in ("_tool_ttft", "_tool_outcomes", "_relay_tool_fail",
                  "_swarm_member_fail", "_empty_200", "_pair_rest", "_local_net_marks",
-                 "_PLANNER_FAILED"):
+                 "_PLANNER_FAILED", "_provider_rest", "_psr_flag_cache"):
         other = getattr(mod, name, None) if mod else None
         if isinstance(other, dict):
             other.clear()

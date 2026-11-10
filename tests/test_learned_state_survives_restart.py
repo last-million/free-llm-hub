@@ -23,7 +23,7 @@ import config
 import learnstate
 
 DICTS = ("_tool_ttft", "_long_ctx_speed", "_chain_seen", "_recent_hop_fail", "_empty_200",
-         "_pair_rest", "_THINKING_LEARNED", "_SYSTEM_FIRST", "_ls_ttft_sig")
+         "_pair_rest", "_THINKING_LEARNED", "_SYSTEM_FIRST", "_ls_ttft_sig", "_provider_rest")
 
 
 @pytest.fixture
@@ -51,6 +51,8 @@ def _fill(now):
     A._long_ctx_speed[("nvidia", "kimi-k3")] = [(now - 100, 90000.0, True)]
     A._THINKING_LEARNED[("inception", "mercury-3")] = now - 100
     A._SYSTEM_FIRST[("uncloseai", "Qwen3.8-27B")] = now - 100
+    # a provider inside its provider-wide rest (2026-11-09, tests/test_provider_long_rest.py)
+    A._provider_rest["nvidia"] = {"until": now + 900, "n": 2, "probe": None}
 
 
 def test_everything_comes_back_after_a_restart(world):
@@ -59,7 +61,8 @@ def test_everything_comes_back_after_a_restart(world):
     assert A._save_learned_state(force=True) is True
     assert world.exists()
     _clear()
-    assert A._load_learned_state() == 8
+    assert A._load_learned_state() == 9
+    assert A._provider_rest["nvidia"] == {"until": now + 900, "n": 2, "probe": None}
     assert A._tool_ttft[("nvidia", "z-ai/glm-5.3")] == [31000.0, 33000.0, 30500.0]
     assert A._recent_hop_fail[("nvidia", "z-ai/glm-5.3-flash")] == (now - 30, "timeout")
     assert A._pair_rest[("g4f", "srv_x:gpt-5")] == {"until": now + 1800, "level": 2,
@@ -97,9 +100,10 @@ def test_rows_past_their_own_ttl_are_not_even_written(world):
     A._long_ctx_speed[("e", "m")] = [(now - A.LONG_CTX_SPEED_TTL - 5, 1.0, False)]
     A._THINKING_LEARNED[("f", "m")] = now - A._THINKING_LEARNED_TTL - 5
     A._SYSTEM_FIRST[("g", "m")] = now - A._SYSTEM_FIRST_TTL - 5
+    A._provider_rest["h"] = {"until": now - A._PROVIDER_PROBATION_S - 5, "n": 1, "probe": None}
     pack = A._ls_pack(now)
     for name in ("recent_fail", "pair_rest", "empty_200", "chain_seen", "long_ctx",
-                 "thinking", "system_first"):
+                 "thinking", "system_first", "provider_rest"):
         assert pack[name] == [], name
 
 
@@ -125,6 +129,7 @@ def test_stale_rows_in_an_old_file_are_skipped_on_restore(world):
         "long_ctx": [["a", "m", [[now - 99999, 10.0, False]]]],
         "thinking": [["a", "m", old]],
         "system_first": [["a", "m", old]],
+        "provider_rest": [["provider", "a", {"until": old, "n": 3}]],
     }}))
     assert A._load_learned_state() == 0
     assert not any(getattr(A, n) for n in DICTS)
@@ -239,5 +244,10 @@ def test_the_saved_file_is_plain_json_with_no_secrets_by_construction(world):
     assert data["schema"] == 1 and isinstance(data["saved"], float)
     # "trunc" (2026-10-26): per relay gateway, a label like "g4f|pa:fec3c477", a token count
     # and a timestamp -- see tests/test_truncation_probe.py.
+    # "provider_rest" (2026-11-09): per provider id, when its provider-wide rest ends and
+    # how many it has had in a row -- see tests/test_provider_long_rest.py.
     assert set(data["dicts"]) == {"tool_ttft", "long_ctx", "chain_seen", "recent_fail",
-                                  "empty_200", "pair_rest", "thinking", "system_first", "trunc"}
+                                  "empty_200", "pair_rest", "thinking", "system_first", "trunc",
+                                  "provider_rest"}
+    assert data["dicts"]["provider_rest"] == [
+        ["provider", "nvidia", {"until": A._provider_rest["nvidia"]["until"], "n": 2}]]
