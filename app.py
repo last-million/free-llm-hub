@@ -31820,6 +31820,19 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     # every install (2026-10-23, nemotron_gen); they stay on his own machine.
     "lfm-3-1.7b",
     "nemotron-3-ultra-550b-a55b",
+    # OWNER DECISION 2026-11-11: Recursive Flint v1.0 (hub score 10, no board lists it).
+    # MEASURED the same day on his OpenCode session: it typed its sub-agent calls as
+    # text instead of calling the tool and wrote one reply that looped to 59,071
+    # characters. The identity covers every host that lists it (openrouter, kilocode,
+    # the g4f copies); a later Flint version is a different identity and is not blocked.
+    "flint-v1.0",
+    # OWNER DECISION 2026-11-11, same day: the old free GLM 4.x Flash models (hub score 10
+    # and 30) kept answering turns while newer models existed. These are the three GLM 4.x
+    # ids the fleet lists (Z.AI's own glm-4.5-flash / glm-4.6v-flash / glm-4.7-flash and
+    # ZenMux's -free copies, one identity each). GLM 5.x is not touched.
+    "glm-4.5-flash",
+    "glm-4.6v-flash",
+    "glm-4.7-flash",
 })
 # Identities this hub SHIPPED as blocked once and no longer does (the 3.5 chat
 # variants of Nemotron, 2026-10-23: nemotron_gen). Shipping is a one-way door --

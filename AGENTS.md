@@ -10714,3 +10714,30 @@ owner asked for the rest of that session's problems to be fixed, for every CLI, 
   - Not run against a live model; the stored 59K reply was replayed through the new code.
 
 Release-note: fix: a reply that keeps repeating the same block is now cut instead of running until your CLI gives up, and a provider that keeps timing out is re-tested less often, so fewer of your turns wait two minutes on it.
+
+## Default blocklist, owner's 2026-11-11 additions
+
+Covered by two tests added to `tests/test_default_blocklist.py`. `_DEFAULT_BLOCKED_IDENTITIES` gained four identities at
+the owner's request, and `_seed_default_blocks` delivers them once to every install on its next boot (an untick is
+respected, as always):
+
+- `flint-v1.0` (Recursive Flint v1.0, hub score 10, on no board). MEASURED the same day: it typed its sub-agent calls as
+  text and wrote one reply that looped to 59,071 characters (the two sections above). The identity covers
+  `recursive/flint-v1.0:free` on openrouter and kilocode and the g4f copies; a later Flint version is another identity.
+- `glm-4.5-flash`, `glm-4.6v-flash` and `glm-4.7-flash` (hub score 10, 30 and 30): Z.AI's own free GLM 4.x models and
+  ZenMux's `-free` copies of two of them. They are the only GLM 4.x ids the fleet lists; the paid `glm-4.5` / `glm-4.6` /
+  `glm-4.7` are other identities and were not added. GLM 5.x stays routable.
+- **Consequences, MEASURED on the owner's fleet the same day and said plainly.**
+  - The `glm` provider (Z.AI's own free tier) lists exactly those three models, so it has NOTHING routable left; ZenMux
+    keeps two models that were both dead that day. Both stay in the registry and can be switched off on the Providers page.
+  - GLM 4.5 Flash and 4.7 Flash were often the models that ANSWERED (in 10-25 s) on the evenings when nvidia, dahl and g4f
+    were all failing. With them blocked, such a turn falls to what is left (the rescue provider, the Nemotron 3.5
+    models) or ends in an error sooner. That is the owner's choice of quality over availability.
+  - `glm-4.6v-flash` was a vision model. 30 vision-capable models stay routable (nvidia 5, kilocode 1, openrouter 1 and
+    the g4f copies), so image turns are still served, with fewer fallbacks.
+  - Kilo Code's only built-in default model is `recursive/flint-v1.0:free`, and all three `glm` defaults and both ZenMux
+    defaults are now blocked ids. The registry rows were left as they are (they are the fallback when discovery fails,
+    and live discovery still lists Kilo Code's other free ids); on an install where discovery fails those providers have
+    nothing routable.
+
+Release-note: improved: Flint v1.0 and the old GLM 4.5, 4.6 and 4.7 Flash models are now blocked by default, so the hub no longer falls back to them.

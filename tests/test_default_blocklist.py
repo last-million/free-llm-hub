@@ -149,6 +149,34 @@ def test_the_owners_newer_blocks_ship_and_the_current_nemotron_does_not():
     assert "nemotron-3.5-content-safety" in A._DEFAULT_BLOCKED_IDENTITIES
 
 
+def test_flint_v1_0_ships_blocked_on_every_host_that_lists_it(store):
+    """OWNER DECISION 2026-11-11: Recursive Flint v1.0 is blocked for every install."""
+    assert "flint-v1.0" in A._DEFAULT_BLOCKED_IDENTITIES
+    A._seed_default_blocks()
+    with A.app.test_request_context("/v1/chat/completions"):
+        for pid, mid in (("openrouter", "recursive/flint-v1.0:free"),
+                         ("kilocode", "recursive/flint-v1.0:free"),
+                         ("g4f", "srv_monk1pkz433a519ff2be:recursive/flint-v1.0:free")):
+            assert A._is_model_blocked_by_user(pid, mid), (pid, mid)
+        # a later Flint release is another identity: it is not blocked by this entry
+        assert not A._is_model_blocked_by_user("openrouter", "recursive/flint-v2:free")
+
+
+def test_the_old_glm_flash_models_ship_blocked_and_the_newer_ones_do_not(store):
+    """OWNER DECISION 2026-11-11: GLM 4.5 / 4.6V / 4.7 Flash are blocked for every install."""
+    assert {"glm-4.5-flash", "glm-4.6v-flash", "glm-4.7-flash"} <= A._DEFAULT_BLOCKED_IDENTITIES
+    A._seed_default_blocks()
+    with A.app.test_request_context("/v1/chat/completions"):
+        for pid, mid in (("glm", "glm-4.5-flash"), ("glm", "glm-4.6v-flash"),
+                         ("glm", "glm-4.7-flash"), ("zenmux", "z-ai/glm-4.6v-flash-free"),
+                         ("zenmux", "z-ai/glm-4.7-flash-free")):
+            assert A._is_model_blocked_by_user(pid, mid), (pid, mid)
+        # the current generation stays routable
+        for pid, mid in (("dahl", "zai-org/GLM-5.3-Flash"), ("nvidia", "z-ai/glm-5.3"),
+                         ("nvidia", "z-ai/glm-5.3-flash")):
+            assert not A._is_model_blocked_by_user(pid, mid), (pid, mid)
+
+
 def test_nothing_install_specific_is_shipped():
     for ident in A._DEFAULT_BLOCKED_IDENTITIES:
         assert not ident.startswith(("srv_", "pa:")), ident     # g4f backend ids
