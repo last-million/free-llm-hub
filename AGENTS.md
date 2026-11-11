@@ -10807,4 +10807,11 @@ as default use the best model available image generation, not any randomly".
     keep their old relative order.
   - The probe made 5 anonymous image requests to Pollinations; nothing else was sent anywhere.
 
+- **The marks the old reading left** (`_image_dead_marks_sweep`, at boot, once per install, setting
+  `image_dead_marks_cleared_v1`). MEASURED on the owner's hub the same evening, on the old code: one FLUX image at
+  04:39 and a second try inside 45 s left Pollinations FLUX + Turbo and AI Horde marked dead for 6 h, so Auto had NO
+  free image model and the owner switched to a paid Puter model. The boot step drops the dead marks of FREE
+  image-model ids only (never a chat model, never the user's own blocklist, which is a separate list); a model
+  that is really gone is marked again by its first failed request.
+
 Release-note: improved: automatic image generation now picks the best-rated available model, waits its turn for Pollinations' free FLUX instead of dropping to a weaker model for six hours, and the Images page says which model Auto is really using.

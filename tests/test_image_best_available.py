@@ -620,3 +620,35 @@ def test_a_saved_pollen_key_never_queues(clock, monkeypatch):
     assert status == 429
     assert clock.naps == [] and times[1] == times[0] and len(times) == 3
     assert app._image_pace_next == {}
+
+
+# --------------------------------------------------------------------------- #
+# 6. The marks the old reading left are cleared once
+# --------------------------------------------------------------------------- #
+
+def test_the_stale_image_dead_marks_are_cleared_once(monkeypatch):
+    settings = {}
+    monkeypatch.setattr(config, "get_setting", lambda k, d=None: settings.get(k, d))
+    monkeypatch.setattr(config, "set_setting", lambda k, v: settings.__setitem__(k, v))
+    future = 9_999_999_999.0
+    keep = {("pollinations", "openai-fast"): future,           # a CHAT model of the same provider
+            ("puter", "ai-image"): future,                      # a paid image model: not this clean-up's business
+            ("nvidia", "z-ai/glm-5.3"): future}
+    clear = {("pollinations", "flux"): future, ("pollinations", "turbo"): future,
+             ("aihorde", "stable_diffusion"): future}
+    monkeypatch.setattr(app, "_dead_models", {**keep, **clear})
+    monkeypatch.setattr(app, "_auto_blocked", {})
+    assert app._image_dead_marks_sweep(now=100.0) == 3
+    assert app._dead_models == keep
+    assert settings["image_dead_marks_cleared_v1"] == 100
+    # never twice: a model really dead after this is left dead
+    app._dead_models[("pollinations", "flux")] = future
+    assert app._image_dead_marks_sweep(now=200.0) == 0
+    assert ("pollinations", "flux") in app._dead_models
+
+
+def test_the_clean_up_never_raises(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("config unreadable")
+    monkeypatch.setattr(config, "get_setting", boom)
+    assert app._image_dead_marks_sweep() == 0

@@ -5539,6 +5539,44 @@ def _auto_block_sweep(now=None):
         return 0
 
 
+def _image_dead_marks_sweep(now=None):
+    """Once per install (setting `image_dead_marks_cleared_v1`): drop the "dead"
+    marks on FREE image models. Returns how many were dropped. Never raises.
+
+    WHY (MEASURED 2026-11-11 on the owner's hub): before 7fc5a04 the image path
+    marked a model dead for 6 h on any 402, and Pollinations answers its free
+    "one image every 45 s" limit with HTTP 402. One image followed too soon by a
+    second left Pollinations FLUX and Turbo (and AI Horde) dead for 6 h, so Auto
+    had NO free image model at all. The new code reads that reply as a limit;
+    this clears what the old code left. Only image-model ids of free rows are
+    touched, never a chat model and never a model the user switched off (that is
+    a separate list). A model that really is gone is marked again by its first
+    failed request."""
+    try:
+        if config.get_setting("image_dead_marks_cleared_v1"):
+            return 0
+        now = time.time() if now is None else now
+        pairs = set()
+        for p in prov.list_providers():
+            for row in _image_model_rows(p["id"]):
+                if row.get("free", True):
+                    pairs.add((p["id"], str(row["id"])))
+        n = 0
+        with _dead_lock:
+            for key in pairs:
+                if _dead_models.pop(key, None) is not None:
+                    n += 1
+                _auto_blocked.pop(key, None)
+        config.set_setting("image_dead_marks_cleared_v1", int(now))
+        if n:
+            _log.info("[images] cleared %d stale 'dead' mark(s) on free image models "
+                      "(set by the old reading of a free rate limit)", n)
+        return n
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[images] dead-mark clean-up skipped: %s", _sanitize(str(exc), 200))
+        return 0
+
+
 # PROVIDER-level sideline. When a provider fails AUTH/credit (401/402/403) across
 # several DIFFERENT models, the KEY itself is the problem (wrong token / no model
 # access / out of credits — e.g. a github-models token with 403 on everything, or
@@ -59035,6 +59073,7 @@ if __name__ == "__main__":
     _load_learned_state()      # slow / resting / failing pairs the last run had learned
     _seed_last_answer()        # last-answer time for records older than it
     _auto_block_sweep()        # once: block the pairs that never answered (24 h)
+    _image_dead_marks_sweep()  # once: clear image "dead" marks the old 402 reading left
     try:
         # Swarm runs outlive the process that started them. The hub restarts
         # itself every five hours to git pull, and before this a swarm that
