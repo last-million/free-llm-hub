@@ -390,6 +390,76 @@ def _line_loop(masked, prompt_text, finish_reason=None):
     return None
 
 
+# A BLOCK THAT COMES BACK (2026-11-11). _line_loop needs the same line back to back and
+# _tail_loop a unit of at most 160 chars, so a reply that repeats a whole BLOCK of several
+# lines (a paragraph, a typed call, "... End of turn. Done.") again and again was never a
+# loop. MEASURED: one streamed reply ran to 59,071 chars -- an 824-char line 8 times, a
+# 67-char line 23 times, never twice in a row -- until the client cut it after 130 s.
+# The SAME long line coming back, with other lines in between, is the signal: 4 copies of a
+# line of 200+ chars, 6 of a 60+ char prose line, 12 of a structured one (list item, log
+# line, key: value record). Never inside a code fence, never a table row, never a line the
+# prompt itself contains.
+_SCATTER_MIN_LEN = 60
+_SCATTER_LONG_LEN = 200
+_SCATTER_LONG_RUN = 4
+_SCATTER_RUN = 6
+_SCATTER_STRUCT_RUN = 12
+_SCATTER_MAX_KEYS = 4000
+
+
+def _scatter_count(line, counts, prompt_text):
+    """Count one finished line; True when this copy makes it a loop."""
+    norm = line.strip()
+    if (len(norm) < _SCATTER_MIN_LEN or norm.startswith("|") or norm.count("|") >= 2
+            or _PUA_RE.search(norm) or sum(1 for c in norm if c.isalpha()) < 12):
+        return False
+    if prompt_text and norm in prompt_text:
+        return False
+    n = counts.get(norm, 0) + 1
+    if n == 1 and len(counts) >= _SCATTER_MAX_KEYS:
+        return False
+    counts[norm] = n
+    if len(norm) >= _SCATTER_LONG_LEN:
+        return n >= _SCATTER_LONG_RUN
+    return n >= (_SCATTER_STRUCT_RUN if _line_is_structured(line) else _SCATTER_RUN)
+
+
+def _scattered_loop(masked, prompt_text):
+    """Offset of the copy that makes a long line a loop (see above), or None. `masked`
+    has its code fences replaced, so code never counts."""
+    counts, pos = {}, 0
+    for line in masked.split("\n"):
+        start = pos
+        pos += len(line) + 1
+        if _scatter_count(line, counts, prompt_text):
+            return start
+    return None
+
+
+def _scattered_loop_stream(text, state, prompt_text):
+    """The same rule for a growing stream: only the lines finished since the last call are
+    read (`state` keeps the counts), so it stays O(new text). Absolute offset or None."""
+    pos = state.get("sc_pos", 0)
+    if pos > len(text):
+        pos, state["sc_counts"], state["sc_fence"] = 0, {}, False
+    end = text.rfind("\n") + 1
+    if end <= pos:
+        return None
+    counts = state.setdefault("sc_counts", {})
+    fence = bool(state.get("sc_fence"))
+    hit = None
+    for line in text[pos:end].split("\n")[:-1]:
+        start = pos
+        pos += len(line) + 1
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        if not fence and hit is None and _scatter_count(line, counts, prompt_text):
+            hit = start
+    state["sc_pos"], state["sc_fence"] = end, fence
+    return hit
+
+
 def _loop_lines_structured(region):
     """True when every whole line of a loop region (its first line may be a
     partial copy, so it is skipped; so is a last line still being written)
@@ -1849,6 +1919,8 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             ("repetition", lambda: _line_loop(loop_masked, prompt_text, loop_fin)),
             ("repetition", lambda: _tail_loop(loop_masked, prompt_text, loop_fin)),
             ("repetition", lambda: _glued_loop(loop_masked, prompt_text, loop_fin)),
+            ("repetition", lambda: (_scattered_loop(loop_masked, prompt_text)
+                                    if _flag("scattered_loop_cut", True) else None)),
             ("separator_run", lambda: _separator_run(masked, finish_reason)),
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
             ("reasoning_leak", lambda: _reasoning_leak(masked, prompt_text)),
@@ -1971,6 +2043,11 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
         loop_masked = _mask_fences_distinct(body)
         # A reply ALREADY in a foreign script is not switching now; whole-reply
         # script judgement was inspect()'s job on the head.
+        # A block that comes back (see _SCATTER_MIN_LEN): only with a caller's `state`,
+        # which keeps the line counts across calls.
+        scattered = None
+        if state is not None and _flag("scattered_loop_cut", True):
+            scattered = _scattered_loop_stream(text, state, prompt_text)
         if state is None:
             state = {}
         pos = state.get("fpos", 0)
@@ -2007,7 +2084,8 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
         if r is not None:
             found.append(r - start + len(pad))
         if not found:
-            return None
-        return max(0, start + min(found) - len(pad))
+            return scattered
+        cut = max(0, start + min(found) - len(pad))
+        return cut if scattered is None else min(cut, scattered)
     except Exception:                                            # noqa: BLE001
         return None

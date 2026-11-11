@@ -622,10 +622,41 @@ _STOP_NOTE_RE = re.compile(
     r"(?:done\.?\s*)?$")
 
 
+_TRAILING_RULE_RE = re.compile(r"(?:\s*\n[ \t]*[-*_.…=]{3,}[ \t]*)+\s*$")
+
+
 def _drop_stop_note(text):
     if not text:
         return text
-    return _STOP_NOTE_RE.sub("", text).rstrip()
+    # A separator line ("---") the model put after its note does not save the note.
+    body = _TRAILING_RULE_RE.sub("", text)
+    out = _STOP_NOTE_RE.sub("", body)
+    return out.rstrip() if out != body else text
+
+
+# A TYPED CALL THAT COMES BACK IS A LOOP (2026-11-11). MEASURED: the same three "<task N>"
+# blocks typed eight times over, 30,000 more characters, until the client gave up after
+# 130 s. A held reply is checked every _REPEAT_CHECK_EVERY characters: once a COMPLETE
+# block repeats an earlier one, everything from the repeat on is dropped and the calls
+# typed before it are handed over at once. _HOLD_MAX_CHARS bounds any held reply.
+_REPEAT_CHECK_EVERY = 1500
+_HOLD_MAX_CHARS = 400000
+
+
+def _tag_repeat_start(markup, names, schemas=None):
+    """Offset in `markup` of the first "<tool N>" block that repeats an earlier one, or
+    None. The LAST block is never judged: it may still be being typed."""
+    blocks = _tag_blocks(markup, names, schemas)
+    seen = set()
+    for start, _end, name, args in blocks[:-1]:
+        try:
+            key = (name, json.dumps(args, sort_keys=True))
+        except (TypeError, ValueError):
+            continue
+        if key in seen:
+            return start
+        seen.add(key)
+    return None
 
 
 def _strip_typed(markup, names=None, schemas=None):
@@ -1115,6 +1146,7 @@ def rescue_stream(items, tools, framing="lines"):
     ticks = 0              # backticks in the text passed through (see _markup_start)
     bol = True             # the text passed through so far ends at a line start
     tag_open = False       # the held text opened on a "<tool N>" header (see _TAG_HEAD_RE)
+    checked = 0            # len(markup) at the last repeat check (see _tag_repeat_start)
 
     def finalize(fin_obj):
         calls = parse(markup, allowed_names=names, schemas=schemas)
@@ -1184,6 +1216,24 @@ def rescue_stream(items, tools, framing="lines"):
                 mode = "done"
                 if kind == "done":
                     yield unit
+            elif text and len(markup) - checked >= _REPEAT_CHECK_EVERY:
+                checked = len(markup)
+                rep = _tag_repeat_start(markup, names, schemas) if tag_open else None
+                if rep is not None or len(markup) > _HOLD_MAX_CHARS:
+                    # The model is repeating itself (or will not stop): hand over what it
+                    # typed before the repeat and stop reading the upstream.
+                    try:
+                        _log.warning("[tool-rescue] held reply cut at %d chars (%s); "
+                                     "offered_tools=%d", len(markup),
+                                     "typed calls repeated" if rep is not None else "too long",
+                                     len(names))
+                    except Exception:                            # noqa: BLE001
+                        pass
+                    if rep is not None:
+                        markup = markup[:rep]
+                    yield from finalize({"choices": [{"finish_reason": "length"}]})
+                    yield b"data: [DONE]" + end
+                    return
             continue
         if mode == "hold":
             if not text and kind == "other" and not bytes(

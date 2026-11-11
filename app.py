@@ -12306,6 +12306,32 @@ def _psr_holds(pid, now=None):
         return False
 
 
+# A REST THAT FAILS ITS TEST GROWS (2026-11-11). MEASURED (hub.log, 2026-11-10): nvidia
+# failed its test request 19 times in a row, one every 30 minutes, and every test was a
+# real user turn that waited ~2 minutes before the fallback served. So each failed test
+# doubles the next rest (30 min, 1 h, 2 h, cap _PROVIDER_STALL_REST_CAP); one answer on
+# any model still lifts it at once. Flag `provider_rest_escalates` (default on); off =
+# 30 minutes every time, as before.
+_PROVIDER_STALL_REST_CAP = 4 * 3600.0
+
+
+def _psr_escalates_on():
+    try:
+        return bool(config.get_flag("provider_rest_escalates", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _psr_rest_seconds(n):
+    """How long rest number `n` in a row lasts. Never raises."""
+    try:
+        if int(n) <= 1 or not _psr_escalates_on():
+            return _PROVIDER_STALL_REST_S
+        return min(_PROVIDER_STALL_REST_S * (2 ** min(int(n) - 1, 10)), _PROVIDER_STALL_REST_CAP)
+    except Exception:                                            # noqa: BLE001
+        return _PROVIDER_STALL_REST_S
+
+
 def _psr_note_stall(pid):
     """A stall was just filed for one of `pid`'s models (by _note_recent_hop_failure,
     which has already ruled out a client that left and a local network failure).
@@ -12333,12 +12359,12 @@ def _psr_note_stall(pid):
                 if stalled >= _PROVIDER_STALL_MODELS:
                     rec["until"] = now + _PROVIDER_STALL_REST_S     # still stalling
             else:
-                rec["until"] = now + _PROVIDER_STALL_REST_S
                 rec["n"] = int(rec.get("n") or 1) + 1
+                rec["until"] = now + _psr_rest_seconds(rec["n"])
                 rec["probe"] = None
                 event = "again"
             n = int(rec.get("n") or 1)
-        mins = int(_PROVIDER_STALL_REST_S // 60)
+        mins = int((_psr_rest_seconds(n) if event == "again" else _PROVIDER_STALL_REST_S) // 60)
         if event == "rest":
             _log.info("[provider-rest] %s: %d of its models stalled inside %d min; the whole "
                       "provider rests %d min", pid, stalled, int(_RECENT_FAIL_TTL // 60), mins)
@@ -12467,7 +12493,7 @@ def _psr_restore_row(pid, saved, now):
     until = float(saved["until"])
     if not pid or _is_relay_pid(pid) or now >= until + _PROVIDER_PROBATION_S:
         return False
-    until = min(until, now + _PROVIDER_STALL_REST_S)
+    until = min(until, now + _psr_rest_seconds(max(1, int(saved.get("n") or 1))))
     with _provider_rest_lock:
         if pid in _provider_rest:
             return False

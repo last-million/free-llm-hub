@@ -464,6 +464,22 @@ def _multi_per_target_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _provider_rest_escalation_off_unless_tested(request, monkeypatch):
+    """A PROVIDER REST THAT FAILS ITS TEST GROWS (app `_psr_rest_seconds`, flag
+    `provider_rest_escalates`, default ON since 2026-11-11). The older provider-rest
+    tests pin a flat 30-minute rest; off here keeps them so. The feature's own file
+    turns it on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_reply_loops_and_rest_growth":
+        try:
+            import app
+            monkeypatch.setattr(app, "_psr_escalates_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _findings_check_off_unless_tested(request, monkeypatch):
     """THE FINDINGS CHECK (app, flag `findings_check`) is default ON (2026-10-29): a
     reply that claims a security finding is filed in a ledger under the state dir, may

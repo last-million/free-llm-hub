@@ -494,7 +494,9 @@ def test_tail_check_is_throttled_and_uses_the_scan_cache(monkeypatch):
         calls.append(len(text))
         return real(text, **kw)
     monkeypatch.setattr(answer_check, "inspect_tail", spy)
-    ans = _PREAMBLE * 20
+    # Twenty DIFFERENT paragraphs: the same one pasted twenty times is a loop since
+    # 2026-11-11 (answer_check's scattered-line rule), not clean prose.
+    ans = "".join("Part %d of the tutorial. %s" % (i, _PREAMBLE) for i in range(20))
     g = _gate(_frames(ans, fin="stop", size=4), "write a long tutorial")
     text, _fins, _done = _parse_chat(b"".join(g))
     assert text == ans and not g.cut

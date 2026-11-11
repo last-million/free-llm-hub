@@ -10665,3 +10665,52 @@ the turn ended on the text "Stop. No more content after the third task call. End
   - Not run against a live model: the evidence is the tests plus the two stored replies.
 
 Release-note: fix: when a model writes its sub-agent or tool calls as text under a "<task 1>" header, the hub now runs them instead of showing the text and stopping your turn.
+
+## Replies that repeat themselves are cut; a provider that keeps failing its test rests longer (2026-11-11)
+
+Covered by `tests/test_reply_loops_and_rest_growth.py` (14, hermetic). Follow-up to the `<task 1>` section above: the
+owner asked for the rest of that session's problems to be fixed, for every CLI, and for the real causes to be named.
+
+- **What was responsible that evening (MEASURED, hub.log + learned-state.json + Activity, 2026-11-10 18:40 to
+  2026-11-11 00:47 UTC).** The model that wrote the bad replies, `openrouter/recursive/flint-v1.0:free`, has hub score 10.
+  It served because nothing stronger was answering: nvidia stalled on every model all day (19 failed test requests in a
+  row, then 5 more), dahl answered HTTP 429 "at capacity" on both its models, g4f took no pick at all after 18:39 (out for
+  the evening), groq cannot hold a request over ~7K tokens, zenmux answered 429. The router's own pick on those turns was
+  `llm7/codestral-latest` ("pool 1"). No routing change makes those hosts answer; what follows removes the hub's own share.
+- **A block that comes back is a loop** (`answer_check._scattered_loop`, `_scattered_loop_stream`; flag
+  `scattered_loop_cut`, default on; a flag read that raises counts as off = the old checks alone). `_line_loop`
+  needs the same line back to back and `_tail_loop` a unit of at most 160 characters, so a reply that repeats a whole
+  block of several lines was never a loop. MEASURED: one streamed reply of 59,071 characters carried an 824-character
+  line 8 times and a 67-character line 23 times, never twice in a row; `inspect` called every prefix of it ok and the
+  client cut it after 130 s. Now the SAME long line coming back with other lines in between counts: 4 copies of a line
+  of 200+ characters, 6 of a 60+ character prose line, 12 of a structured one (list item, log line, `key: value`).
+  Never inside a code fence, never a table row, never a line the prompt itself contains, at least 12 letters. `inspect`
+  runs it on a whole reply (reason `repetition`, the text before the loop is the salvage); `inspect_tail` runs it on a
+  stream through the caller's `state` (only the lines finished since the last call are read, so it stays O(new text)), so
+  the committed-stream gate of all three protocols cuts it as it streams. On the measured reply the cut comes at 30,191
+  characters instead of never.
+- **Typed calls that come back are cut at the repeat** (`tool_rescue._tag_repeat_start`, in `rescue_stream`). A held
+  `<tool N>` reply is checked every `_REPEAT_CHECK_EVERY` (1500) characters; once a COMPLETE block repeats an earlier
+  one (same tool, same arguments; the last block is never judged, it may still be being typed), everything from the
+  repeat on is dropped, the calls typed before it become real `tool_calls`, the stream is closed with `[DONE]` and the
+  upstream is no longer read. `_HOLD_MAX_CHARS` (400,000) bounds any held reply. The stop note is dropped even when a
+  separator line follows it. No flag (it only shortens a hold that was already going to be parsed). One log line:
+  `[tool-rescue] held reply cut at N chars (typed calls repeated)`.
+- **A rest that fails its test grows** (`app._psr_rest_seconds`, flag `provider_rest_escalates`, default on; off = 30
+  minutes every time). The provider-wide rest ("A provider that keeps stalling rests for 30 minutes") sent one test
+  request every 30 minutes for as long as the provider stalled, and each test was a real user turn that waited about two
+  minutes before the fallback served: 19 of them on 2026-11-10. Each failed test now doubles the next rest: 30 min, 1 h,
+  2 h, then `_PROVIDER_STALL_REST_CAP` (4 h). One answer from that provider on any model still lifts the rest at once.
+  A rest restored from learned-state.json is capped at its own level's length. `tests/conftest.py` keeps the flat rule
+  for the older provider-rest tests.
+- **Limits, said plainly.**
+  - The repeat rules cut a loop; they do not make the reply useful. On a tool turn a cut reply ends at "length" with the
+    text written so far and no tool call, so the CLI's turn can still end there.
+  - A legitimate reply that repeats one long prose line six times outside a code fence would be cut (not seen; the
+    thresholds are judgement, not fitted).
+  - Only the `<tool N>` dialect gets the repeat cut while held; the other typed dialects get the length bound only.
+  - With longer rests a recovered provider can go unnoticed for up to 4 hours unless something else reaches it (a pinned
+    request, the provider Test, or a chain with nothing else left).
+  - Not run against a live model; the stored 59K reply was replayed through the new code.
+
+Release-note: fix: a reply that keeps repeating the same block is now cut instead of running until your CLI gives up, and a provider that keeps timing out is re-tested less often, so fewer of your turns wait two minutes on it.
