@@ -39819,6 +39819,18 @@ def api_max_reasoning_flag():
     return jsonify({"enabled": config.get_flag("max_reasoning", True)})
 
 
+@app.route("/api/harness", methods=["GET", "POST"])
+def api_hub_harness_flag():
+    """Settings switch "Calvoun Free LLM Hub harness" (flag `hub_harness`, default ON and
+    recommended, owner 2026-11-11). Off turns every flag in config.HARNESS_FLAGS
+    off at once (see config.get_flag); each feature's own setting is kept, so
+    switching back on restores exactly what was there."""
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        config.set_flag(config.HARNESS_FLAG, bool(body.get("enabled")))
+    return jsonify({"enabled": config.get_flag(config.HARNESS_FLAG, True)})
+
+
 @app.route("/api/enhance-prompt", methods=["POST"])
 def api_enhance_prompt():
     """{prompt, kind:'chat'|'image'} -> {original, enhanced, changed, model}.

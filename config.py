@@ -954,10 +954,33 @@ def clear_default() -> None:
         save_config(cfg)
 
 
+# THE HUB'S HARNESS: one master switch (owner, 2026-11-11). On (the default and the
+# recommended setting) the hub adds its own help around every model: the briefs and
+# skills, the model guides, the goal / memory / tools notes, the verifier and its
+# corrector, the specialists' team notes, the skill picker, the memory writer. Off,
+# every flag below reads False wherever it is read, so models get the request as the
+# CLI sent it and the hub makes no extra model calls of its own. Routing, fallback to
+# the next model, the answer checks, tool-call rescue, context fitting and the scope
+# guard are NOT part of it: they keep requests working and safe, so they stay on.
+HARNESS_FLAG = "hub_harness"
+HARNESS_FLAGS = frozenset({
+    "craft_briefs", "brief_every_turn", "skill_picker", "skill_tool_hint",
+    "skill_conversation_memory", "model_guides", "goal_brief",
+    "conversation_memory_note", "memory_project_note", "tool_scan",
+    "planning_env_probe", "crew_agent_hint", "turn_verifier", "turn_slop_check",
+    "tool_turn_specialists", "tool_turn_specialists_single",
+    "tool_turn_specialists_medium", "findings_check",
+    "memory_fact_extractor", "memory_fact_extractor_v1",
+})
+
+
 def get_flag(name: str, default: bool = False) -> bool:
-    """Read a top-level boolean flag from the config (survives round-trips)."""
+    """Read a top-level boolean flag from the config (survives round-trips).
+    A harness flag reads False while the harness switch is off."""
     with _LOCK:
         cfg = load_config()
+    if name in HARNESS_FLAGS and cfg.get(HARNESS_FLAG) is False:
+        return False
     v = cfg.get(name)
     return v if isinstance(v, bool) else default
 

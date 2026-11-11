@@ -10815,3 +10815,29 @@ as default use the best model available image generation, not any randomly".
   that is really gone is marked again by its first failed request.
 
 Release-note: improved: automatic image generation now picks the best-rated available model, waits its turn for Pollinations' free FLUX instead of dropping to a weaker model for six hours, and the Images page says which model Auto is really using.
+
+## One switch for the hub's harness (2026-11-11)
+
+Covered by `tests/test_hub_harness_switch.py` (6). Owner: "a choice in Settings to enable and disable the harness of our
+free llm hub, enabled by default and shown as recommended to keep on".
+
+- **What "the harness" is here**: the help the hub ADDS around a model -- text added to what the model reads, and the
+  extra model calls the hub makes on its own. `config.HARNESS_FLAGS`: `craft_briefs` (briefs and skills, the ACT block),
+  `brief_every_turn`, `skill_picker`, `skill_tool_hint`, `skill_conversation_memory`, `model_guides`, `goal_brief`,
+  `conversation_memory_note`, `memory_project_note`, `tool_scan`, `planning_env_probe`, `crew_agent_hint`,
+  `turn_verifier`, `turn_slop_check`, `tool_turn_specialists` (+ `_single`, `_medium`), `findings_check`,
+  `memory_fact_extractor` (+ `_v1`).
+- **How**: setting `hub_harness` (default true). `config.get_flag` returns False for every flag in that set while
+  `hub_harness` is false: one place, no change at any feature's own read, and each feature's own saved setting is kept,
+  so switching the harness back on restores exactly what was there. A test pins that every name in the set is a flag
+  the hub really reads.
+- **Not part of it, on purpose** (they keep requests working and safe): routing and the chain walk, fallback to the
+  next model, the answer checks and the stream peek, tool-call rescue, context fitting and old-result clearing, the
+  memory archive itself, the scope guard, max reasoning, provider fairness and rests, image ranking.
+- **Route** `GET/POST /api/harness {enabled}` (control-token gated like every `/api/*`; README route count 205 -> 206).
+  **Page**: the first group of Settings (`#harness-group`), a switch named "Calvoun Free LLM Hub harness" with a "Recommended: keep on" badge, help text
+  that says what it does and what keeps working, and a warning line while it is off.
+- **Limits.** While it is off the Skills switches show their own saved state but have no effect (the help says so). A
+  test that monkeypatches `config.get_flag` bypasses the switch (by design: it replaces the reader).
+
+Release-note: new: Settings has one switch for the Calvoun Free LLM Hub harness (the briefs, skills, guides, notes and checks the hub adds around every model); it stays on by default and is marked as recommended.

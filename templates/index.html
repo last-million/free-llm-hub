@@ -4871,6 +4871,15 @@
     <div class="section-body" id="sec-settings">
     <div class="sd-grid">
 
+    <div class="sd-group" id="harness-group">
+      <label class="switch" title="The help the hub adds around every model: briefs, skills, guides, notes, the verifier and the memory writer">
+        <input id="drawer-harness-switch" type="checkbox" aria-label="Calvoun Free LLM Hub harness" aria-describedby="harness-help">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Calvoun Free LLM Hub harness <span class="badge recommended">Recommended: keep on</span></span>
+      </label>
+      <p class="sd-help" id="harness-help">On: the hub adds its own help around every model &mdash; task briefs and skills, model guides, goal, memory and tools notes, a second-model check of risky steps, helper notes on hard turns and the memory writer. Off: models get your request exactly as your CLI sent it, with no extra model calls from the hub (the skill switches below then have no effect). Choosing the model, falling back to the next one, rejecting junk replies and the scope guard keep working either way.</p>
+      <p class="sd-help sd-warn" id="harness-off-note" hidden>The harness is off: free models get no help from the hub, so expect weaker answers and more stopped turns.</p>
+    </div>
     <div class="sd-group">
       <label class="switch" title="Switch between the dark and light dashboard theme (stored on this machine only)">
         <input id="drawer-theme-switch" type="checkbox" aria-label="Use light theme">
@@ -15989,6 +15998,32 @@
     });
   }
 
+  /* ---------- the hub's harness (Settings, default on, recommended) ---------- */
+  function paintHarness(on){
+    var sw = $('#drawer-harness-switch'), note = $('#harness-off-note');
+    if (sw) sw.checked = !!on;
+    if (note) note.hidden = !!on;
+  }
+  function loadHarness(silent){
+    return api('/api/harness').then(function(r){ paintHarness(r && r.enabled); })
+      .catch(function(e){ if (!silent) toast('Harness: ' + e.message, true); });
+  }
+  function initHarness(){
+    var sw = $('#drawer-harness-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/harness', { method: 'POST', body: { enabled: want } })
+        .then(function(r){
+          paintHarness(r && r.enabled);
+          toast('Calvoun Free LLM Hub harness ' + (r && r.enabled ? 'on' : 'off'));
+        })
+        .catch(function(e){ toast('Harness: ' + e.message, true); paintHarness(!want); })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
   /* ---------- reasoning & deep thinking toggle (Settings, default on) ---------- */
   function loadReasoning(silent){
     return api('/api/reasoning').then(function(r){
@@ -16953,6 +16988,7 @@
   function loadSettingsView(silent){
     try { loadTestVerification(silent); } catch (e) {}
     try { loadPromptEnhance(silent); } catch (e) {}
+    try { loadHarness(silent); } catch (e) {}
     try { loadReasoning(silent); } catch (e) {}
     try { loadSkills(silent); } catch (e) {}
     try { loadCustomProviders(silent); } catch (e) {}
@@ -16970,7 +17006,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true); loadReasoning(true); loadSkills(true); loadCustomProviders(true); loadLowres(true); loadHeartbeats(true);
+    loadPromptEnhance(true); loadHarness(true); loadReasoning(true); loadSkills(true); loadCustomProviders(true); loadLowres(true); loadHeartbeats(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -17701,6 +17737,7 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
+  initHarness();
   initReasoning();
   initSkills();
   initCustomProviders();
