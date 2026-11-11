@@ -10615,3 +10615,53 @@ behaviour). It EXTENDS the 2026-10-24 rule ("A provider that stalls on two diffe
     code, now for 30 minutes instead of 10). The cost was not measured.
 
 Release-note: fix: when a provider stops answering on all its models, the hub now sets the whole provider aside for 30 minutes and checks it with one request at a time, instead of letting several sessions wait two minutes on it every ten minutes.
+
+## A tool call typed as a `<task 1>` header with `key: value` lines is rescued (2026-11-11)
+
+Covered by `tests/test_tag_header_tool_calls.py` (33, hermetic: synthetic replies in the measured shape). Owner, OpenCode:
+the turn ended on the text "Stop. No more content after the third task call. End of turn. Done."
+
+- **MEASURED** (the owner's OpenCode `coding-max` session, 2026-11-11 00:35-00:47 UTC; structure only: counts, lengths,
+  a masked skeleton, model ids). Three replies carried that sentence. Each had NO tool part (`finish=stop`, parts
+  `step-start` / `reasoning` / `text` / `step-finish`), and its text held three blocks shaped
+  `<task N>` on a line of its own, then `description: "..."`, `prompt: "..."`, `subagent_type: "general"`,
+  `task_id: ""`, a blank line, and at the end the sentence above. Activity: all three were served by
+  `openrouter/recursive/flint-v1.0:free` (a direct provider) after `dahl` answered HTTP 429 twice. One of them ran away
+  to 59,071 characters (55 "Tool call" mentions) and the client cut it after 130 s.
+- **Cause.** The model typed its sub-agent calls as text in a format no dialect in `tool_rescue` knew
+  (`has_model_markup` False, `rescue` found nothing, `answer_check.inspect` ok), so the reply was served as prose, OpenCode
+  ran nothing and ended the turn. A direct provider's text-only reply is not held like a relay's, and at 2.2K characters it
+  is past the announcement hold. The hub does not produce `<task N>` anywhere (grepped): the model invented the format.
+- **The dialect** (`tool_rescue._tag_blocks`, no flag, like every other dialect: it only turns a typed call into a real
+  one). A header `<NAME>` / `<NAME 1>` / `<NAME #1>` on a line of its own, NAME an OFFERED tool (case-insensitive),
+  outside backticks, followed by `key: value` (or `key = value`) lines. It is a call only when the line after the header
+  names a parameter the tool's schema declares (any identifier for a tool with no schema). A value in double quotes is
+  JSON text and may run over several lines; an unquoted one is typed by the schema (`timeout: 30` is a number). The block
+  ends at a blank line, the next header, a closing `</NAME>` or the first line that is not a declared key. An EMPTY string
+  for a key the schema does not require is dropped (the measured `task_id: ""`). Like model markup it owns the text
+  (`_parse_all` returns it before the JSON fallbacks, so a prompt value holding JSON is not a second call).
+- **Streams** (`rescue_stream`): a header naming an offered tool at a line start opens the held path
+  (`_tag_call_start`; `bol` tracks whether the text passed so far ends at a line start, so a header in the middle of a line
+  split across deltas is not one), a half-typed header is held (`_may_open_tag`: `<`, `<ta`, `<task 1`), and at the end the
+  calls become real `tool_calls` with finish `tool_calls`. A header that no parameter line confirmed is ordinary text: it is
+  sent on exactly as it came, with the stream's own finish, never as the unparseable-markup error.
+- **The stop note** (`_drop_stop_note`): once calls were rescued, a LAST paragraph that only says end of turn / no more
+  content ("Stop. No more content after ... End of turn. Done.") is dropped from the text beside them. "Done." alone and a
+  sentence that merely contains the words are kept.
+- **Not offered / unreadable** (`app._TEXT_TOOL_CALL_RES`, one more pattern): a `<word N>` line followed by a
+  `key: "` line is a typed call, so on a tool turn a block naming a tool that was never offered reads as a non-answer and
+  the turn goes to the next model (non-streamed replies and whole replies judged by the peek).
+- **Checked on the real replies** (names and argument keys only): both stored 2.2K replies now give three `task` calls with
+  `description`, `prompt`, `subagent_type`, streamed in 3-character frames and non-streamed, no error frame.
+- **Negative control**: against the old `tool_rescue.py` 12 of the 33 tests fail (the rest pin what must stay true).
+- **Limits, said plainly.**
+  - Only this shape. A model that invents another header or separator is not read.
+  - A streamed reply that typed a call to a tool that was NOT offered is still shown as text once the stream is committed
+    (a direct provider's long text-only reply is not held to its end).
+  - The 59K runaway reply is not addressed: its calls would be rescued when it finishes, but nothing here cuts a looping
+    reply sooner.
+  - A real answer that puts an offered tool's name alone in angle brackets on its own line, followed by a line naming one of
+    that tool's parameters, would be read as a call (not inside backticks). Not seen in practice.
+  - Not run against a live model: the evidence is the tests plus the two stored replies.
+
+Release-note: fix: when a model writes its sub-agent or tool calls as text under a "<task 1>" header, the hub now runs them instead of showing the text and stopping your turn.

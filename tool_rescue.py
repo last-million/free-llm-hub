@@ -444,8 +444,194 @@ def _may_open_json(text, names):
     return False
 
 
-def _strip_typed(markup):
+# A CALL TYPED AS A TAG HEADER + "key: value" LINES (2026-11-11). MEASURED in a real OpenCode
+# turn (coding-max, served by openrouter recursive/flint-v1.0:free): three sub-agent calls typed
+# as text, each shaped
+#     <task 1>
+#     description: "..."
+#     prompt: "..."
+#     subagent_type: "general"
+# followed by prose ("Stop. No more content after the third task call. End of turn. Done.").
+# No dialect knew it, so the reply reached the CLI as text, nothing ran and the turn ended.
+# Only an OFFERED tool's name opens it, at the start of a line and outside backticks, and it
+# is a call only when the line right after the header names a parameter the tool declares
+# (any identifier when the tool has no schema).
+_TAG_HEAD_RE = re.compile(
+    r"(?m)^[ \t]*<[ \t]*([A-Za-z_][\w.-]{0,63})(?:[ \t]*[#:-]?[ \t]*\d{1,3})?[ \t]*>[ \t]*$")
+_TAG_KEY_RE = re.compile(r"^[ \t]*([A-Za-z_][\w-]{0,63})[ \t]*[:=][ \t]?(.*?)[ \t]*\r?$")
+_TAG_CLOSE_RE = re.compile(r"^[ \t]*<[ \t]*/[ \t]*([A-Za-z_][\w.-]*)[^<>]{0,16}>[ \t]*\r?$")
+_TAG_PARTIAL_RE = re.compile(r"<[ \t]*([A-Za-z_][\w.-]*)?([ \t]*[#:-]?[ \t]*\d{0,3})?[ \t]*$")
+_TAG_MAX_VALUE_LINES = 120
+
+
+def _tag_names(names):
+    """{lowercased offered name: offered name}."""
+    out = {}
+    for n in names or ():
+        out.setdefault(str(n).lower(), str(n))
+    return out
+
+
+def _tag_value(raw, lines, k, declared):
+    """One "key: value" value -> (value, index of the last line it used). A double-quoted
+    value is JSON text and may run over several lines until it closes."""
+    s = raw.strip()
+    if s.endswith(","):
+        s = s[:-1].rstrip()
+    if s.startswith('"'):
+        text, last = s, k
+        for j in range(k, min(len(lines), k + _TAG_MAX_VALUE_LINES)):
+            if j > k:
+                text += "\n" + lines[j][1].rstrip("\r\n")
+            cand = text.rstrip()
+            if cand.endswith(","):
+                cand = cand[:-1]
+            try:
+                # strict=False: a value the model ran over several lines holds raw newlines.
+                val = json.loads(cand, strict=False)
+                last = j
+                break
+            except ValueError:
+                continue
+        else:
+            # Never closed: the text the model typed, minus the opening quote.
+            val, last = s[1:-1] if len(s) > 1 and s.endswith('"') else s[1:], k
+        if isinstance(val, str) and declared in ("integer", "number", "boolean", "object", "array"):
+            val = _dsml_value(val, {}, declared)
+        return val, last
+    if len(s) > 1 and s[0] == s[-1] == "'":
+        return s[1:-1], k
+    return _dsml_value(s, {}, declared), k
+
+
+def _tag_blocks(text, names, schemas=None, ticks=0):
+    """Every "<tool N>" + "key: value" block in `text` naming an offered tool:
+    [(start, end, name, args)]. A header no parameter line confirms is not a call."""
+    if not isinstance(text, str) or "<" not in text or not names:
+        return []
+    allowed = _tag_names(names)
+    out = []
+    for m in _TAG_HEAD_RE.finditer(text):
+        if (ticks + text.count("`", 0, m.start())) % 2:
+            continue
+        name = allowed.get(m.group(1).lower())
+        if not name or (out and m.start() < out[-1][1]):
+            continue
+        schema = (schemas or {}).get(name) or {}
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        props = props if isinstance(props, dict) and props else None
+        required = schema.get("required") if isinstance(schema, dict) else None
+        required = set(required) if isinstance(required, list) else set()
+        lines, off = [], m.end()
+        if text.startswith("\r\n", off):
+            off += 2
+        elif text.startswith("\n", off):
+            off += 1
+        for ln in text[off:].splitlines(True):
+            lines.append((off, ln))
+            off += len(ln)
+        args, end, k = {}, m.end(), 0
+        while k < len(lines):
+            start, ln = lines[k]
+            if not ln.strip():
+                if args:
+                    break
+                k += 1
+                continue
+            cm = _TAG_CLOSE_RE.match(ln)
+            if cm:
+                if cm.group(1).lower() == m.group(1).lower():
+                    end = start + len(ln.rstrip("\r\n"))
+                break
+            if _TAG_HEAD_RE.match(ln.rstrip("\r\n")):
+                break
+            km = _TAG_KEY_RE.match(ln.rstrip("\n"))
+            if not km or (props is not None and km.group(1) not in props):
+                break
+            key = km.group(1)
+            declared = _schema_type(schemas, name, key)
+            val, k = _tag_value(km.group(2), lines, k, declared)
+            if not (isinstance(val, str) and not val.strip() and key not in required):
+                args[key] = val
+            end = lines[k][0] + len(lines[k][1].rstrip("\r\n"))
+            k += 1
+        if args:
+            out.append((m.start(), end, name, args))
+    return out
+
+
+def _tag_calls(text, names, schemas=None):
+    return [_call(name, args) for _s, _e, name, args in _tag_blocks(text, names, schemas)]
+
+
+def _strip_tag_blocks(text, names, schemas=None):
+    blocks = _tag_blocks(text, names, schemas)
+    if not blocks:
+        return text
+    out, last = [], 0
+    for start, end, _n, _a in blocks:
+        out.append(text[last:start])
+        last = end
+    out.append(text[last:])
+    return re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+
+
+def _tag_call_start(text, ticks, names, bol=True):
+    """The first "<tool N>" header line in `text` naming an offered tool, outside code.
+    `bol`: whether `text` itself starts at the beginning of a line."""
+    if not isinstance(text, str) or "<" not in text or not names:
+        return None
+    allowed = _tag_names(names)
+    for m in _TAG_HEAD_RE.finditer(text):
+        if m.start() == 0 and not bol:
+            continue
+        if (ticks + text.count("`", 0, m.start())) % 2:
+            continue
+        if m.group(1).lower() in allowed:
+            return m
+    return None
+
+
+def _may_open_tag(text, names, bol=True):
+    """True when `text` ENDS with what could still become a "<tool N>" header on a line
+    of its own (a "<", "<ta", "<task 1"), so it is held until it is one or is not."""
+    i = text.rfind("<", max(0, len(text) - 80))
+    if i < 0:
+        return False
+    before = text[:i]
+    line_head = before[before.rfind("\n") + 1:] if "\n" in before else before
+    if line_head.strip() or (("\n" not in before) and not bol):
+        return False
+    pm = _TAG_PARTIAL_RE.fullmatch(text[i:])
+    if not pm:
+        return False
+    stem, suffix = (pm.group(1) or "").lower(), (pm.group(2) or "")
+    allowed = _tag_names(names)
+    if suffix.strip():
+        return stem in allowed
+    return any(n.startswith(stem) for n in allowed)
+
+
+# The model's note to itself after the calls it typed ("Stop. No more content after the
+# third task call. End of turn. Done." -- the 2026-11-11 reply). Once the calls are real
+# it is noise; dropped only when it is the WHOLE last paragraph and says end of turn /
+# no more content.
+_STOP_NOTE_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:stop\.?\s*)?(?:(?:no more (?:content|text|output)\b[^.\n]{0,80}\.?\s*)"
+    r"(?:end of (?:the )?(?:turn|response|reply)\.?\s*)?|end of (?:the )?(?:turn|response|reply)\.?\s*)"
+    r"(?:done\.?\s*)?$")
+
+
+def _drop_stop_note(text):
+    if not text:
+        return text
+    return _STOP_NOTE_RE.sub("", text).rstrip()
+
+
+def _strip_typed(markup, names=None, schemas=None):
     """What is left of held text once the call is real: no raw markup or JSON beside it."""
+    if names and _tag_blocks(markup, names, schemas):
+        return _strip_tag_blocks(markup, names, schemas)
     if has_model_markup(markup):
         return strip_model_markup(markup)
     out, last = [], 0
@@ -668,6 +854,13 @@ def _parse_all(text, allowed_names=None, schemas=None):
         # An exact repeat is one call typed twice, as on the generic path below.
         return dedupe_calls(found)[0]
 
+    if allowed_names is not None:
+        # "<tool N>" + "key: value" lines (see _TAG_HEAD_RE). Like markup, it owns the
+        # text: a prompt value holding JSON is not a second call.
+        tagged = _tag_calls(text, allowed_names, schemas)
+        if tagged:
+            return dedupe_calls(tagged)[0]
+
     for block in _TOOL_CALL_BLOCK.findall(_upto_last_close(text)):
         found.extend(_from_tool_call_block(block))
     if not found:
@@ -740,9 +933,11 @@ def is_bare_tool_name(text, tools):
     return bool(m) and m.group(1).strip() in names
 
 
-def _strip_calls(text):
+def _strip_calls(text, names=None, schemas=None):
     """Remove the typed call from the prose so the client is not shown raw XML
     next to the real call it now has."""
+    if names and _tag_blocks(text or "", names, schemas):
+        return _strip_tag_blocks(text, names, schemas)
     if has_model_markup(text):
         return strip_model_markup(text)
     out = text or ""
@@ -784,7 +979,7 @@ def rescue(data, tools):
     # credited to it.
     msg["tool_calls"] = [{"id": "call_rescued_" + uuid.uuid4().hex[:20], "type": "function",
                           "function": c} for c in calls]
-    left = _strip_calls(content)
+    left = _drop_stop_note(_strip_calls(content, names, tool_schemas(tools)))
     # A model that typed a call and nothing else leaves no prose behind; content
     # must then be None, not "", or strict clients reject the message.
     msg["content"] = left or None
@@ -918,6 +1113,8 @@ def rescue_stream(items, tools, framing="lines"):
     held, pending, markup, tail = [], "", "", []
     real_calls = False
     ticks = 0              # backticks in the text passed through (see _markup_start)
+    bol = True             # the text passed through so far ends at a line start
+    tag_open = False       # the held text opened on a "<tool N>" header (see _TAG_HEAD_RE)
 
     def finalize(fin_obj):
         calls = parse(markup, allowed_names=names, schemas=schemas)
@@ -926,6 +1123,15 @@ def rescue_stream(items, tools, framing="lines"):
             # It emitted real calls as well: the markup is only noise now.
             yield from tail
             yield chunk({}, "tool_calls", usage)
+            return
+        if not calls and tag_open and not _tag_blocks(markup, names, schemas):
+            # A "<tool N>" header that no parameter line confirmed is ordinary text:
+            # hand it on as it came instead of an error.
+            yield chunk({"content": markup})
+            yield from tail
+            fr = _choice0(fin_obj).get("finish_reason") if isinstance(fin_obj, dict) else None
+            if fr:
+                yield chunk({}, fr, usage)
             return
         if not calls:
             # Say WHY, with no content of the reply: which opener, how long, whether
@@ -942,7 +1148,7 @@ def rescue_stream(items, tools, framing="lines"):
                 pass
             yield emit(_STREAM_ERROR)
             return
-        rest = _strip_typed(markup)
+        rest = _drop_stop_note(_strip_typed(markup, names, schemas))
         if rest:
             yield chunk({"content": rest})
         for i, c in enumerate(calls):
@@ -992,6 +1198,8 @@ def rescue_stream(items, tools, framing="lines"):
                 # Nothing completes an opener across a non-text unit.
                 yield from held
                 ticks += pending.count("`")
+                if pending:
+                    bol = pending.endswith("\n")
                 held, pending, mode = [], "", "pass"
                 yield unit
                 continue
@@ -1004,7 +1212,10 @@ def rescue_stream(items, tools, framing="lines"):
             yield unit
             continue
         m = _markup_start(text, ticks) or _json_call_start(text, ticks, names)
-        if m:
+        tm = None if m else _tag_call_start(text, ticks, names, bol)
+        if m or tm:
+            m = m or tm
+            tag_open = tm is not None
             if text[:m.start()]:
                 yield chunk({"content": text[:m.start()]})
             markup, held, pending, mode = text[m.start():], [], "", "markup"
@@ -1012,12 +1223,14 @@ def rescue_stream(items, tools, framing="lines"):
                 yield from finalize(obj)
                 mode = "done"
             continue
-        if not fin and (_may_open_marker(text) or _may_open_json(text, names)):
+        if not fin and (_may_open_marker(text) or _may_open_json(text, names)
+                        or _may_open_tag(text, names, bol)):
             if not held_text:
                 held, pending = [unit], text
             mode = "hold"
             continue
         ticks += text.count("`")
+        bol = text.endswith("\n")
         if held_text:
             yield from held
             held, pending = [], ""

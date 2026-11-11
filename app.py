@@ -43677,6 +43677,13 @@ _TEXT_TOOL_CALL_RES = (
     # call still reads as a non-answer and hands the turn to another model.
     re.compile(r"</\s*(?:[a-z][\w.-]*:)?invoke\s*>", re.I),
     re.compile(r"<\s*(?:[a-z][\w.-]*:)?parameter\b[^>]*\bname\s*=", re.I),
+    # "<task 1>" on a line of its own, then a 'key: "value"' line (tool_rescue's
+    # tag-header dialect, 2026-11-11). A call to an OFFERED tool is rescued before
+    # this is consulted; this catches one to a tool that was never offered, or one
+    # the rescue could not read, so the turn goes to another model instead of
+    # ending on the typed calls.
+    re.compile(r'(?m)^[ \t]*<[ \t]*[A-Za-z_][\w.-]{0,63}[ \t]*[#:-]?[ \t]*\d{1,3}[ \t]*>'
+               r'[ \t]*\r?\n[ \t]*[A-Za-z_][\w-]{0,63}[ \t]*:[ \t]*"'),
 )
 
 
