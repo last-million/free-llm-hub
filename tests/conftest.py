@@ -480,6 +480,35 @@ def _provider_rest_escalation_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _image_pace_off_unless_tested(request, monkeypatch):
+    """THE IMAGE QUEUE (app `_image_pace_reserve`, flag `image_pace_wait`, default ON
+    since 2026-11-11): a request to a provider with a documented spacing (Pollinations:
+    one image every 45 s) WAITS for its turn. Off here so no other test file can sleep
+    for real, and the queue is emptied around every test. The feature's own file turns
+    it on, with a fake clock."""
+    try:
+        import app
+    except Exception:
+        yield
+        return
+    try:
+        app._image_pace_next.clear()
+    except Exception:
+        pass
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_image_best_available":
+        try:
+            monkeypatch.setattr(app, "_image_pace_on", lambda: False)
+        except Exception:
+            pass
+    yield
+    try:
+        app._image_pace_next.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _findings_check_off_unless_tested(request, monkeypatch):
     """THE FINDINGS CHECK (app, flag `findings_check`) is default ON (2026-10-29): a
     reply that claims a security finding is filed in a ledger under the state dir, may

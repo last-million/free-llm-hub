@@ -4669,6 +4669,7 @@
         </select>
         <button class="btn sm" id="image-priority-save" type="button">Save</button>
       </div>
+      <div class="chat-note" id="image-priority-note" role="status"></div>
       <div class="model-cards" id="image-model-cards" role="radiogroup" aria-label="Model to generate with"></div>
       <div class="image-bar">
         <select id="image-size" aria-label="Image size"
@@ -8762,7 +8763,7 @@
       c.tabIndex = on ? 0 : -1;                 /* roving tabindex */
     });
   };
-  ModelPicker.prototype.render = function(models){
+  ModelPicker.prototype.render = function(models, autoSub){
     if (!this.el) return;
     this._rows = (models || []).map(function(m){
       return {
@@ -8770,6 +8771,8 @@
         name: m.label || m.model || m.id,
         provider: m.provider_name || m.provider || '',
         text: m.text_in_image,
+        /* The public board's score (what Auto orders by); null = not listed. */
+        quality: (typeof m.quality === 'number') ? m.quality : null,
         configured: m.configured !== false,
         dead: !!m.dead,
         /* Metered models are offered but never auto-picked, so the card has to
@@ -8789,9 +8792,13 @@
     var html = '<button type="button" role="radio" class="model-card is-auto" data-value="auto" ' +
                'aria-checked="false" tabindex="-1">' + check +
                '<span class="mc-name">Auto</span>' +
-               '<span class="mc-provider">Best free model, orchestrated</span></button>';
+               '<span class="mc-provider">' + esc(autoSub || 'Best free model, orchestrated') +
+               '</span></button>';
     this._rows.forEach(function(r){
       var tags = '';
+      if (r.quality) tags += '<span class="mc-tag" title="Score on a public image-quality board; ' +
+                             'Auto uses the highest one available">quality ' +
+                             esc(String(r.quality)) + '</span>';
       if (r.text) tags += '<span class="mc-tag' + (r.text === 'excellent' ? ' good' : '') +
                           '">text: ' + esc(r.text) + '</span>';
       /* Cost first when it costs: it is the thing you most need before clicking. */
@@ -8858,8 +8865,28 @@
         prSel.value = chosen;
       }
 
+      /* What automatic requests really use. A saved priority that Auto does not
+         use (a paid model: those are never spent automatically) is said in words
+         instead of being silently ignored. textContent only. */
+      var autoPick = (j && j.effective_priority && j.effective_priority[0]) || '';
+      var prNote = $('#image-priority-note');
+      if (prNote){
+        var ign = j && j.priority_ignored;
+        var msg = '';
+        if (ign && ign.id){
+          msg = ign.why === 'paid'
+            ? ign.id + ' is a paid model, so automatic image requests do not use it ' +
+              '(it is used only when you pick its card below for one image).'
+            : ign.id + ' is not available right now.';
+          msg += ign.auto_pick ? ' Automatic requests use: ' + ign.auto_pick + '.'
+                               : ' No free image model is available right now.';
+        }
+        prNote.textContent = msg;
+        prNote.classList.toggle('show', !!msg);
+      }
+
       /* per-generation model override — CARDS, not a dropdown (see .model-cards) */
-      imagePicker.render(models);
+      imagePicker.render(models, autoPick ? 'Best available now: ' + autoPick : '');
     }).catch(function(e){ if (!silent) toast('Images: ' + e.message, true); });
   }
 

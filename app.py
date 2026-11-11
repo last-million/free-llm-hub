@@ -56801,11 +56801,155 @@ _IMAGE_PROVIDER_ORDER = ("cloudflare", "modelscope", "pollinations")
 MAX_IMAGE_HOPS = 4              # bound worst-case latency (ModelScope polls up to 60s/hop)
 _MODELSCOPE_POLL_DEADLINE = 60  # seconds
 
+# --------------------------------------------------------------------------- #
+# A FREE IMAGE LIMIT IS A QUEUE, NOT A DEAD MODEL (2026-11-11)
+#
+# MEASURED on the owner's image history (model ids and times only): 9 of his 13
+# images came from AI Horde's anonymous Stable Diffusion (the weakest model he
+# has) and 3 from Pollinations' FLUX. In every burst the FIRST image was FLUX and
+# the next ones, made 12-38 s later, were Stable Diffusion -- and stayed there
+# for hours. Cause: Pollinations' anonymous image endpoint allows "one image at a
+# time, at least 45 seconds apart" per IP and answers a faster request with HTTP
+# 402 + Retry-After (its APIDOCS.md, read 2026-11-11). PROBED the same day: a
+# second fresh image at once -> 402, `Retry-After: 41`, body code "FREE_LIMIT",
+# "1 image every 45 seconds per IP"; the same request 42 s later -> 200. The hub
+# read that 402 as _DEAD_STATUSES and shut the model out for _DEAD_MODEL_TTL
+# (6 h), so everything fell to the next, weaker provider.
+#
+# Now: such a reply is a rate limit (429 to the caller: a 60 s throttle, never a
+# dead mark), and with flag `image_pace_wait` (default on) the hub does not ask
+# early at all: each request takes the next free slot and waits for it, up to
+# _IMAGE_PACE_MAX_WAIT. A request whose turn is further away than that leaves the
+# provider to the next candidate instead of holding the client for minutes.
+# Waiting 45 s for the better model instead of taking a worse one at once is the
+# owner's stated order of priorities (quality first).
+# --------------------------------------------------------------------------- #
+_IMAGE_MIN_INTERVAL = {"pollinations": 45.0}   # seconds between two image requests
+_IMAGE_PACE_MAX_WAIT = 50.0                    # the longest one request waits for its turn
+_image_pace_lock = threading.Lock()
+_image_pace_next = {}                          # pid -> wall time the next request may start
+
+
+def _image_pace_now():
+    """The clock of the image queue (its own function so a test can move it)."""
+    return time.time()
+
+
+def _image_pace_nap(seconds):
+    """One short wait of the image queue (its own function so a test can fake it)."""
+    time.sleep(seconds)
+
+
+def _image_pace_on():
+    """Flag `image_pace_wait` (default on; a read that fails counts as off = ask
+    at once and let the provider refuse, as before)."""
+    try:
+        return bool(config.get_flag("image_pace_wait", True))
+    except Exception:
+        return False
+
+
+def _image_pace_reserve(pid):
+    """Take the next slot of a provider with a documented spacing. Returns the
+    seconds to wait before calling it (0.0 = now), or None when that turn is
+    more than _IMAGE_PACE_MAX_WAIT away (nothing is taken then). A provider with
+    no spacing rule always answers 0.0. Never raises."""
+    try:
+        interval = _IMAGE_MIN_INTERVAL.get(pid)
+        if not interval:
+            return 0.0
+        now = _image_pace_now()
+        with _image_pace_lock:
+            nxt = _image_pace_next.get(pid, 0.0)
+            wait = max(0.0, nxt - now)
+            if wait > _IMAGE_PACE_MAX_WAIT:
+                return None
+            _image_pace_next[pid] = max(now, nxt) + interval
+            return wait
+    except Exception:
+        return 0.0
+
+
+def _image_pace_defer(pid, seconds):
+    """The provider itself said when it takes the next image: no request of ours
+    starts before that."""
+    try:
+        with _image_pace_lock:
+            _image_pace_next[pid] = max(_image_pace_next.get(pid, 0.0),
+                                        _image_pace_now() + max(0.0, float(seconds)))
+    except Exception:
+        pass
+
+
+def _image_pace_sleep(seconds):
+    """Wait for a slot in short slices. False when the client left meanwhile
+    (nobody is waiting for the image any more)."""
+    end = _image_pace_now() + max(0.0, float(seconds))
+    while True:
+        if _client_gone():
+            return False
+        left = end - _image_pace_now()
+        if left <= 0:
+            return True
+        _image_pace_nap(min(0.5, left))
+
+
+def _image_rate_limited(resp):
+    """Seconds to wait when `resp` is a provider's "too many images" reply (402 or
+    429 carrying a Retry-After header or Pollinations' FREE_LIMIT code), else
+    None. A 402 with neither is a real payment refusal and is not this."""
+    try:
+        if resp.status_code not in (402, 429):
+            return None
+        raw = (getattr(resp, "headers", None) or {}).get("Retry-After")
+        try:
+            secs = float(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            secs = None
+        if secs is None and "FREE_LIMIT" not in str(getattr(resp, "text", "") or "")[:600]:
+            return None
+        if secs is None:
+            secs = _IMAGE_MIN_INTERVAL.get("pollinations", 45.0)
+        return max(1.0, min(600.0, secs))
+    except Exception:
+        return None
+
 
 def _image_model_rows(pid):
     """Registry image-model rows ({'id','label',...}) for one provider."""
     p = prov.get_provider(pid) or {}
     return [m for m in (p.get("image_models") or []) if isinstance(m, dict) and m.get("id")]
+
+
+def _image_rank_on():
+    """Flag `image_rank_by_quality` (default on; a read that fails counts as
+    off = the fixed provider order, exactly as before)."""
+    try:
+        return bool(config.get_flag("image_rank_by_quality", True))
+    except Exception:
+        return False
+
+
+def _image_rank(pairs):
+    """OWNER 2026-11-11: "for image provider he should automatically as default
+    use the best model available, not any randomly." The automatic order used to
+    be a fixed order of PROVIDERS (cloudflare, modelscope, pollinations, the
+    rest), each provider's models in registry order. With Cloudflare and
+    ModelScope both on, Auto opened on Cloudflare's FLUX.1 schnell (arena 742)
+    while ModelScope's Z-Image Turbo (936) and Qwen Image (906) sat behind it.
+
+    Now the models a public board lists go first, best score first
+    (imagerank.py: Artificial Analysis' text-to-image arena, numbers read from
+    the page, none estimated). Models the board does not list keep the order
+    they had, after the listed ones. Stable, reorder only: nothing is added or
+    dropped, and any error returns the list untouched."""
+    if not _image_rank_on():
+        return pairs
+    try:
+        import imagerank
+        return imagerank.rank(pairs)
+    except Exception:
+        return pairs
 
 
 def _image_candidates():
@@ -56819,6 +56963,11 @@ def _image_candidates():
     will try, and Cloudflare alone lists 4 image models — grouping would let
     every hop be spent on one broken/exhausted provider before a working,
     entirely different provider is ever reached.
+
+    2026-11-11: that interleaved tail is then ordered by QUALITY (_image_rank).
+    The protection the interleave gave is kept another way: the request's walk
+    moves a provider that failed a hop behind the others (v1_images_generations),
+    so three strong models of one broken provider cannot use up the hops.
 
     PAID image models (row["free"] is False) are deliberately EXCLUDED here —
     they never appear in auto/manual rotation and are reachable only via an
@@ -56858,7 +57007,7 @@ def _image_candidates():
             models = by_provider.get(pid) or []
             if round_i < len(models):
                 tail.append(models[round_i])
-    return ordered + tail
+    return ordered + _image_rank(tail)
 
 
 def _resolve_image_model(model):
@@ -57048,7 +57197,13 @@ def _parse_wh(size, default=1024):
 def _pollinations_generate_image(pcfg, model, prompt, size=1024, steps=4):
     """Pollinations' anonymous GET-URL image API (NOT /chat/completions): GET
     image.pollinations.ai/prompt/{prompt}?... -> raw image bytes. No key
-    required; an optional saved key/token just lifts limits."""
+    required; an optional saved key/token just lifts limits.
+
+    Its free limit is ONE IMAGE EVERY 45 SECONDS per IP, answered with HTTP 402
+    (see _IMAGE_MIN_INTERVAL). The hub waits its turn (_image_pace_reserve) and,
+    when the server still says "too soon", waits the time it names and asks once
+    more. A reply that is that limit comes back as 429, never as 402: the caller
+    reads 402 as "this model is gone" and would shut the model out for hours."""
     keys = pcfg.get("api_keys") or []
     api_key = keys[0] if keys else None
     width, height = _parse_wh(size)
@@ -57057,10 +57212,31 @@ def _pollinations_generate_image(pcfg, model, prompt, size=1024, steps=4):
     url = "https://image.pollinations.ai/prompt/%s?%s" % (
         quote((prompt or "")[:1500], safe=""), query)
     headers = {"Authorization": "Bearer " + api_key} if api_key else {}
-    try:
-        resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, 90))
-    except requests.RequestException as exc:
-        return 502, None, exc.__class__.__name__
+    # The 45 s spacing is the ANONYMOUS limit; a saved pollen key lifts it, so a
+    # request with a key never queues (a limit reply is still read as a limit).
+    pace = _image_pace_on() and not api_key
+    resp = None
+    for attempt in (0, 1):
+        if pace:
+            wait = _image_pace_reserve("pollinations")
+            if wait is None:
+                return 503, None, ("busy: Pollinations' free limit is one image every 45 s "
+                                   "and other requests are already waiting for it")
+            if wait > 0 and not _image_pace_sleep(wait):
+                return 499, None, "client left"
+        try:
+            resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, 90))
+        except requests.RequestException as exc:
+            return 502, None, exc.__class__.__name__
+        limited = _image_rate_limited(resp)
+        if limited is None:
+            break
+        if pace:
+            _image_pace_defer("pollinations", limited + 1.0)
+            if attempt == 0 and limited <= _IMAGE_PACE_MAX_WAIT:
+                continue
+        return 429, None, ("rate limited: Pollinations' free limit is one image every 45 s "
+                           "per IP (it asked to retry in %d s)" % int(limited))
     if resp.status_code != 200 or not resp.content:
         status = resp.status_code if resp.status_code != 200 else 502
         return status, None, _sanitize(resp.text or "empty body", 300)
@@ -57507,7 +57683,24 @@ def v1_images_generations():
     # Fallback if EVERY hop's image gets text-flagged: a real (if imperfect)
     # image beats a 502 over a soft quality heuristic -- see below.
     text_flagged_fallback = None
-    for hop_pid, hop_model in chain[:MAX_IMAGE_HOPS]:
+    # The chain is in QUALITY order (_image_rank), so several models of one
+    # provider can sit side by side at its head. A provider that FAILED a hop of
+    # this request (an error, a timeout, a refusal) therefore goes behind the
+    # other providers for the rest of the request: its next model would most
+    # likely fail the same way, and ModelScope alone can hold a hop for 60 s. A
+    # 200 whose image the text check rejected is NOT a failure of the provider:
+    # the next best model is tried, same provider included. Reorder only, same
+    # hop budget. Flag off = the first MAX_IMAGE_HOPS entries in order, as before.
+    _rank_on = _image_rank_on()
+    pending = list(chain) if _rank_on else list(chain[:MAX_IMAGE_HOPS])
+    hops_left = MAX_IMAGE_HOPS
+    failed_pids = set()
+    while pending and hops_left > 0:
+        _idx = 0
+        if failed_pids:
+            _idx = next((i for i, c in enumerate(pending) if c[0] not in failed_pids), 0)
+        hop_pid, hop_model = pending.pop(_idx)
+        hops_left -= 1
         generator = _IMAGE_GENERATORS.get(hop_pid)
         if not generator:
             continue
@@ -57517,6 +57710,8 @@ def v1_images_generations():
                 hop_pid, generator, pcfg, hop_model, prompt, size, steps)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            if _rank_on:
+                failed_pids.add(hop_pid)
             continue
         quota.record(hop_pid, hop_model)
         if status == 200 and b64:
@@ -57546,6 +57741,8 @@ def v1_images_generations():
         if status in _DEAD_STATUSES:
             _mark_model_dead(hop_pid, hop_model, status)
         errors.append("%s: HTTP %s %s" % (hop_pid, status, _sanitize(detail or "")))
+        if _rank_on:
+            failed_pids.add(hop_pid)
     if not images_b64 and text_flagged_fallback is not None:
         # Every hop that produced an image got text-flagged -- a real image
         # with a possible text defect still beats failing the whole request.
@@ -57627,9 +57824,54 @@ def _images_payload():
                 "configured": bool(pcfg.get("enabled") and
                                    (pcfg.get("api_key") or not _needs_key(pid))),
                 "dead": _is_model_dead(pid, model),
+                # The public board's score for this model (imagerank.py), None
+                # when the board does not list it. What Auto orders by.
+                "quality": _image_quality(model),
             })
     available_order = [pid + "/" + model for pid, model in _image_candidates()]
-    return {"state": state, "models": models, "effective_priority": available_order}
+    return {"state": state, "models": models, "effective_priority": available_order,
+            "priority_ignored": _image_priority_ignored(state, models, available_order),
+            "quality_source": _image_quality_source()}
+
+
+def _image_quality(model):
+    try:
+        import imagerank
+        return imagerank.score(model)
+    except Exception:
+        return None
+
+
+def _image_quality_source():
+    try:
+        import imagerank
+        return {"name": imagerank.SOURCE, "url": imagerank.URL, "date": imagerank.DATE}
+    except Exception:
+        return None
+
+
+def _image_priority_ignored(state, models, available_order):
+    """A saved "Image priority" that automatic requests do NOT use, with the
+    reason, so the page can say so instead of leaving it silently ignored:
+    {"id", "why": "paid" | "unavailable", "auto_pick"} or None. MEASURED on the
+    owner's install 2026-11-11: his saved priority was a metered Puter model;
+    paid image models are never used automatically (they are reachable only by
+    picking them for one generation), so every automatic image came from another
+    model and nothing told him."""
+    try:
+        if (state or {}).get("priority_mode") != "manual":
+            return None
+        by_id = {m["id"]: m for m in models}
+        for item in (state or {}).get("manual_priority") or []:
+            if item in available_order:
+                continue
+            row = by_id.get(item) or {}
+            return {"id": item,
+                    "why": "paid" if row.get("free") is False else "unavailable",
+                    "auto_pick": available_order[0] if available_order else None}
+    except Exception:
+        pass
+    return None
 
 
 @app.route("/api/images", methods=["GET", "POST"])

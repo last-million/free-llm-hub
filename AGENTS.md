@@ -10741,3 +10741,70 @@ respected, as always):
     nothing routable.
 
 Release-note: improved: Flint v1.0 and the old GLM 4.5, 4.6 and 4.7 Flash models are now blocked by default, so the hub no longer falls back to them.
+
+## Automatic image generation uses the best model available (2026-11-11)
+
+Covered by `tests/test_image_best_available.py` (89, hermetic: fake providers, fake HTTP replies in the shape a
+live probe returned, a fake clock; no network, no real waiting). Owner: "for image provider he should automatically
+as default use the best model available image generation, not any randomly".
+
+- **MEASURED first (the owner's image history, model ids and times only, no prompts).** 13 images: 9 from AI Horde's
+  anonymous Stable Diffusion (the weakest model he has), 3 Pollinations FLUX, 1 Pollinations Turbo. In each burst the
+  FIRST image was FLUX and the next ones, 12-38 s later, came from Stable Diffusion. Two causes:
+  1. **Pollinations' free limit was read as a dead model.** Its anonymous endpoint allows "one image at a time, at
+     least 45 seconds apart" per IP (its APIDOCS.md, read 2026-11-11). PROBED the same day: a second fresh image at
+     once -> HTTP 402, `Retry-After: 41`, body code `FREE_LIMIT` ("1 image every 45 seconds per IP"); the same
+     request 42 s later -> 200. 402 is in `_DEAD_STATUSES`, so the hub shut FLUX out for `_DEAD_MODEL_TTL` (6 h)
+     and every later image fell to the next provider.
+  2. **"Auto" was a fixed order of providers, not of quality** (`_IMAGE_PROVIDER_ORDER`: cloudflare, modelscope,
+     pollinations, the rest; each provider's models in registry order, interleaved). With Cloudflare and ModelScope
+     both on, Auto opened on Cloudflare's FLUX.1 schnell (arena 742) ahead of ModelScope's Z-Image Turbo (936).
+- **The board** (`imagerank.py`, pure, never raises): Artificial Analysis' text-to-image arena (AA-Image-T2I v2.1,
+  read 2026-11-11, URL in the module). Scores read from the page, none estimated: GPT Image 2 (high) 1190, Nano
+  Banana 2 1143, GPT Image 1.5 1125, Nano Banana Pro 1120, Seedream 4.5 1030, GPT Image 1 1016, Nano Banana 987,
+  Z-Image Turbo 936, GPT Image 1 Mini 936, FLUX.1 Kontext [max] 931, Qwen Image 906, FLUX.1 [dev] 820, FLUX.1
+  [schnell] 742. Matched by what the id NAMES on any host (`@cf/black-forest-labs/flux-1-schnell`,
+  `black-forest-labs/FLUX.1-schnell`, `togetherai:...flux.1-schnell` are one model). A model the board does not list
+  gets NO score (None): Stable Diffusion 1.5 / XL / XL Lightning, DreamShaper, Seedream 4.0, Higgsfield Soul, and
+  the bare aliases `flux` / `turbo` / `ai-image` (what serves them is the host's choice). Neighbouring ids that are
+  other models (gpt-image-2.5, qwen-image-2.1/3, flux.2, gemini-3.1-flash-lite-image) are pinned as unmatched.
+- **Auto order** (`_image_rank`, flag `image_rank_by_quality`, default on; a failed flag read = off = the old order):
+  the interleaved tail is sorted by board score, best first; equal scores and every unlisted model keep the order
+  they had, after the listed ones. Stable, reorder only. A saved FREE priority still goes first. Paid models are
+  still never automatic (unchanged, `free: False`), whatever they score.
+- **The walk** (`v1_images_generations`, same flag): a quality order can put several models of ONE provider at the
+  head, which the old interleave was there to prevent. Now a provider that FAILED a hop of this request (an error,
+  a timeout, a non-200) goes behind the other providers for the rest of the request; its other models are still
+  tried after them (nothing dropped). A 200 whose image the text check rejected is not a provider failure: the next
+  best model is tried, same provider included. `MAX_IMAGE_HOPS` (4) is unchanged. Flag off = the first 4 entries in
+  order, as before.
+- **A free image limit is a queue** (flag `image_pace_wait`, default on): `_IMAGE_MIN_INTERVAL` = {pollinations:
+  45 s}. An ANONYMOUS Pollinations request takes the next free slot and waits for it (`_image_pace_reserve`, waited
+  in 0.5 s slices, stops when the client leaves), at most `_IMAGE_PACE_MAX_WAIT` (50 s); a turn further away than
+  that answers 503 "busy" (no slot taken, nothing sent) and the walk moves to the next candidate. If the server still
+  answers its limit (`_image_rate_limited`: 402/429 with a Retry-After, or the `FREE_LIMIT` code), the hub waits the
+  time it names and asks ONCE more. A limit that holds comes back as **429** (a 60 s throttle in the walk), never
+  402, so it is never a dead mark. A 402 with neither a Retry-After nor `FREE_LIMIT` is still a payment refusal
+  (402). With a saved pollen key nothing queues (the 45 s is the anonymous limit). Flag off = ask at once; the limit
+  is still read as 429.
+- **The page says what Auto uses.** `/api/images` rows carry `quality` (the board score or None), plus
+  `quality_source` and `priority_ignored` ({id, why: paid | unavailable, auto_pick}). MEASURED: the owner's saved
+  "Image priority" is the metered `puter/ai-image`, which Auto never uses, and nothing said so. A note under the
+  priority select now says it in words (`#image-priority-note`, textContent only), the Auto card reads "Best
+  available now: <model>", and each card shows its "quality N" tag. No new route.
+- `tests/conftest.py` `_image_pace_off_unless_tested`: the queue is off and emptied for every other test file, so no
+  test can sleep for real.
+- **Limits, said plainly.**
+  - On the owner's own fleet (Pollinations + AI Horde only, both keyless) the ranking changes nothing: neither model is
+    on the board. What changes there is the queue: a second image within 45 s now WAITS up to ~45 s for FLUX instead of
+    getting Stable Diffusion at once. That is slower on purpose (quality first, the owner's standing order). A third
+    image inside the same 45 s is past the 50 s wait and goes to the next provider for that one image.
+  - Pollinations' anonymous endpoint also caps an image at 768x768 pixels in area (its docs); the hub still asks for
+    the requested size and the server scales it down. Not changed.
+  - The queue is per hub process and in memory: after a restart the first request may meet the server's own limit
+    once (it then waits the time the server names).
+  - The board covers the commercial and the newer open models; most free providers' older models have no score and
+    keep their old relative order.
+  - The probe made 5 anonymous image requests to Pollinations; nothing else was sent anywhere.
+
+Release-note: improved: automatic image generation now picks the best-rated available model, waits its turn for Pollinations' free FLUX instead of dropping to a weaker model for six hours, and the Images page says which model Auto is really using.

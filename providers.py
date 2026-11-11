@@ -356,9 +356,17 @@ PROVIDERS: Dict[str, dict] = {
         # genuinely-free models are listed; nanobanana/gptimage/seedream need
         # paid Pollen credits and are deliberately excluded so "free" stays true
         # (cross-checked against the shipped SEO Quantum Pro image registry).
+        # FREE LIMIT (Pollinations' APIDOCS.md + a live probe, 2026-11-11): one
+        # image every 45 s per IP, answered with HTTP 402 `FREE_LIMIT` +
+        # Retry-After when exceeded, and at most 768x768 pixels in area. The hub
+        # waits its turn (app._image_pace_reserve) and never reads that 402 as a
+        # dead model. `flux` and `turbo` are two different models (same prompt
+        # and seed gave different images in the probe).
         "image_models": [
-            {"id": "flux", "label": "FLUX", "text_in_image": "medium"},
-            {"id": "turbo", "label": "Turbo", "text_in_image": "medium"},
+            {"id": "flux", "label": "FLUX", "text_in_image": "medium",
+             "notes": "free: one image every 45 s (the hub waits its turn), up to 768x768"},
+            {"id": "turbo", "label": "Turbo", "text_in_image": "medium",
+             "notes": "free: one image every 45 s (the hub waits its turn), up to 768x768"},
         ],
         "notes": ("Anonymous tier: NO key, NO signup, NO card. LIVE-VERIFIED — POST "
                   "text.pollinations.ai/openai/chat/completions returns 200 with "
