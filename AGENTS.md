@@ -10841,3 +10841,35 @@ free llm hub, enabled by default and shown as recommended to keep on".
   test that monkeypatches `config.get_flag` bypasses the switch (by design: it replaces the reader).
 
 Release-note: new: Settings has one switch for the Calvoun Free LLM Hub harness (the briefs, skills, guides, notes and checks the hub adds around every model); it stays on by default and is marked as recommended.
+
+## Qwen 4 is used when it appears, with no board row yet (OWNER DIRECTIVE 2026-11-12)
+
+Covered by `tests/test_qwen4_owner_rank.py` (11, hermetic). Owner: "if our hub finds the new Qwen 4 or
+Qwen 4 preview, use it of course because it is good, but we don't have a real benchmark for it".
+
+- **MEASURED first (sandbox).** Every Qwen 4 id already scored 134.10 for chat (the qwen floor, 4.0 ->
+  +0.10: above GLM 5.3 134.03 and DeepSeek V4.1 Flash 134.05). On TOOL turns it had no board row, so no
+  agentic bonus (134.10 against GLM 5.3's 138.85 and DeepSeek V4.1 Flash's 141.07) and `_may_lead_agentic`
+  was False, while the small `qwen4-27b` inherited `qwen3.8-27b`'s row and could lead.
+- **Availability the same day.** OpenRouter's public catalog (468 models) listed no Qwen 4 (newest Qwen:
+  `qwen3.8-max-prime`), and neither did the hub's live catalog (201 models). Public reports: Alibaba showed
+  Qwen 4 Max / Flash / Plus / 27B at Apsara (2026-09-22) and released Qwen3.8-Flash-Next as an architecture
+  preview; no confirmed Qwen 4 release was found. OpenRouter lists its Qwen models as paid, and the hub only
+  routes OpenRouter's `:free` and zero-priced text ids, so a paid Qwen 4 there would not be used either.
+- **The rule** (`_owner_rank_key` keys `qwen4` / `qwen4_preview`): family qwen, version >= 4.0, no tier (not
+  -flash / -mini / -lite ...), not a small size variant (`_ev_small_param_variant`: 27B-class or under), no
+  speed word. `_OWNER_TOOL_OVER_GLM`: release = GLM 5.3's own bonus + 2.2 (DeepSeek V4.1 Flash's step), preview
+  + 2.1. `_OWNER_MAY_LEAD` lets both open a tool turn with no board row. Chat is left on the qwen floor.
+- **Result** (first-party, healthy): tool turns qwen4 141.12, preview 141.02, DeepSeek V4.1 Flash 141.07
+  (inside `_AUTO_TOP_BAND`: they share the top of the free Chinese models), GLM 5.3 138.85; still under hy4
+  142.44, Claude Opus 5.5 144.66 and Kimi K3.1 Pro 148.05. A g4f copy pays the relay discount (137.12). A newer
+  release ranks above (qwen4.1 > qwen4, qwen5 > qwen4.1). Unchanged: qwen3.8 ids, `qwen4-flash` (99.10, the
+  strong-root speed cap), `qwen4-27b` (its inherited board row).
+- **Limits, said plainly.** No benchmark backs the tool placement: it is the owner's call. Measured reliability,
+  rests and the 24 h no-answer block still demote a Qwen 4 pair that fails. Qwen3.8-Flash-Next (the 125B-A6B
+  architecture preview) is not treated as Qwen 4. When a Qwen 4 is reachable, the existing "newest wins" rule
+  (modelrank) holds the older flagship under it: checked with a fake fleet, `qwen3.8-max` 134.08 -> 131.43, while
+  `groq/qwen/qwen3.8-27b` keeps 133.08 / 134.16. When a board lists Qwen 4, its own row should replace this
+  placement.
+
+Release-note: improved: when a free Qwen 4 or Qwen 4 preview appears on any provider, the hub now uses it for coding-agent turns at the level of DeepSeek V4.1 Flash, without waiting for a benchmark.

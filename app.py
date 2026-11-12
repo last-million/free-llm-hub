@@ -20697,7 +20697,9 @@ def _may_lead_agentic(score, model_id):
     (chat) score now sits in the free cluster (~134), under the 138 floor, but
     its proven agent ability is the whole point of leading a tool turn."""
     return (_is_tool_proven(model_id) or score >= _PREF_FLOORS[5]
-            or _ev_has_agentic_evidence(model_id))
+            or _ev_has_agentic_evidence(model_id)
+            # OWNER DIRECTIVE 2026-11-12: Qwen 4 leads with no board row yet.
+            or _owner_rank_key(model_id)[0] in _OWNER_MAY_LEAD)
 
 
 def _rp_evidence_only_lead(pid, model_id, score):
@@ -20773,14 +20775,28 @@ def _is_tool_proven(model_id):
 _OWNER_DS_FLASH_FLOOR = 134.05        # chat: just over GLM 5.3's board-placed 134.03
 _OWNER_DS_PRO_FLOOR = 134.12          # chat: over MiMo V2.6 Pro's 134.09
 _OWNER_ORDER_CEILING = 134.49         # never past hy3 (134.5), like MiMo's ceiling
-_OWNER_TOOL_OVER_GLM = {"ds_flash": 2.2, "mimo_pro": 2.7, "ds_pro": 3.2}
+# OWNER DIRECTIVE 2026-11-12: "if our hub finds the new Qwen 4 or Qwen 4 preview, use it,
+# of course -- it is good -- but we don't have a real benchmark for it". MEASURED before
+# the change (sandbox): every Qwen 4 id already scored 134.10 for chat (the qwen floor:
+# above GLM 5.3 and DeepSeek V4.1 Flash), but on TOOL turns it had no board row, so no
+# agentic bonus (134.10 against GLM 5.3's 138.85 and DeepSeek V4.1 Flash's 141.07) and
+# no right to open a tool turn, while the small qwen4-27b inherited qwen3.8-27b's row and
+# could. Placement (an owner call, no figure invented): the full-size Qwen 4 (no speed or
+# small size cut) gets DeepSeek V4.1 Flash's step over GLM 5.3, so it shares the top of the
+# free Chinese models with it, under hy4 (vendor Terminal-Bench figure), Claude, Kimi
+# K3.1 and the GPT cap. A preview build sits one step under the release (a release is
+# normally the stronger build: hy4 44.4 vs its preview 26.3). Chat is left on the qwen
+# floor. Measured reliability, rests and the 24 h block still demote it if it fails.
+_OWNER_TOOL_OVER_GLM = {"ds_flash": 2.2, "mimo_pro": 2.7, "ds_pro": 3.2,
+                        "qwen4": 2.2, "qwen4_preview": 2.1}
+_OWNER_MAY_LEAD = frozenset({"qwen4", "qwen4_preview"})   # no board row to lead on
 _DS_V41_SPELLING_RE = re.compile(r"deepseek[-_ ]?v4[.-]1(?![0-9])", re.I)
 _owner_rank_cache = {}
 
 
 def _owner_rank_key(model_id):
-    """("ds_pro" | "mimo_pro" | "ds_flash" | None, version) for a model id in the
-    owner's order. Cached; never raises."""
+    """("ds_pro" | "mimo_pro" | "ds_flash" | "qwen4" | "qwen4_preview" | None, version)
+    for a model id in the owner's order. Cached; never raises."""
     low = (model_id or "").lower()
     hit = _owner_rank_cache.get(low)
     if hit is not None:
@@ -20797,6 +20813,14 @@ def _owner_rank_key(model_id):
         elif (p is not None and p.family == "mimo" and p.tier == "pro"
               and tuple(p.version or (0, 0)) >= (2, 6)):
             out = ("mimo_pro", tuple(p.version))
+        elif (p is not None and p.family == "qwen" and not p.tier
+              and tuple(p.version or (0, 0)) >= (4, 0)
+              and not _ev_small_param_variant(low)
+              and not _SPEED_VARIANT_RE.search(low)):
+            # Qwen 4 and later, full size only: a -flash/-mini cut or a 27B-class size
+            # variant keeps its own place (OWNER DECISION 2026-10-10, size variants).
+            out = ("qwen4_preview" if benchmarks._is_preview(low) else "qwen4",
+                   tuple(p.version))
     except Exception:                                            # noqa: BLE001
         out = (None, None)
     if len(_owner_rank_cache) < 8192:
