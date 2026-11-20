@@ -29,5 +29,23 @@ discarded after copying `SKILL.md` + `scripts/` + `LICENSE`.
 4. **Proactive-suggestion rule** added (SEO / social trends / marketing /
    "what are people saying about X").
 
-Everything below the adaptations banner in `SKILL.md`, and all of `scripts/`,
-is byte-identical to upstream v3.18.4.
+5. **Split into SKILL.md + `references/`** (2026-11-20). NVIDIA SkillEvaluator
+   measured the old SKILL.md at 2266 lines / 226,851 bytes / ~56K tokens
+   (limits 500 lines, 51,200 bytes, ~5K tokens) and OpenCode stops reading a
+   SKILL.md at 50 KiB, so agents there never saw the research and synthesis
+   steps. SKILL.md (now ~46 KB) keeps what every answer needs: the hub section,
+   the SKILL CONTRACT, the whole OUTPUT CONTRACT (badge and LAWs 1-11) and HOW
+   TO INVOKE (all of which sat inside the old first 50 KiB, so nothing the
+   model could see before is now behind a Read), plus an index naming the
+   `references/` file that holds every other upstream section: the LAW 6
+   worked example, the trending/discovery protocol (stubbed in HOW TO INVOKE),
+   setup, intent and pre-flight, comparison modes, research, synthesis,
+   follow-up, and Security & Permissions. The upstream text was moved line for
+   line (checked: no line lost); each reference file starts with a two-line
+   comment saying so, and the SKILL CONTRACT carries a one-line hub note that
+   "this file" now means SKILL.md plus `references/`. The `description` gained
+   a leading "Use when ..." trigger.
+
+Apart from those changes, the upstream sections (in `SKILL.md` below the
+adaptations banner and in `references/`) and all of `scripts/` are
+byte-identical to upstream v3.18.4.
