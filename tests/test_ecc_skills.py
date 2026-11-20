@@ -1,7 +1,7 @@
-"""ECC skills: opt-in coding-agent rules vendored from github.com/affaan-m/ECC.
+"""ECC skills: coding-agent rules vendored from github.com/affaan-m/ECC.
 
 Covers the legal vendoring (LICENSE + VENDORED.md, markdown only, no
-executables), ecc.py (catalog, default-off, frontmatter-strip, bounded render,
+executables), ecc.py (catalog, frontmatter-strip, bounded render,
 enabled+matched gating), craft.match wiring, the /api/skills routes (list,
 toggle one, toggle all), injection into the Build brief (craft.system_message,
 used verbatim by agentic_chat) and into every /v1 protocol (the shared
@@ -105,8 +105,9 @@ def test_catalog_ids_and_shape():
         assert len(set(k.lower() for k in kw)) == len(kw)           # no dup keyword
 
 
-def test_default_is_off():
-    # Nothing enabled in a fresh catalog view, and the stored default is empty.
+def test_nothing_enabled_means_nothing_matches():
+    # ecc.view / ecc.hits take the ENABLED ids as given: an empty list is "all switched
+    # off". (The hub's default is every skill on: see tests/test_ecc_default_on.py.)
     assert all(not row["enabled"] for row in ecc.view([]))
     assert ecc.hits("set up tdd with test coverage", []) == []
 
@@ -199,11 +200,11 @@ def test_worst_case_with_all_ecc_enabled_stays_under_ceiling():
 
 # ------------------------------------------------------------ /api/skills
 
-def test_api_lists_ecc_all_off(isolated_config):
+def test_api_lists_every_ecc_skill_on_by_default(isolated_config):
     v = app.app.test_client().get("/api/skills").get_json()
     assert [row["id"] for row in v["ecc"]] == list(EXPECTED_IDS)
-    assert all(not row["enabled"] for row in v["ecc"])
-    assert v["ecc_all"] is False
+    assert all(row["enabled"] for row in v["ecc"])
+    assert v["ecc_all"] is True
     assert "Affaan Mustafa" in v["ecc_credit"]
     # ECC ids are distinct from the built-in ids.
     assert not (set(EXPECTED_IDS) & set(skills.BUILTIN_IDS))
@@ -211,6 +212,10 @@ def test_api_lists_ecc_all_off(isolated_config):
 
 def test_api_toggle_one_and_all(isolated_config, app_source):
     c = app.app.test_client()
+    # Start from "all off" so each step is a real change from the saved state.
+    v = c.post("/api/skills/toggle", json={"id": "ecc_all", "enabled": False},
+               headers=H).get_json()
+    assert all(not r["enabled"] for r in v["ecc"]) and v["ecc_all"] is False
     v = c.post("/api/skills/toggle", json={"id": "ecc:tdd-workflow", "enabled": True},
                headers=H).get_json()
     assert {r["id"]: r["enabled"] for r in v["ecc"]}["ecc:tdd-workflow"] is True
@@ -245,7 +250,7 @@ def test_injected_into_v1_via_apply_craft_brief(isolated_config, app_source):
     out = app._apply_craft_brief(list(msgs), agentic=True)
     joined = "\n".join(m.get("content", "") for m in out if m.get("role") == "system")
     assert "ECC SKILL: Security review (ECC)" in joined
-    # Off by default: nothing enabled -> no ECC block.
+    # Switched off by the user (a saved empty list): no ECC block.
     config.set_setting("ecc_enabled", [])
     out2 = app._apply_craft_brief(list(msgs), agentic=True)
     joined2 = "\n".join(m.get("content", "") for m in out2 if m.get("role") == "system")

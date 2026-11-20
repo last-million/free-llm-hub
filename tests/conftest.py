@@ -873,6 +873,27 @@ def _skill_work_and_rescue_off_unless_tested(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _ecc_unset_means_none_except_its_own_tests(request, monkeypatch):
+    """ECC skills are ON by default (nothing saved = all nine on, 2026-11-20). Every test
+    file but the ECC ones keeps the earlier reading -- nothing saved = none -- so the
+    brief-size and byte-exact brief checks elsewhere still measure what they always did.
+    A list a test saves itself is followed either way."""
+    try:
+        import app
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+    mod = getattr(request.node, "module", None)
+    name = mod.__name__.rsplit(".", 1)[-1] if mod is not None else ""
+    if name not in ("test_ecc_skills", "test_ecc_default_on"):
+        def _none_unless_saved():
+            v = app.config.get_setting("ecc_enabled", [])
+            return [x for x in v if x in app.ecc.IDS] if isinstance(v, list) else []
+        monkeypatch.setattr(app, "_ecc_enabled", _none_unless_saved)
+    yield
+
+
 _DEPLOY_TEST_FILES = {"test_deploy_perfect", "test_deploy_after_run"}
 
 

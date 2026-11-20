@@ -1,4 +1,4 @@
-"""ECC skills: opt-in coding-agent rules vendored from github.com/affaan-m/ECC.
+"""ECC skills: coding-agent rules vendored from github.com/affaan-m/ECC.
 
 MIT, (c) 2026 Affaan Mustafa. The markdown lives in `skills_ecc/<name>.md`
 (see `skills_ecc/VENDORED.md` for provenance and what was left out). This module
@@ -6,8 +6,9 @@ is the pure part (stdlib only, never raises): the catalog shown in Settings,
 keyword matching, and a mtime-cached reader that strips each file's YAML
 frontmatter before the body is injected.
 
-The skills are OFF by default. app.py stores which ids are ON in the
-`ecc_enabled` setting and hands them to craft.match() through the skill source,
+The skills are ON by default and a user can switch each one, or all, off. Until
+the user saves a choice every id is on; app.py then stores the ids that are ON in
+the `ecc_enabled` setting and hands them to craft.match() through the skill source,
 so an enabled+matched ECC skill rides the opening turn exactly like a built-in
 brief or a USER SKILL block -- every protocol, CLI, /agent brief file and crew.
 A missing directory or unreadable file yields no hits (the off state).
@@ -26,7 +27,7 @@ DIGEST_DIR = os.path.join(DIR, "digests")
 MAX_PER_TURN = 2       # ECC skills added to one request (context tax)
 MAX_CHARS = 1500       # injected block per skill, header included
 
-CREDIT = "opt-in; MIT, (c) Affaan Mustafa -- github.com/affaan-m/ECC"
+CREDIT = "MIT, (c) Affaan Mustafa -- github.com/affaan-m/ECC"
 
 # (id, filename, display name, one-line description, trigger keywords). The id is
 # "ecc:<upstream skill name>"; name/description/keywords are drawn from each

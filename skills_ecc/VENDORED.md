@@ -1,4 +1,4 @@
-# Vendored: ECC skills (opt-in)
+# Vendored: ECC skills (on by default)
 
 - Upstream: https://github.com/affaan-m/ECC
 - Commit: `ef648e01899ba3e8dc6371642deaaf64b4477775` (repo VERSION 2.2.3)
@@ -79,10 +79,10 @@ a digest is missing or unreadable. The originals are unchanged.
 trigger keywords drawn from each skill's own frontmatter description) and reads
 the markdown here on demand (cached by mtime, fail-open). The skills are
 **off by default**; the owner enables them, all at once or one by one, in
-Settings -> Skills -> "ECC skills". When enabled and matched, a skill's body is
+Settings -> Skills -> "ECC skills" (all on by default; switch any off). When enabled and matched, a skill's body is
 injected as one bounded system block (its digest, <= 1500 chars each, at most 2 ECC skills
 per request) exactly like the hub's existing USER SKILL blocks — see the
-"ECC skills (vendored, opt-in)" section of the repo `AGENTS.md`.
+"ECC skills (vendored, on by default)" section of the repo `AGENTS.md`.
 
 Credit: these documents are the work of Affaan Mustafa and the ECC project,
 redistributed here under the MIT license.

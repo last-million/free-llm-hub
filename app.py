@@ -32626,9 +32626,15 @@ def _custom_skills():
 
 
 def _ecc_enabled():
-    """The opt-in ECC skill ids the owner switched ON (default none)."""
-    v = config.get_setting("ecc_enabled", [])
-    return [x for x in v if x in ecc.IDS] if isinstance(v, list) else []
+    """The ECC skill ids that are ON. ON BY DEFAULT (owner, 2026-11-20: "skills should
+    always be enabled by default, and the user can disable them"): while the setting has
+    never been saved every ECC skill is on. A list the user saved -- an empty one
+    included ("Enable all ECC" off) -- is followed exactly, so nothing a user switched
+    off comes back; a stored value that is not a list reads as never saved."""
+    v = config.get_setting("ecc_enabled", None)
+    if not isinstance(v, list):
+        return list(ecc.IDS)
+    return [x for x in v if x in ecc.IDS]
 
 
 def _skill_source():

@@ -287,7 +287,9 @@ vendored skill lives here:
   only the POST `{social_search: bool}` that sets it is control-token gated) and only uses
   social sources when the dashboard Settings switch "Social media web search"
   is on. The switch persists as the `social_web_search` flag in config.py
-  (default false). Covered by `tests/test_skills_policy.py`.
+  (default false). Covered by `tests/test_skills_policy.py`. SKILL.md is ~46 KB plus
+  `references/` (split 2026-11-20 because OpenCode stops reading a SKILL.md at 50 KiB;
+  see `VENDORED.md` and `tests/test_last30days_split.py`).
 
 As noted above, graphify's `post-commit` hook must stay installed so the
 graph rebuilds after each commit.
@@ -1157,7 +1159,7 @@ Covered by `tests/test_skills_settings.py`. "Skills" = the craft briefs
   = update), `POST /api/skills/custom/delete {id}`. UI: `#skills-group` in the
   Settings drawer.
 
-## ECC skills (vendored, opt-in) (2026-10-08)
+## ECC skills (vendored, on by default) (2026-10-08)
 
 Covered by `tests/test_ecc_skills.py`. Nine coding-agent rule documents vendored
 from github.com/affaan-m/ECC (commit `ef648e0`, repo VERSION 2.2.3), **MIT, (c)
@@ -1185,7 +1187,12 @@ only injects text).
   Mustafa -- ...)\n<body>`, each `<= MAX_CHARS` (1500); `hits(text, enabled_ids)`
   returns at most `MAX_PER_TURN` (2), ENABLED-and-matched only; a missing dir /
   unreadable file = no hits (the off state).
-- **Default OFF.** Enabled ids live in setting `ecc_enabled` (default `[]`).
+- **Default ON** (owner, 2026-11-20: skills are always enabled by default and a user can
+  disable them; they were default OFF before). Setting `ecc_enabled` never saved = every
+  skill on; a saved list, an empty one included, is followed exactly (`_ecc_enabled`), so
+  nothing a user switched off comes back; a stored value that is not a list reads as never
+  saved. Covered by `tests/test_ecc_default_on.py`; conftest keeps the old none-by-default
+  reading for every other test file (`_ecc_unset_means_none_except_its_own_tests`).
   `_skill_source()` now returns a THIRD element (enabled ECC ids); `craft.py`
   unpacks it length-tolerantly (a 2-tuple source = no ECC, the old shape some
   tests still use) and `craft.match` appends `ecc.hits` after the user skills.
@@ -1201,8 +1208,10 @@ only injects text).
 - **Cost**: with EVERY ECC skill enabled, the heaviest request still lands at
   ~13.27% of the 32K floor (the saas landing page, which matches no ECC skill);
   the heaviest ECC-matching request is ~11.7%. The existing
-  `test_craft_briefs.test_worst_case_brief_cost` (0.135) stays green because ECC
-  is off by default.
+  `test_craft_briefs.test_worst_case_brief_cost` stays green because conftest keeps
+  "nothing saved = no ECC" for the other test files; the check with every skill on is
+  `test_ecc_skills.test_worst_case_with_all_ecc_enabled_stays_under_ceiling` (a real install
+  now pays this: up to 2 ECC blocks of <= 1500 chars on a request that matches their keywords).
 - **Digests (2026-11-20)**: the block is `skills_ecc/digests/<name>.md` (hub-authored,
   1.0-1.4K chars, the skill's own rules without code samples or "When to Activate"),
   not a clip of the original. MEASURED with `ecc.render`: the clip kept 8-11% of seven
@@ -1210,8 +1219,51 @@ only injects text).
   Found by running NVIDIA SkillEvaluator (`skillevaluator validate --tiers 1 --no-llm`)
   on the vendored skills; its other HIGH findings were false positives (REST examples
   read as tool abuse, `/users/123/` as a personal path) and SkillSpector/Gitleaks did
-  not run on Windows. Missing or unreadable digest = the old clipped original.
+  not run on Windows then (SkillSpector ran later: see "Skill tooling pass"). Missing or unreadable digest = the old clipped original.
   Covered by `tests/test_ecc_digests.py`.
+
+## Skill tooling pass: NVIDIA SkillEvaluator, SkillSpector, Microsoft SkillOpt (2026-11-20)
+
+Owner: fix the hub's skills with the new NVIDIA and Microsoft tools. 27 skills were staged as
+`<name>/SKILL.md` (the 10 built-in briefs, the 7 shared blocks, the 9 ECC digests, last30days)
+and run through SkillEvaluator 1.0.1 Tier 1 plus its overlap check, and SkillSpector `--no-llm`.
+
+- **Fixed (real findings):** the ECC clip (digests, above); last30days SKILL.md at 226,851 bytes
+  against OpenCode's 50 KiB cut (split: SKILL.md ~46 KB keeps the hub gating, the SKILL CONTRACT, the
+  whole OUTPUT CONTRACT and HOW TO INVOKE, all of which sat inside the old first 50 KiB, plus an
+  index; the other upstream sections moved line for line into `references/`); a picker parse bug
+  SkillOpt's rollout exposed (`id:programming` read as no id); ECC skills on by default.
+- **Scanned, left as they are:** the 26 critical "License 'Proprietary'" and 17 "no top-level
+  heading" come from how the briefs were staged (a made-up license line, no title); "Instructions /
+  Examples" and "very little content" are SKILL.md format rules, and the briefs are injected text
+  with character budgets. SkillSpector PE3 (.env), RP1 (unpinned npx), EA2 ("without asking") and E1
+  (curl to the local image endpoint) on the briefs were read line by line: they are the briefs' own
+  instructions (keep .env out of git, serve with npx serve, ...), so false positives. last30days's
+  275 findings are upstream scripts (browser cookies are read only when FROM_BROWSER is set); the
+  vendored scripts stay byte-identical.
+- **Overlap** (NVIDIA nemotron-3-embed-1b, threshold 0.75): one pair, `verify-read` vs `verify-run`
+  (0.81 / 0.83), two intentional variants (tool-less turns vs tool turns).
+- **SkillOpt on the picker catalog** (the one part with a measurable target): a rollout built with
+  the hub's own `skillpick.messages_for` / `parse` on groq/qwen3.8-27b at temperature 0 scored
+  **47/48 exact on both runs** (soft 0.979), with 45/48 identical picks between the runs and 5 of 96
+  calls answered by a fallback model instead of Groq. One miss, both runs: "add pagination and
+  caching to the node api" -> programming only. The headroom is one item, below the run-to-run
+  noise, so no catalog change was kept. The web-design brief was not optimized: it sits at 5441 of
+  its 5500 characters, `best` is not a frozen model, and slopcheck as the grader would teach the brief
+  to dodge slopcheck.
+- **Running them again:** `skillevaluator validate <dir> --type skill --tiers 1 --no-llm`;
+  `similarity-check` needs the `openai` package, `SKILL_EVAL_EMBEDDING_PROVIDER=nv_build` and
+  `NVIDIA_API_KEY`; SkillSpector installs on Windows into a Python 3.12 venv
+  (`pip install git+https://github.com/NVIDIA/skillspector.git`) and prints JSON to stdout
+  (`--format json`; file output is unsupported on Windows); SkillOpt takes any OpenAI-compatible
+  endpoint through `OPENAI_COMPATIBLE_*`: put a small proxy in front of the hub that adds
+  `"_no_craft": true` so the hub's own briefs stay out of the measurement. Its reflection step opens
+  `conversation.json` without an encoding (cp1252 on Windows), so write it ASCII-escaped, and a
+  client killed mid-run leaves the proxy retrying orphaned requests. The harness (about 250 lines)
+  was not kept in the repo. SkillOpt-Sleep was not used (it reads local agent transcripts).
+- **Not done:** Gitleaks, and SkillEvaluator Tier 3 (live agent evaluation: Docker and an agent CLI).
+  SkillEvaluator's own security step reported skillspector and gitleaks unavailable inside its venv,
+  so SkillSpector was run on its own.
 
 ## Low-resource mode (2026-09-28)
 
