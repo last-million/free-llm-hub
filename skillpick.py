@@ -99,7 +99,15 @@ def parse(reply, ids):
     found = []
     low = reply.lower()
     for tok in re.findall(r"[a-z0-9_][a-z0-9_:.\-]*", low):
-        real = known.get(tok.rstrip(".:-"))
+        tok = tok.rstrip(".:-")
+        real = known.get(tok)
+        # A label glued to the id ("id:programming", "skill:ecc:tdd-workflow", MEASURED
+        # 2026-11-20 on groq qwen3.8-27b) is read by dropping leading "word:" parts until
+        # an enabled id is left; "ecc:..." and "cli:..." ids match before anything is cut.
+        rest = tok
+        while real is None and ":" in rest:
+            rest = rest.split(":", 1)[1]
+            real = known.get(rest)
         if real and real not in found:
             found.append(real)
     if found:

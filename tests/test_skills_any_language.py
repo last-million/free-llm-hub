@@ -103,6 +103,17 @@ def test_a_reply_can_never_name_a_skill_that_is_not_enabled():
     assert p.pick("build me a nice shop please", CATALOG, wait=1) == ("web_design",)
 
 
+def test_a_label_glued_to_the_id_is_still_read():
+    # MEASURED 2026-11-20 (SkillOpt run, groq qwen3.8-27b): "id:ecc:tdd-workflow,id:programming"
+    # was read as no id at all, so the picker lost TDD + Engineering for that request.
+    ids = ["programming", "ecc:tdd-workflow", "seo"]
+    assert skillpick.parse("id:ecc:tdd-workflow,id:programming", ids) == (
+        "ecc:tdd-workflow", "programming")
+    assert skillpick.parse("skill:seo", ids) == ("seo",)
+    assert skillpick.parse("ecc:tdd-workflow", ids) == ("ecc:tdd-workflow",)
+    assert skillpick.parse("id:secret_skill", ids) is None      # still only enabled ids
+
+
 def test_the_most_it_can_pick_is_capped():
     ids = ["a%d" % i for i in range(9)]
     assert len(skillpick.parse(",".join(ids), ids)) == skillpick.MAX_IDS
