@@ -1203,6 +1203,15 @@ only injects text).
   the heaviest ECC-matching request is ~11.7%. The existing
   `test_craft_briefs.test_worst_case_brief_cost` (0.135) stays green because ECC
   is off by default.
+- **Digests (2026-11-20)**: the block is `skills_ecc/digests/<name>.md` (hub-authored,
+  1.0-1.4K chars, the skill's own rules without code samples or "When to Activate"),
+  not a clip of the original. MEASURED with `ecc.render`: the clip kept 8-11% of seven
+  of the nine files (25% of agent-introspection-debugging, 58% of verification-loop).
+  Found by running NVIDIA SkillEvaluator (`skillevaluator validate --tiers 1 --no-llm`)
+  on the vendored skills; its other HIGH findings were false positives (REST examples
+  read as tool abuse, `/users/123/` as a personal path) and SkillSpector/Gitleaks did
+  not run on Windows. Missing or unreadable digest = the old clipped original.
+  Covered by `tests/test_ecc_digests.py`.
 
 ## Low-resource mode (2026-09-28)
 

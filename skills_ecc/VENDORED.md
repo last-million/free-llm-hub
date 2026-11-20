@@ -43,6 +43,19 @@ body (see `ecc.py`).
   the edit site points back here. Nothing else in that file, and no byte of the
   other eight files, was changed.
 
+## Hub-authored digests (`digests/`, 2026-11-20)
+
+The hub injects at most 1500 chars per skill, but the originals run 2.7-16.7K
+chars, so a plain clip kept only 8-11% of seven of the nine files (a title, the
+"When to Activate" list and the first section; measured with `ecc.render`, the
+gap found by NVIDIA SkillEvaluator's static checks). `digests/<name>.md` holds a
+condensed version of each skill's own rules (1.0-1.4K chars), written by the hub
+from the original above: same rules, no code samples, no "When to Activate"
+list, no references to other ECC skills or tools that are not vendored. It is a
+derived work of the MIT-licensed original; the credit line rides every injected
+block. `ecc.render` uses the digest and falls back to the clipped original when
+a digest is missing or unreadable. The originals are unchanged.
+
 ## What was left out, and why
 
 - **`agents/openai.yaml`** — every upstream skill ships one alongside its
@@ -67,7 +80,7 @@ trigger keywords drawn from each skill's own frontmatter description) and reads
 the markdown here on demand (cached by mtime, fail-open). The skills are
 **off by default**; the owner enables them, all at once or one by one, in
 Settings -> Skills -> "ECC skills". When enabled and matched, a skill's body is
-injected as one bounded system block (<= 1500 chars each, at most 2 ECC skills
+injected as one bounded system block (its digest, <= 1500 chars each, at most 2 ECC skills
 per request) exactly like the hub's existing USER SKILL blocks — see the
 "ECC skills (vendored, opt-in)" section of the repo `AGENTS.md`.
 

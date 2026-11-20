@@ -17,6 +17,11 @@ import re
 import threading
 
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills_ecc")
+# Hub-authored condensed rules, one per skill (same filename). The vendored originals
+# run 2.7-16.7K chars and the injected block is MAX_CHARS, so the old clip kept only a
+# title, a "When to Activate" list and the first section (8-11% of seven of the nine
+# files). render() uses the digest when one exists and the clipped original otherwise.
+DIGEST_DIR = os.path.join(DIR, "digests")
 
 MAX_PER_TURN = 2       # ECC skills added to one request (context tax)
 MAX_CHARS = 1500       # injected block per skill, header included
@@ -125,12 +130,35 @@ def load_body(filename):
     return body
 
 
+def load_digest(filename):
+    """The hub-authored condensed rules for one skill, cached by mtime; "" when there is
+    none or it cannot be read (render() then falls back to the vendored original)."""
+    path = os.path.join(DIGEST_DIR, filename)
+    key = "digest:" + filename
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""
+    with _lock:
+        hit = _cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read().strip()
+    except (OSError, ValueError):
+        return ""
+    with _lock:
+        _cache[key] = (mtime, body)
+    return body
+
+
 def render(sid):
     """The bounded system-message block for one ECC skill, or "" if unreadable."""
     entry = _BY_ID.get(sid)
     if not entry:
         return ""
-    body = load_body(entry[1])
+    body = load_digest(entry[1]) or load_body(entry[1])
     if not body:
         return ""
     header = "ECC SKILL: %s (%s)\n" % (entry[2], CREDIT)

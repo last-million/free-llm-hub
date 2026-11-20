@@ -1,0 +1,11 @@
+# Playwright E2E
+- Layout: tests/e2e/<area>/*.spec.ts, page objects in tests/pages, fixtures in tests/fixtures, playwright.config.ts.
+- Page Object Model: one class per page holding locators (data-testid) and actions (goto, search), so tests read like user stories.
+- Locators: getByRole, getByText or data-testid, never CSS classes. Locators auto-wait, so never use page.waitForTimeout.
+- Wait on conditions (waitForResponse for the API call, expect(...).toBeVisible()), never fixed sleeps; let animations settle before clicking.
+- Each test independent: own data, no ordering, clean up.
+- Config: fullyParallel; on CI retries 2 and workers 1; trace on-first-retry, screenshot and video on failure; baseURL from env; webServer starts the app and is reused locally; projects for chromium, firefox, webkit and a mobile viewport.
+- Flaky tests: reproduce with --repeat-each=10; quarantine with test.fixme and an issue link; fix the cause (race, network timing, animation) instead of raising timeouts.
+- CI: npm ci, npx playwright install --with-deps, run, upload the HTML report and traces even when tests fail.
+- Money, wallets, production data: skip those flows on production, mock the wallet provider (window.ethereum), use staging.
+- Finish with a report: total, passed, failed, flaky, and each failure's file:line and screenshot.
