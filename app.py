@@ -31091,7 +31091,7 @@ def _write_playwright_marker(pid, shared=True, headless=True):
         pass
 
 
-def _retire_stale_playwright(marker):
+def _retire_stale_playwright(marker, psutil_mod=None):
     """Stop a browser server THIS hub started without the shared context.
 
     Only ever a pid we wrote down ourselves. A server we did not start has no
@@ -31101,18 +31101,63 @@ def _retire_stale_playwright(marker):
     pid = marker.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
+    # MEASURED 2026-11-21: the recorded pid is the shell the hub launched, long gone
+    # by the next start (the real server is its detached node child), so killing
+    # "that pid" stopped nothing and the old server was adopted again -- and a pid
+    # that was reused by an unrelated program would have been killed. Find the
+    # server by what it IS: a process whose command line names @playwright/mcp AND
+    # this hub's own profile folder (a server somebody else runs does not), plus
+    # everything those processes started (the browser).
     try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10, creationflags=_CREATE_NO_WINDOW)
-        else:
-            os.kill(pid, 15)
-        _log.info("[playwright] retired the pre-shared-context server (pid %d)", pid)
-        time.sleep(1.5)
-        return True
+        psutil = psutil_mod
+        if psutil is None:
+            import psutil                                        # noqa: F811
+        victims = _playwright_victims(psutil)
+        stopped = 0
+        for proc in victims:
+            try:
+                proc.kill()
+                stopped += 1
+            except Exception:                                    # noqa: BLE001
+                pass
+        if stopped:
+            _log.info("[playwright] retired the old browser server (%d process(es))", stopped)
+            time.sleep(1.5)
+        return bool(stopped)
     except Exception:                                            # noqa: BLE001
         return False
+
+
+def _playwright_ours(argv):
+    """Is this command line the shared browser server THIS hub starts?"""
+    text = os.path.normcase(" ".join(str(a) for a in (argv or ())))
+    profile = _playwright_profile_dir()
+    return bool(profile) and "@playwright" in text and "mcp" in text \
+        and os.path.normcase(profile) in text
+
+
+def _playwright_victims(psutil):
+    """Our server's processes and everything they started. Never the hub itself."""
+    mine = os.getpid()
+    roots = []
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if p.info.get("pid") != mine and _playwright_ours(p.info.get("cmdline")):
+                roots.append(p)
+        except Exception:                                        # noqa: BLE001
+            continue
+    victims, seen = [], set()
+    for p in roots:
+        group = [p]
+        try:
+            group += list(p.children(recursive=True))
+        except Exception:                                        # noqa: BLE001
+            pass
+        for q in group:
+            if q.pid not in seen and q.pid != mine:
+                seen.add(q.pid)
+                victims.append(q)
+    return victims
 
 
 def _playwright_probe(port):

@@ -230,3 +230,99 @@ def test_a_failed_retire_still_adopts_the_running_server(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "_playwright_url", [None])
     A._start_playwright_mcp()
     assert A._playwright_url[0] == URL
+
+
+# --------------------------------------------------------------------------- #
+# Retiring finds the server by what it is, not by a pid written down days ago
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-11-21: the marker pid was the launcher shell, long gone; killing it
+# stopped nothing, the headed server was adopted again, and a reused pid would have
+# been killed.
+
+import os
+
+
+class _Proc:
+    def __init__(self, pid, cmdline, children=()):
+        self.pid = pid
+        self.info = {"pid": pid, "cmdline": cmdline}
+        self._children = list(children)
+        self.killed = False
+
+    def children(self, recursive=True):
+        return list(self._children)
+
+    def kill(self):
+        self.killed = True
+
+
+class _Psutil:
+    def __init__(self, procs):
+        self.procs = procs
+
+    def process_iter(self, attrs=None):
+        return iter(self.procs)
+
+
+def _server_cmd(profile, runner="node.exe"):
+    return [runner, "C:/n/node_modules/@playwright/mcp/cli.js", "--port", "8931",
+            "--host", "127.0.0.1", "--shared-browser-context",
+            "--user-data-dir", profile]
+
+
+def _retire(monkeypatch, tmp_path, procs):
+    profile = str(tmp_path / "playwright-profile")
+    monkeypatch.setattr(A, "_playwright_profile_dir", lambda: profile)
+    monkeypatch.setattr(A.time, "sleep", lambda s: None)
+    return profile, A._retire_stale_playwright({"pid": 4321}, psutil_mod=_Psutil(procs))
+
+
+def test_the_real_server_and_its_browser_are_stopped_even_if_the_marker_pid_is_dead(monkeypatch, tmp_path):
+    profile = str(tmp_path / "playwright-profile")
+    browser = _Proc(31, ["chrome.exe", "--user-data-dir=" + profile])
+    node = _Proc(30, _server_cmd(profile), children=[browser])
+    shell = _Proc(29, ["cmd.exe", "/c", "npx -y @playwright/mcp@latest --user-data-dir " + profile])
+    done, ok = _retire(monkeypatch, tmp_path, [shell, node])
+    assert ok is True
+    assert shell.killed and node.killed and browser.killed
+
+
+def test_a_playwright_server_with_another_profile_is_left_alone(monkeypatch, tmp_path):
+    mine = _Proc(30, _server_cmd(str(tmp_path / "playwright-profile")))
+    theirs = _Proc(40, _server_cmd(str(tmp_path / "somebody-elses-profile")))
+    _retire(monkeypatch, tmp_path, [mine, theirs])
+    assert mine.killed and not theirs.killed
+
+
+def test_the_marker_pid_is_never_killed_on_its_own(monkeypatch, tmp_path):
+    """A recycled pid belongs to some other program: only the command line decides."""
+    stranger = _Proc(4321, ["notepad.exe", "notes.txt"])
+    _done, ok = _retire(monkeypatch, tmp_path, [stranger])
+    assert ok is False
+    assert not stranger.killed
+
+
+def test_the_hub_itself_is_never_a_victim(monkeypatch, tmp_path):
+    profile = str(tmp_path / "playwright-profile")
+    me = _Proc(os.getpid(), _server_cmd(profile))
+    _retire(monkeypatch, tmp_path, [me])
+    assert not me.killed
+
+
+def test_nothing_found_means_nothing_retired(monkeypatch, tmp_path):
+    _done, ok = _retire(monkeypatch, tmp_path, [])
+    assert ok is False
+
+
+def test_a_broken_process_listing_is_not_fatal(monkeypatch, tmp_path):
+    class _Boom:
+        def process_iter(self, attrs=None):
+            raise RuntimeError("no process table")
+    monkeypatch.setattr(A, "_playwright_profile_dir", lambda: str(tmp_path / "p"))
+    assert A._retire_stale_playwright({"pid": 4321}, psutil_mod=_Boom()) is False
+
+
+def test_retiring_no_longer_shells_out_to_kill_a_recorded_pid():
+    body = SRC[SRC.index("def _retire_stale_playwright("):]
+    body = body[:body.index("\ndef _playwright_ours(")]
+    assert "taskkill" not in body and "os.kill(" not in body
