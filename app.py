@@ -13556,6 +13556,54 @@ def _rejected_optional_params(payload, err_text):
     return out
 
 
+# STRICT-BODY PROVIDERS (2026-11-21). A user's own OpenAI-compatible bridge
+# (REPORTED: a local "Agent Gemini Bridge") accepts ONLY model / messages / stream
+# and answers every other key with HTTP 400 "Unsupported request options." -- a
+# message that names no field, so _rejected_optional_params finds nothing to drop,
+# and max_tokens (which the provider Test always sends) is never droppable. The
+# key then reads dead ("Test: HTTP 400") although the bridge works. A refusal of
+# that kind is retried ONCE with the body cut to those three keys (messages cut to
+# role + content); the provider is remembered only when that retry SUCCEEDS, so a
+# 400 that was about something else (an unknown model, a bad message) teaches
+# nothing. Never for a request that carries tools, a tool turn or an image: cutting
+# those would answer a different question than the one asked.
+_MINIMAL_BODY = set()                   # pid -> its API takes only model/messages/stream
+_MINIMAL_KEEP = ("model", "messages", "stream")
+
+
+def _strict_body_on():
+    try:
+        return bool(config.get_flag("strict_body_fallback", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _minimal_body(payload):
+    """`payload` cut to what a strict OpenAI-compatible API accepts, or None when
+    the request cannot mean the same thing without what would be cut, or when
+    there is nothing to cut."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        return None
+    for k in ("tools", "tool_choice", "functions", "function_call"):
+        if payload.get(k):
+            return None
+    msgs = []
+    for m in payload["messages"]:
+        if (not isinstance(m, dict) or m.get("tool_calls") or m.get("function_call")
+                or m.get("role") in ("tool", "function")):
+            return None
+        c = m.get("content")
+        if isinstance(c, list):
+            if any(not (isinstance(p, dict) and p.get("type") == "text") for p in c):
+                return None
+        elif not isinstance(c, str):
+            return None
+        msgs.append({"role": m.get("role"), "content": c})
+    out = {k: payload[k] for k in _MINIMAL_KEEP if k in payload}
+    out["messages"] = msgs
+    return None if out == payload else out
+
+
 def _remember_unsupported_params(pid, keys):
     if not keys:
         return
@@ -19729,6 +19777,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     _known_bad = _params_rejected_by(pid)
     if isinstance(payload, dict) and _known_bad & set(payload):
         payload = {k: v for k, v in payload.items() if k not in _known_bad}
+    if pid in _MINIMAL_BODY:                 # a strict-body provider (see _MINIMAL_BODY)
+        _mb = _minimal_body(payload)
+        if _mb is not None:
+            payload = _mb
     if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
         # (1) AUTO-COMPACT the history to THIS model's context window (per-model
         # memory management — a small-context model gets recent turns only), then
@@ -20044,6 +20096,27 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     resp = (_post_with_header_deadline(_hdr_wait,
                                                        _rh_post, **_post_kw)
                             if stream else _rh_post(**_post_kw))
+            # ...and a refusal of the whole option set that names nothing (see
+            # _MINIMAL_BODY): retry once with only model / messages / stream.
+            if (resp.status_code in (400, 422) and isinstance(payload, dict)
+                    and pid not in _MINIMAL_BODY and _strict_body_on()
+                    and _PARAM_REFUSAL_RE.search(_resp_text_safe(resp))):
+                _mb = _minimal_body(payload)
+                if _mb is not None:
+                    _first = resp
+                    _post_kw["json"] = _mb
+                    _retry = (_post_with_header_deadline(_hdr_wait, _rh_post, **_post_kw)
+                              if stream else _rh_post(**_post_kw))
+                    if _retry.status_code < 400:
+                        with _thinking_lock:
+                            _MINIMAL_BODY.add(pid)
+                        _log.info("[params] %s takes only model/messages/stream: "
+                                  "extra request fields dropped from now on", pid)
+                        _first.close()
+                        resp, payload = _retry, _mb
+                    else:                    # not about the options: nothing learned
+                        _retry.close()
+                        _post_kw["json"] = payload
             # ...and a template that wants ONE system message, first: merge them
             # and retry this hop at once (see _SYSTEM_ORDER_ERR_RE).
             if (resp.status_code in (400, 422) and isinstance(payload, dict)

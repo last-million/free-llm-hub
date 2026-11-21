@@ -214,6 +214,8 @@ def _clear_thinking_ledgers():
         mod._REASONING_REJECTED.clear()
     # Optional params a provider refused by name (prompt_cache_key etc.).
     getattr(mod, "_PARAM_REJECTED", {}).clear()
+    # Providers learned to take only model/messages/stream (strict-body APIs).
+    getattr(mod, "_MINIMAL_BODY", set()).clear()
 
 
 @pytest.fixture(autouse=True)

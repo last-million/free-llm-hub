@@ -10992,3 +10992,32 @@ background.
   turn when this was written.
 
 Release-note: improved: the browser agents use for web searches and page checks now runs in the background with no window, and a setting brings the visible window back when you want to watch or sign in.
+
+## A strict API that takes only model / messages / stream (2026-11-21)
+
+Covered by `tests/test_strict_body_provider.py` (hermetic: a fake strict API behind `requests.post`).
+REPORTED: a user's own local OpenAI-compatible bridge, added as a custom provider, showed its only key dead:
+`Test: HTTP 400: Unsupported request options.`
+
+- **Cause (MEASURED on the live hub).** The bridge accepts only `model`, `messages` (role + content only) and
+  `stream`, and answers every other key with that sentence. It names no field, so `_rejected_optional_params`
+  (drop the field the 400 names) found nothing, and `max_tokens`, which every provider Test sends, is in
+  `_NEVER_DROP_PARAMS`. The 400 then read as a dead key (`dead_why` held the message, dead for 6 h).
+- **Fix** (flag `strict_body_fallback`, `config.get_flag`, default ON; a read that raises = off). In
+  `_upstream_chat`, after the by-name retry: a 400/422 whose text matches `_PARAM_REFUSAL_RE` is retried ONCE
+  with `_minimal_body(payload)` -- keys `model`, `messages`, `stream`, each message cut to role + content. The
+  provider is added to `_MINIMAL_BODY` ONLY when that retry succeeds (< 400), so a 400 about something else (an
+  unknown model) teaches nothing and the original 400 is returned. Once learned, every later request to that
+  provider is cut before it is sent. In memory per process: a restart costs one extra call to re-learn.
+- **Never cut:** a request with `tools` / `tool_choice` / `functions` / `function_call`, a tool turn (a `tool`
+  or `function` message, `tool_calls` on a message), or an image / non-text part, or one with nothing to cut
+  (`_minimal_body` returns None). Cutting those would answer a different question; such a hop just fails and the
+  chain walks on, as before.
+- **A dead mark already on the key is not lifted by this.** It clears when the Test passes (a 2xx clears it).
+- **Limits, said plainly.** The bridge's other rules are not handled: the last message must be from the user,
+  roles must be system / developer / user / assistant. Each answer there takes 20-75 s, and the hub's Test
+  allows 40 s per call (`_TEST_PROBE_CALL_SECONDS`) and the stream peek 35-90 s (`_stream_peek_timeout`), so a
+  slow answer can still time out; that is separate from this fix and not changed here. No usage figures come
+  back when `stream_options` is cut.
+
+Release-note: fix: a custom provider whose API accepts only model, messages and stream (a local bridge, say) now works; the hub retries once with just those fields instead of marking the key dead.
