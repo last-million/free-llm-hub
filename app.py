@@ -20055,6 +20055,13 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     _hdr_wait = _STREAM_HEADER_WAIT + _upload_allowance(_nbytes)
     if _patient_pid(pid):             # a slow endpoint of the user's own (see _patient_pid)
         _hdr_wait = max(_hdr_wait, _STREAM_HEADER_BUDGET)
+    elif isinstance(payload, dict) and payload.get("model"):
+        # a pair whose own record says its first byte comes late (see _measured_patience);
+        # the clock's hop budget still bounds the hop
+        _mp = _measured_patience(pid, payload.get("model"), bool(payload.get("tools")),
+                                 _request_deadline_seconds())
+        if _mp:
+            _hdr_wait = max(_hdr_wait, min(_mp, _STREAM_HEADER_BUDGET))
     for i in range(n):
         is_last = (i == n - 1)
         key = keys[(start + i) % n]
@@ -41567,6 +41574,42 @@ def _qf_cut_too_short(pid, model, waited_s, tools):
         return False
 
 
+# THE WAIT FOLLOWS EACH MODEL'S OWN MEASURED SPEED (flag `measured_patience`, default on).
+# MEASURED 2026-11-21 from the hub's saved first-content times on tool turns: nvidia
+# kimi-k3.1-pro p50 80 s / p90 115 s, g4f deepseek-v4.1-flash p50 57 s / p90 71 s, nvidia
+# mistral-large p90 75 s, g4f gemini-3.6-flash p90 118 s -- against flat limits of 35 s
+# (a stream's first content), 60-90 s (a "slow" model's) and, on a short turn, 25-45 s that
+# can only SHORTEN (_adaptive_hop_budget). A good model that normally answers a little
+# later than the flat limit was cut about half the time, and its own record never counted.
+# A pair with a real record (>= _QF_EXT_MIN_SAMPLES) that is not failing now may wait up to
+# _PATIENT_MULT x its OWN p90 -- at most _PATIENT_MAX_SHARE of the request deadline, on ONE
+# pair per walk, never on a short (trivial) turn, a subscription, or a pair that is failing,
+# resting, benched or at a stalling provider. Only ever longer than the normal wait.
+_PATIENT_MULT = 1.1
+_PATIENT_MAX_SHARE = 0.6
+
+
+def _measured_patience(pid, model, tools, limit):
+    """Seconds this pair may wait for its first content on the strength of its OWN
+    measured p90, or None (no record, failing, flag off). Never raises."""
+    try:
+        if not pid or not model or not config.get_flag("measured_patience", True):
+            return None
+        m = _qf_first_content_ms(pid, model, tools)
+        if not m:
+            return None
+        if (_recent_hop_failure(pid, model) or _chain_reliability_band(pid, model) >= 2
+                or _pair_resting(pid, model) or _is_pair_benched(pid, model)
+                or (tools and _tool_turn_sick(pid, model))):
+            return None
+        want = _PATIENT_MULT * float(m[1]) / 1000.0
+        if limit:
+            want = min(want, _PATIENT_MAX_SHARE * float(limit))
+        return want
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
     """Up to _QUALITY_FALLBACK_PAIRS (pid, model) of `entries` (the chain not
     walked yet) to serve a best/max turn whose strong pool did not answer in
@@ -42245,6 +42288,27 @@ class _ChainClock:
         or peek shorter than the request deadline, and no hedge partner racing it."""
         return bool(self.pinned) and _patient_pid(pid)
 
+    def _patience_over(self, pid, model, normal, used=0.0):
+        """`normal`, or longer when this pair's OWN measured record says it usually
+        answers later (see _measured_patience). One pair per walk, never on a short turn."""
+        try:
+            if self.trivial or _is_sub(pid) or self._patient(pid):
+                return normal
+            slot = getattr(self, "_patient_pair", None)
+            if slot is not None and slot != (pid, model):
+                return normal
+            want = _measured_patience(pid, model, self.tools, self.limit)
+            if want is None:
+                return normal
+            if self.limit:
+                want = min(want, max(0.0, _PATIENT_MAX_SHARE * float(self.limit) - float(used)))
+            if want <= normal:
+                return normal
+            self._patient_pair = (pid, model)
+            return want
+        except Exception:                                        # noqa: BLE001
+            return normal
+
     def _budget_for(self, pid, model, stream=None):
         budget = None
         patient = self._patient(pid)
@@ -42271,6 +42335,9 @@ class _ChainClock:
         if qf and not qf["fired"] and self._rest and not _is_sub(pid) and not patient:
             room = self._qf_room(pid, model, qf)
             budget = room if budget is None else min(budget, room)
+        elif budget is not None and not patient:
+            # a hop the provider share (or nothing else) would cut: its own record may say more
+            budget = self._patience_over(pid, model, budget, self._prov_secs.get(pid, 0.0))
         left = self.left()
         if left is not None:
             # No hop may spend the time the rescue hop is waiting for.
@@ -42757,6 +42824,8 @@ class _ChainClock:
         t = _stream_peek_timeout(model, est, pid=pid)
         if self._patient(pid):
             t = max(t, float(CHAT_READ_TIMEOUT))
+        else:
+            t = self._patience_over(pid, model, t)
         if self._hop_budget is not None and self._hop_started is not None:
             t = min(t, self._hop_budget - (time.monotonic() - self._hop_started))
         left = self.left()

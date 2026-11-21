@@ -11047,3 +11047,33 @@ The same request streamed, or sent with the bridge idle, was served by the bridg
   The bridge is single-browser and paces sends, so many parallel requests to it queue.
 
 Release-note: improved: when you ask for a provider you added yourself by name, the hub now waits for its slow answers (up to the request limit) instead of cutting it at 25 to 45 seconds and answering with another model.
+
+## The wait for a model follows its own measured speed (2026-11-21)
+
+Covered by `tests/test_measured_patience.py` (hermetic: fake ledgers, fake clock state). Owner: "maybe other
+providers need more time too." MEASURED from the hub's saved first-content times on tool turns
+(`learned-state.json` `tool_ttft`, pairs with >= 5 samples): nvidia kimi-k3.1-pro p50 80 s / p90 115 s (40 samples),
+g4f deepseek-v4.1-flash p50 57 s / p90 71 s, nvidia mistral-large-4 p90 75 s, g4f gemini-3.6-flash p90 118 s (5
+samples). 5 of the 21 measured pairs had a p90 over the 45 s short-turn budget and 3 a p50 over 25 s. The flat limits
+were 35 s (a stream's first content), 60-90 s for a "slow" model (`_stream_peek_timeout`), and 25-45 s on a short turn,
+where `_adaptive_hop_budget` can only SHORTEN (min of the ceiling and 3.5 x p90). So a good model that normally answers
+later than the limit was cut a large share of the time, and its own record never counted.
+
+- **Rule** (flag `measured_patience`, `config.get_flag`, default ON; a read that raises = off). `_measured_patience(pid,
+  model, tools, limit)` = `_PATIENT_MULT` (1.1) x the pair's OWN p90 first-content time, from `_qf_first_content_ms` (the
+  tool-turn record on a tool turn, else the streamed one; >= `_QF_EXT_MIN_SAMPLES` = 5), capped at `_PATIENT_MAX_SHARE`
+  (0.6) of the request deadline. None for a pair with a recent failure (`_recent_hop_failure`, which also reads a stalling
+  provider), measured to fail (`_chain_reliability_band` >= 2), resting, benched, or sick on tool turns.
+- **Where it applies** (`_ChainClock._patience_over`): `peek_timeout` (a stream's first content), and `_budget_for` when
+  the per-provider share (or nothing else) would cut the hop -- the share is lifted up to the cap minus the time the
+  provider already spent this walk. `_upstream_chat`'s streaming header wait uses it too (the clock's budget still
+  bounds the hop). Only ever LONGER than the normal wait.
+- **Never on:** a short (trivial) turn -- speed matters there and the router already prefers fast models; a subscription;
+  a hop while the best/max fallback mark is armed (`_qf_room` has its own one-pair extension); a second pair in the same
+  walk (ONE pair per walk holds the longer wait, so a chain of slow models cannot spend the deadline).
+- **Limits, said plainly.** It trusts the pair's own history: a model that got slower since then waits longer than it
+  should, at most 60% of the deadline, once per walk. `_tool_ttft` also holds censored stall samples, which raise the p90.
+  The roles path (swarm / crew / multi tool turns) has its own actor budgets and is not changed. Not measured live: the
+  effect on real turns is shown by the tests and the numbers above, not by a before/after run.
+
+Release-note: improved: the hub now waits for a model as long as that model's own record says it usually takes, so good but slow models such as Kimi K3.1 Pro are no longer cut off about half the time.
