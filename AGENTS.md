@@ -1265,6 +1265,31 @@ and run through SkillEvaluator 1.0.1 Tier 1 plus its overlap check, and SkillSpe
   SkillEvaluator's own security step reported skillspector and gitleaks unavailable inside its venv,
   so SkillSpector was run on its own.
 
+## An empty completion that carries `"tool_calls": null` is empty (2026-11-21)
+
+Covered by `tests/test_null_tool_calls_is_not_content.py`. Owner, OpenCode `coding-max`: three
+turns in a row ("yes please ...") ended with nothing done. MEASURED: OpenCode's own database shows
+each assistant turn as `finish=stop`, 0 output tokens, no text, no tool call; the Activity rows say
+ok / 200: dahl answered HTTP 429, then `g4f/Perplexity:claude3opus` was served. Probed directly
+with a trivial "reply ok" prompt (3 keys, stream and not): that relay answers HTTP 200 with ONE
+chunk, `content: ""`, `tool_calls: null`, `finish_reason: "stop"`, `completion_tokens: 0`, plus a
+long `conversation` metadata object, then `[DONE]`. (One of the three keys also gets HTTP 402 "No
+cake credits".)
+
+- **Cause**: `_STREAM_CONTENT_RE` counted a bare `"tool_calls"` as content, so the stream peek took
+  that frame for an answer; the frame is long, so it passed the `_PEEK_JUDGE_CHARS` gate at once, was
+  judged "content" with no text to read, and was committed. The CLI received an empty stream, ended
+  its turn and the chain never walked on. Every OpenAI-compatible gateway that sends `"tool_calls":
+  null` in each delta was affected the same way when its reply was empty.
+- **Fix**: the content regex takes `tool_calls` only when it carries something (null, `[]`, `{}` and
+  `""` do not), the same guard `_STREAM_TOOLCALL_RE` already had. An empty stream now ends the peek as
+  "empty", the hop fails and the walk goes on; the activity feed and the deadline guard read frames
+  the same way. A real tool call and real text commit exactly as before.
+- **Limit**: it makes the hub walk past the dead relay; it cannot make the rest of the fleet healthy.
+  If every other hop also fails the CLI now gets an error to retry instead of a silent empty turn.
+  Not changed: that relay keeps being asked until the existing failure streak (3 empties in 15
+  minutes) rests it, and the 24-hour no-answer block takes it out after repeated failures.
+
 ## Low-resource mode (2026-09-28)
 
 Covered by `tests/test_low_resource.py`. `lowres.py` (leaf: psutil + config,

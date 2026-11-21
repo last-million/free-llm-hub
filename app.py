@@ -22246,7 +22246,13 @@ def _activity_before():
 _STREAM_TERMINAL_RE = re.compile(rb"\[DONE\]|response\.completed|message_stop")
 _STREAM_CONTENT_RE = re.compile(
     rb'output_text\.delta|function_call_arguments\.delta|content_block_delta'
-    rb'|"tool_calls"|"content"\s*:\s*"(?:\\|[^"])')
+    # A tool_calls key counts only when it carries something. MEASURED 2026-11-21: the g4f
+    # relay behind Perplexity:claude3opus answers every request with one empty chunk
+    # ("content": "", "tool_calls": null, finish "stop", 0 completion tokens); a bare
+    # `"tool_calls"` here made the peek commit that empty stream, so OpenCode got nothing
+    # and the chain never walked on to another model (same guard as _STREAM_TOOLCALL_RE).
+    rb'|"tool_calls"(?!\s*:\s*(?:null\b|\[\s*\]|\{\s*\}|""))'
+    rb'|"content"\s*:\s*"(?:\\|[^"])')
 _STREAM_ERROR_RE = re.compile(rb'event:\s*error|"error"\s*:')
 # Peek-safe variant: only an error that actually CARRIES a value (an object or a
 # string). The shared _STREAM_ERROR_RE also matches `"error": null` / `"error": {}`,
