@@ -199,7 +199,7 @@ def test_openclaw_stdio_omits_transport_and_uses_a_string_command(home):
     doc = json.load(open(m._config_path("openclaw"), encoding="utf-8"))
     entry = doc["mcp"]["servers"]["playwright"]
     assert entry["command"] == "npx", "must be a string, not an array"
-    assert entry["args"] == ["-y", "@playwright/mcp@latest"]
+    assert entry["args"] == ["-y", "@playwright/mcp@latest", "--headless"]
     assert "transport" not in entry, "stdio is detected by `command`; sse fallback is url-only"
     assert "type" not in entry, "'type' is claude's dialect and would pass silently"
     # the remote servers in the same file DO carry a transport

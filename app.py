@@ -31020,8 +31020,32 @@ _HUB_URL_SENTINEL = "<hub>"     # replaced with _hub_mcp_url() at call time
 # Fails OPEN: if node is missing or the server does not come up, the STDIO spec
 # is registered exactly as before, so this is never worse than it was.
 _PLAYWRIGHT_PORT = int(os.environ.get("FREE_LLM_HUB_PLAYWRIGHT_PORT", "8931"))
-_PLAYWRIGHT_STDIO = {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
+# HEADLESS BY DEFAULT (owner, 2026-11-21: "he open browser and we see it ... use
+# the browser in the background without we see it"). @playwright/mcp is HEADED
+# unless told otherwise, so every web search or page check an agent made popped
+# a real Chrome window on the owner's screen. Flag `playwright_headless`
+# (config.get_flag, default ON) puts `--headless` on both the shared server and the
+# stdio fallback; switch it OFF to watch the browser or to sign in / solve a
+# CAPTCHA by hand (the profile in --user-data-dir keeps the login either way).
+_PLAYWRIGHT_STDIO = {"command": "npx",
+                     "args": ["-y", "@playwright/mcp@latest", "--headless"]}
 _playwright_url = [None]        # set by _start_playwright_mcp when it is up
+
+
+def _playwright_headless():
+    """True = run the browser with no window. A flag read that raises = headless."""
+    try:
+        return bool(config.get_flag("playwright_headless", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _playwright_stdio():
+    """The stdio fallback spec, headed only when the owner switched headless off."""
+    spec = dict(_PLAYWRIGHT_STDIO)
+    spec["args"] = [a for a in _PLAYWRIGHT_STDIO["args"]
+                    if _playwright_headless() or a != "--headless"]
+    return spec
 
 
 def _playwright_profile_dir():
@@ -31055,13 +31079,14 @@ def _playwright_marker():
         return {}
 
 
-def _write_playwright_marker(pid, shared=True):
+def _write_playwright_marker(pid, shared=True, headless=True):
     try:
         path = _playwright_marker_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"port": _PLAYWRIGHT_PORT, "pid": pid,
-                       "shared": bool(shared), "at": time.time()}, fh)
+                       "shared": bool(shared), "headless": bool(headless),
+                       "at": time.time()}, fh)
     except (OSError, ValueError, TypeError):
         pass
 
@@ -31114,12 +31139,16 @@ def _playwright_probe(port):
 def _start_playwright_mcp():
     """Start (or adopt) the shared browser server. Never raises."""
     try:
+        headless = _playwright_headless()
         found = _playwright_probe(_PLAYWRIGHT_PORT)
         if found:
             marker = _playwright_marker()
             # Ours, but started before the shared context was asked for: adopting
             # it would keep handing every turn its own fresh browser forever.
-            if marker.get("pid") and not marker.get("shared"):
+            # Same for the window: a server of ours started headed (a marker with
+            # no "headless" key is one) would keep opening a visible browser.
+            if marker.get("pid") and (not marker.get("shared")
+                                      or bool(marker.get("headless")) != headless):
                 if _retire_stale_playwright(marker):
                     found = _playwright_probe(_PLAYWRIGHT_PORT)
             if found:
@@ -31146,6 +31175,8 @@ def _start_playwright_mcp():
         argv = ["npx", "-y", "@playwright/mcp@latest",
                 "--port", str(_PLAYWRIGHT_PORT), "--host", "127.0.0.1",
                 "--shared-browser-context"]
+        if headless:
+            argv.append("--headless")
         profile = _playwright_profile_dir()
         if profile:
             argv += ["--user-data-dir", profile]
@@ -31154,7 +31185,7 @@ def _start_playwright_mcp():
                                 stdin=subprocess.DEVNULL,
                                 creationflags=_CREATE_NO_WINDOW,
                                 shell=(os.name == "nt"))
-        _write_playwright_marker(proc.pid, shared=True)
+        _write_playwright_marker(proc.pid, shared=True, headless=headless)
         # First run downloads the package, so this waits rather than probing once.
         deadline = time.time() + 90
         while time.time() < deadline:
@@ -31180,7 +31211,7 @@ def _always_mcp():
     """The servers every agent gets. A function, not a constant, because the
     playwright entry depends on whether the shared server came up."""
     playwright = ({"url": _playwright_url[0]} if _playwright_url[0]
-                  else dict(_PLAYWRIGHT_STDIO))
+                  else _playwright_stdio())
     return (
         ("free-llm-hub", {"url": _HUB_URL_SENTINEL}),
         ("context7", {"url": "https://mcp.context7.com/mcp"}),

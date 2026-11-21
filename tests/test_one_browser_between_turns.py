@@ -208,7 +208,7 @@ def test_a_server_we_started_without_it_is_retired(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "_playwright_probe", lambda port: probes.pop(0))
     monkeypatch.setattr(A, "_which_cli", lambda name: None)
     monkeypatch.setattr(A.shutil, "which", lambda name: None)
-    A._playwright_url[0] = None
+    monkeypatch.setattr(A, "_playwright_url", [None])
     A._start_playwright_mcp()
     assert killed == [4321]
 
@@ -223,7 +223,7 @@ def test_a_server_someone_else_runs_is_never_killed(monkeypatch, tmp_path):
                         lambda m: killed.append(m) or True)
     monkeypatch.setattr(A, "_playwright_probe",
                         lambda port: "http://localhost:8931/mcp")
-    A._playwright_url[0] = None
+    monkeypatch.setattr(A, "_playwright_url", [None])
     A._start_playwright_mcp()
     assert killed == []
     assert A._playwright_url[0] == "http://localhost:8931/mcp"
@@ -238,7 +238,7 @@ def test_our_own_shared_server_is_adopted_not_restarted(monkeypatch, tmp_path):
                         lambda m: killed.append(m) or True)
     monkeypatch.setattr(A, "_playwright_probe",
                         lambda port: "http://localhost:8931/mcp")
-    A._playwright_url[0] = None
+    monkeypatch.setattr(A, "_playwright_url", [None])
     A._start_playwright_mcp()
     assert killed == []
 

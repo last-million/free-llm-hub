@@ -10959,3 +10959,30 @@ Qwen 4 preview, use it of course because it is good, but we don't have a real be
   placement.
 
 Release-note: improved: when a free Qwen 4 or Qwen 4 preview appears on any provider, the hub now uses it for coding-agent turns at the level of DeepSeek V4.1 Flash, without waiting for a benchmark.
+
+## The agents' browser runs with no window (2026-11-21)
+
+Covered by `tests/test_playwright_headless.py` (hermetic: fake Popen, fake probe, marker under tmp_path).
+Owner: a web search made by an agent opened a real browser window on screen; he wants it used in the
+background.
+
+- **Cause.** `@playwright/mcp` is headed unless it gets `--headless` (checked against its own `--help`,
+  2026-11-21), and the hub started the shared server (`_start_playwright_mcp`) and registered the stdio
+  fallback (`_PLAYWRIGHT_STDIO`) without it.
+- **Fix.** Flag `playwright_headless` (`config.get_flag`, default ON; a read that raises = headless) adds
+  `--headless` to both. `_playwright_stdio()` is the fallback spec, headed only when the flag is off. The
+  registered URL, the shared context, the profile (`--user-data-dir`, so logins survive) and the port do not
+  change, so no CLI config is rewritten.
+- **An old server is retired once.** The server outlives the hub and is adopted on the next start, so
+  `playwright-server.json` now records `headless`. A server THIS hub started (marker with a pid) whose
+  `headless` differs from the flag -- including every marker written before this change, which has no such
+  key -- is stopped and relaunched with the right flags. A server with no marker is never touched, and if the
+  stop fails the running one is adopted (fail open). It takes effect at the next hub start.
+- **To watch the browser, or to sign in / solve a CAPTCHA by hand:** set `playwright_headless` to false
+  (`config.set_flag("playwright_headless", False)`) and restart the hub; the profile keeps the login.
+- **Limits, said plainly.** A few sites treat headless Chrome as a bot and show a CAPTCHA; the fix for that is
+  the flag, not a workaround. A stdio entry that an older hub wrote into a CLI's own config (only when the
+  shared server was down) keeps its old args until it is removed and re-added. Not run against a live agent
+  turn when this was written.
+
+Release-note: improved: the browser agents use for web searches and page checks now runs in the background with no window, and a setting brings the visible window back when you want to watch or sign in.
