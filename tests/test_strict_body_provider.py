@@ -27,6 +27,10 @@ def isolated(monkeypatch):
     monkeypatch.setattr(app, "_PARAM_REJECTED", {})
     monkeypatch.setattr(app, "_MINIMAL_BODY", set())
     monkeypatch.setattr(app, "_strict_body_on", lambda: True)
+    # Fake requests must not be counted against a real provider's quota: other tests read
+    # quota headroom (llm7, uncloseai) and would see it lowered on the same worker.
+    monkeypatch.setattr(app.quota, "record", lambda *a, **k: None)
+    monkeypatch.setattr(app.quota, "record_key", lambda *a, **k: None)
     try:
         yield d
     finally:

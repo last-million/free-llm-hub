@@ -11024,3 +11024,26 @@ REPORTED: a user's own local OpenAI-compatible bridge, added as a custom provide
   request, and such a provider cannot serve tool turns at all.
 
 Release-note: fix: a custom provider whose API accepts only model, messages and stream (a local bridge, say) now works; the hub retries once with just those fields instead of marking the key dead.
+
+## The hub waits for a provider you added, when you ask for it by name (2026-11-21)
+
+Covered by `tests/test_patient_custom_provider.py`. REPORTED: the local browser bridge "works even if it takes
+much time". MEASURED: a non-stream request for `local-gemini-brdg/gemini-web` was cut by `_HopBudgetExceeded`
+(the bridge answers in 20-75 s, and slows down on back-to-back sends) and answered by inception after 124 s.
+The same request streamed, or sent with the bridge idle, was served by the bridge in 19-26 s.
+
+- **Rule** (flag `patient_custom_provider`, `config.get_flag`, default ON; a read that raises = off).
+  `_patient_pid(pid)` = a user-added provider (`_is_custom_provider_pid`). `_ChainClock._patient(pid)` adds
+  "and the request named it explicitly" (`pinned`, i.e. `provider/model`). For such a hop: `_budget_for` skips the
+  trivial hop budget (25 / 45 s), the per-provider share and the best/max fallback mark, so only the request deadline
+  (240 s) bounds it; `peek_timeout` waits at least `CHAT_READ_TIMEOUT` (still capped by the deadline); no hedge
+  partner is started against it (`_hedge_partner`). In `_upstream_chat` the streaming header wait for ANY user-added
+  provider is `_STREAM_HEADER_BUDGET` (a bridge sends its headers only when the whole answer is ready); the clock's
+  budgets still cap it for auto-routed turns.
+- **Unchanged:** auto-routed turns (a slow user-added provider is still cut at the usual budgets and the walk moves
+  on), every built-in provider, tool turns (the bridge cannot do them), and the fallback after the deadline or an error.
+- **Limits, said plainly.** Past the 240 s request deadline the walk still falls back, and files the hop as a stall.
+  `pinned` covers the whole walk, so a second user-added provider reached as a fallback is patient too (rare).
+  The bridge is single-browser and paces sends, so many parallel requests to it queue.
+
+Release-note: improved: when you ask for a provider you added yourself by name, the hub now waits for its slow answers (up to the request limit) instead of cutting it at 25 to 45 seconds and answering with another model.

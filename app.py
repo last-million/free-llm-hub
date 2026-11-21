@@ -804,6 +804,21 @@ _TEST_PROBE_CALL_SECONDS_CUSTOM = 120
 _TEST_PROBE_KEY_SECONDS_CUSTOM = 150
 
 
+def _patient_pid(pid):
+    """PATIENCE for an endpoint the user added by hand (flag `patient_custom_provider`,
+    default ON; a read that raises = off). REPORTED 2026-11-21: a local bridge that drives a
+    real browser answers in 20-75 s -- "it works even if it takes much time" -- and the hub
+    cut it at its fast-model budgets (25-45 s trivial hop, 35-60 s stream peek) and handed
+    the turn to another model. An explicit `provider/model` request for such a provider is
+    now bounded only by the request deadline (see _ChainClock._patient); the walk still
+    falls back to the next model when that runs out or the provider errors."""
+    try:
+        return bool(config.get_flag("patient_custom_provider", True)
+                    and _is_custom_provider_pid(pid))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _probe_limits(pid):
     """(seconds per probe call, seconds per key) for the provider Test."""
     try:
@@ -20038,6 +20053,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     # streaming header wait below also covers the upload: both grow with it.
     _nbytes = _body_bytes(payload)
     _hdr_wait = _STREAM_HEADER_WAIT + _upload_allowance(_nbytes)
+    if _patient_pid(pid):             # a slow endpoint of the user's own (see _patient_pid)
+        _hdr_wait = max(_hdr_wait, _STREAM_HEADER_BUDGET)
     for i in range(n):
         is_last = (i == n - 1)
         key = keys[(start + i) % n]
@@ -42223,12 +42240,18 @@ class _ChainClock:
         s = getattr(self, "_hop_started", None)
         return None if s is None else time.monotonic() - s
 
+    def _patient(self, pid):
+        """An explicit request for a provider the user added by hand: no hop budget
+        or peek shorter than the request deadline, and no hedge partner racing it."""
+        return bool(self.pinned) and _patient_pid(pid)
+
     def _budget_for(self, pid, model, stream=None):
         budget = None
+        patient = self._patient(pid)
         # A local subscription CLI is a subprocess that cold-starts in tens of
         # seconds whatever the question; a first-content budget sized for an
         # HTTP API would cut every one of them off. The deadline still applies.
-        if self.trivial and not _is_sub(pid):
+        if self.trivial and not _is_sub(pid) and not patient:
             ceiling = (_TRIVIAL_SLOW_HOP_BUDGET
                        if _is_slow_model(pid, model)
                        else _TRIVIAL_HOP_BUDGET)
@@ -42237,14 +42260,15 @@ class _ChainClock:
         # than its share of the deadline -- MEASURED, nvidia took all 240 s of
         # a 16K tool turn over three hops (tool-free turns too, see __init__).
         cap = self._provider_cap()
-        if cap is not None and not _is_sub(pid) and self._others_waiting(pid):
+        if (cap is not None and not _is_sub(pid) and not patient
+                and self._others_waiting(pid)):
             room = max(_TOOL_PROVIDER_MIN_HOP, cap - self._prov_secs.get(pid, 0.0))
             budget = room if budget is None else min(budget, room)
         # best/max: a hop still waiting at the fallback mark is cut there, so
         # the fallback (see plan_quality_fallback) gets the time that is left
         # -- only while something is left to fall back to.
         qf = self._qf
-        if qf and not qf["fired"] and self._rest and not _is_sub(pid):
+        if qf and not qf["fired"] and self._rest and not _is_sub(pid) and not patient:
             room = self._qf_room(pid, model, qf)
             budget = room if budget is None else min(budget, room)
         left = self.left()
@@ -42305,7 +42329,7 @@ class _ChainClock:
 
     def _hedge_partner(self, pid, model):
         plan = self._hedge_plan
-        if not plan or self._hedge_fired or _is_sub(pid):
+        if not plan or self._hedge_fired or _is_sub(pid) or self._patient(pid):
             return None
         try:
             chain = plan["chain"]
@@ -42731,6 +42755,8 @@ class _ChainClock:
 
     def peek_timeout(self, model, est, pid=None):
         t = _stream_peek_timeout(model, est, pid=pid)
+        if self._patient(pid):
+            t = max(t, float(CHAT_READ_TIMEOUT))
         if self._hop_budget is not None and self._hop_started is not None:
             t = min(t, self._hop_budget - (time.monotonic() - self._hop_started))
         left = self.left()
