@@ -11015,9 +11015,12 @@ REPORTED: a user's own local OpenAI-compatible bridge, added as a custom provide
   chain walks on, as before.
 - **A dead mark already on the key is not lifted by this.** It clears when the Test passes (a 2xx clears it).
 - **Limits, said plainly.** The bridge's other rules are not handled: the last message must be from the user,
-  roles must be system / developer / user / assistant. Each answer there takes 20-75 s, and the hub's Test
-  allows 40 s per call (`_TEST_PROBE_CALL_SECONDS`) and the stream peek 35-90 s (`_stream_peek_timeout`), so a
-  slow answer can still time out; that is separate from this fix and not changed here. No usage figures come
-  back when `stream_options` is cut.
+  roles must be system / developer / user / assistant. No usage figures come back when `stream_options` is cut.
+- **The Test waits longer for a provider the user added** (`_probe_limits`: `_TEST_PROBE_CALL_SECONDS_CUSTOM` 120 s per call,
+  `_TEST_PROBE_KEY_SECONDS_CUSTOM` 150 s per key; built-in providers keep 40 / 90). MEASURED the same day: after the
+  400 was handled, the Test still read "slow or overloaded" at exactly 40 s, because the bridge drives a real browser
+  (a bare "Reply OK" took 19-22 s straight to it, the hub's longer prompt took more). Live traffic is NOT changed:
+  the stream peek (`_stream_peek_timeout`, 35-90 s) and the hop budgets can still cut a 60-75 s answer on a streamed
+  request, and such a provider cannot serve tool turns at all.
 
 Release-note: fix: a custom provider whose API accepts only model, messages and stream (a local bridge, say) now works; the hub retries once with just those fields instead of marking the key dead.

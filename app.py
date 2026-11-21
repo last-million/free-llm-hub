@@ -796,6 +796,22 @@ _TEST_PROBE_MAX_TOKENS = 512
 # ...and its time: one probe call, and all the candidates of one key.
 _TEST_PROBE_CALL_SECONDS = 40
 _TEST_PROBE_KEY_SECONDS = 90
+# A provider the USER added by hand (a local bridge that drives a browser, a model on a
+# CPU) may legitimately take a minute: MEASURED 2026-11-21, a bridge that answered
+# "Reply OK" in 19-22 s was reported "slow or overloaded" because the hub's own request
+# (longer prompt) ran past 40 s. One pinned user-interactive Test, so patience is cheap.
+_TEST_PROBE_CALL_SECONDS_CUSTOM = 120
+_TEST_PROBE_KEY_SECONDS_CUSTOM = 150
+
+
+def _probe_limits(pid):
+    """(seconds per probe call, seconds per key) for the provider Test."""
+    try:
+        if _is_custom_provider_pid(pid):
+            return _TEST_PROBE_CALL_SECONDS_CUSTOM, _TEST_PROBE_KEY_SECONDS_CUSTOM
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _TEST_PROBE_CALL_SECONDS, _TEST_PROBE_KEY_SECONDS
 
 
 def _bounded_probe_call(pid, payload, pin, seconds):
@@ -24116,10 +24132,11 @@ def api_test_provider(pid):
         # Each call gets _TEST_PROBE_CALL_SECONDS and each key
         # _TEST_PROBE_KEY_SECONDS; a model that says nothing in time is a
         # failed candidate, and the next one is tried while time is left.
-        key_deadline = time.monotonic() + _TEST_PROBE_KEY_SECONDS
+        call_limit, key_limit = _probe_limits(pid)
+        key_deadline = time.monotonic() + key_limit
         for model in candidates[:5]:  # cap attempts — this call is user-interactive
             if time.monotonic() >= key_deadline:
-                reason = reason or ("no answer within %ds" % _TEST_PROBE_KEY_SECONDS)
+                reason = reason or ("no answer within %ds" % key_limit)
                 break
             resp = None
             prompt, expected = _canary_question()
@@ -24134,7 +24151,7 @@ def api_test_provider(pid):
                         pid, {"model": model,
                               "messages": [{"role": "user", "content": prompt}],
                               "max_tokens": max_tok},
-                        pin, min(_TEST_PROBE_CALL_SECONDS,
+                        pin, min(call_limit,
                                  max(1.0, key_deadline - time.monotonic())))
                 except (requests.RequestException, RuntimeError) as exc:
                     reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))

@@ -215,3 +215,37 @@ def test_the_flag_defaults_on_and_a_broken_read_means_off(monkeypatch):
         raise OSError("unreadable")
     monkeypatch.setattr(app.config, "get_flag", boom)
     assert app._strict_body_on() is False
+
+
+# --------------------------------------------------------------------------- #
+# The Test's patience for a provider the user added by hand
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-11-21: the bridge answers a bare "Reply OK" in 19-22 s, but the hub's own
+# request (longer prompt) ran past the flat 40 s Test limit and read "slow or overloaded".
+
+def test_a_user_added_provider_gets_a_longer_test(monkeypatch):
+    monkeypatch.setattr(app, "_is_custom_provider_pid", lambda pid: pid == "my-bridge")
+    call, key = app._probe_limits("my-bridge")
+    assert call == app._TEST_PROBE_CALL_SECONDS_CUSTOM >= 100
+    assert key == app._TEST_PROBE_KEY_SECONDS_CUSTOM > call
+
+
+def test_the_built_in_providers_keep_the_short_test(monkeypatch):
+    monkeypatch.setattr(app, "_is_custom_provider_pid", lambda pid: pid == "my-bridge")
+    assert app._probe_limits("nvidia") == (app._TEST_PROBE_CALL_SECONDS,
+                                           app._TEST_PROBE_KEY_SECONDS)
+
+
+def test_a_broken_custom_check_falls_back_to_the_short_test(monkeypatch):
+    def boom(pid):
+        raise RuntimeError("registry unreadable")
+    monkeypatch.setattr(app, "_is_custom_provider_pid", boom)
+    assert app._probe_limits("my-bridge")[0] == app._TEST_PROBE_CALL_SECONDS
+
+
+def test_the_module_constants_are_read_at_call_time(monkeypatch):
+    """Existing tests shorten the built-in limits by patching the constants."""
+    monkeypatch.setattr(app, "_is_custom_provider_pid", lambda pid: False)
+    monkeypatch.setattr(app, "_TEST_PROBE_CALL_SECONDS", 0.3)
+    monkeypatch.setattr(app, "_TEST_PROBE_KEY_SECONDS", 5)
+    assert app._probe_limits("openrouter") == (0.3, 5)
