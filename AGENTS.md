@@ -11111,3 +11111,54 @@ scored as unknown (10) although it fronts one of the strongest models there is.
   is per provider, not per model. No model is benchmarked by this: it is the owner's call, like Claude's floor.
 
 Release-note: new: you can rank a provider you added yourself (top, high, medium, low) from its card, Settings or the Add dialog, and mark it chat-only so the hub never sends it tool calls.
+
+## A chat stream that stops on "I'll do X" is retried (2026-11-21)
+
+Covered by `tests/test_announce_stop_chat.py` (21, hermetic: fake upstream through the real chat handler).
+Owner, OpenCode: "why does the hub stop sometimes and not continue".
+
+- **MEASURED (the owner's OpenCode database, structure only: counts, lengths, finish reasons).** One
+  conversation, 1,264 messages over three days: 1,093 steps ended with a tool call and 66 ended with
+  `finish=stop` and waited for the user. Three of those ended on "Let me run ..." / "Running baseline pilot ..."
+  with ZERO tool calls (03:53, 05:06 and 16:18 UTC on 2026-11-21); the hub's own `_stopped_on_announcement`
+  flags all three. Across the WHOLE database (3,176 stop replies that carry text) the same detector flags 241
+  (7.6%), 202 of them longer than 400 characters, and **93% of the flagged ones were followed by a short nudge
+  from the user (<= 40 characters) against 34% of the unflagged ones**. The latest stop was a 12K-character
+  reply from `nvidia/moonshotai/kimi-k3.1-pro`, a DIRECT provider, one hop, streamed (the Activity row started
+  16:18:39 UTC and ran 196 s, matching the message). The two earlier stops cannot be attributed: the Activity
+  rows and the learned state had rotated.
+- **Why the hub let it through.** The codex route retries such a reply at the END of its stream, and a RELAY
+  hop's text-only reply is held to its end by the peek. A direct provider's long reply on the CHAT protocol was
+  neither: `_proxy_sse` forwards each frame as it arrives, so the `finish_reason: "stop"` frame and `[DONE]` were
+  already with OpenCode before anything could be judged, and OpenCode ended the turn.
+- **The fix.** `_StreamAnswerGate` sees the finish frame BEFORE it is relayed. On a chat stream that offered
+  tools, is still armed (no tool call seen) and is about to finish with exactly `stop` on a reply that
+  `_stopped_on_announcement` flags (the text riding on the finish frame counts), the gate raises `_AnnounceStop`.
+  The relay then ends like an upstream that died (`_chat_broken_frame`: the retryable `ECONNRESET` error frame, no
+  `finish_reason`, no `[DONE]`), which OpenCode retries on its own. The pair is filed once as "announced"
+  (`_note_nonanswer` + `_note_recent_hop_failure`; never dead-marked), so the retry opens on another model.
+- **Bounded.** `_announce_stop_allowed` is called LAST (only for a reply that qualifies) and keyed on the
+  conversation key plus the instruction, so a bare "continue" does not share one budget across conversations:
+  `_ANNOUNCE_STOP_RETRIES` (2) per `_ANNOUNCE_STOP_TTL` (15 min). The third announcement is served as before, so it
+  can never loop. Ordinary replies never spend it. It also respects the peek's own per-request bound: a request
+  that already walked past `_ANNOUNCE_RETRIES` (2) announcing hops (`g.hub_announce_skips`, read when the gate is
+  built) has its next announcement served by the peek, and the gate leaves that reply alone too (found by the
+  full suite: `test_double_answer::test_the_announcement_retry_is_bounded_per_request`).
+- **Chat route only** (`_gate_stream(..., announce_retry=True)` at the one chat call site): OpenCode, qwen, kimi,
+  pi, openclaw, hermes, aider. `/v1/responses` keeps its own end-of-stream retry and `/v1/messages` (Claude Code)
+  is unchanged (not reported; its retry behaviour was not verified). Flag `announce_stop_retry` (shared with
+  codex, default on; a flag read that raises counts as off). One log line per fire, lengths only:
+  `[announce-stop] chat <pid>/<model>: ... (N chars, last paragraph M chars)`.
+- **Verified with the REAL OpenCode 1.19.4** (sandboxed HOME / XDG / config, its own provider id, the real gate
+  code on an ephemeral port, scripted upstream): request 1 announces and stops; OpenCode re-sends the same request
+  by itself (no partial announcement in the retried history), the hub routes it to the other model, which makes
+  the tool call; OpenCode runs it and the turn finishes (exit 0, no error event). The same run against the
+  original code ends at request 1: the announcement is served as the final answer and no tool ever runs.
+- **Limits, said plainly.** (a) The detector is English-only and a heuristic: a genuine final report whose last
+  paragraph reads "Next, I'll ..." costs one retry on another model (never a lost answer; `_AWAITS_USER_RE`, a
+  question or an unclosed code fence are left alone). (b) The words already shown stay shown. (c) It cannot
+  make a model call a tool: when every model announces, the third reply is served and the turn still stops.
+  (d) A stream that is committed and ended by the deadline guard or by a client that left is not judged.
+  (e) Not live until the hub restarts on this code (the auto-update drains and restarts it).
+
+Release-note: fix: when a free model finishes a reply by saying what it will do next ("Let me run...") without doing it, OpenCode now retries on another model automatically instead of stopping and waiting for you to type "continue".

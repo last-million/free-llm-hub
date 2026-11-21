@@ -45021,6 +45021,30 @@ def _announce_stop_allowed(instruction):
         return False
 
 
+# A CHAT STREAM THAT STOPS ON "I'LL DO X" IS RETRIED (2026-11-21).
+# MEASURED (the owner's OpenCode `coding-max`, structure only): of 66 turns that ended and
+# waited for the user over three days, three ended on "Let me run ..." / "Running baseline
+# pilot ..." with ZERO tool calls (03:53, 05:06, 16:18 UTC on 2026-11-21); the hub's own
+# _stopped_on_announcement flags all three. The latest was a 12K-character reply from
+# nvidia/kimi-k3.1-pro (a DIRECT provider, one hop, streamed). The codex route retries such
+# a reply at the END of its stream (above) and a RELAY hop's text-only reply is held to its
+# end by the peek; a direct provider's long reply on the CHAT protocol was neither: the
+# relay had already forwarded the finish frame and [DONE], so OpenCode ended the turn and
+# the user had to type "continue". The gate sees the finish frame BEFORE it is relayed: on a
+# chat stream that offered tools, saw no tool call and is about to finish with "stop" on an
+# announcement, the gate raises _AnnounceStop and the relay ends exactly like an upstream
+# that died (the retryable ECONNRESET frame, no finish, no [DONE]); the pair is filed as an
+# "announced" failure so the retry opens on another model. Bounded by
+# _announce_stop_allowed (_ANNOUNCE_STOP_RETRIES per conversation+instruction per
+# _ANNOUNCE_STOP_TTL), so it can never loop. Chat route only (the other two routes keep their
+# own endings). Flag `announce_stop_retry` (shared with codex; default on).
+def _announce_gate_on():
+    try:
+        return bool(config.get_flag("announce_stop_retry", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # Longest the peek holds a short reply to see if it ends as a bare announcement (still
 # capped by what the peek itself may wait). MEASURED 2026-10-30 02:19 UTC (codex,
 # `coding`): a g4f relay took 18-23 s to stream a 189-char reply ending "I'll start with
@@ -45535,7 +45559,7 @@ class _StreamAnswerGate:
     def __init__(self, iterator, *, mode="bytes", hop_pid=None, hop_model=None,
                  prompt_text=None, last_prompt=None, tools_offered=False,
                  hold_chars=None, hold_seconds=None, visible_cap=None,
-                 early_chars="default", req_est=0):
+                 early_chars="default", req_est=0, announce_retry=False):
         self._it = iterator
         self._req_est = req_est       # the request's estimated tokens (_note_lost_request)
         # Chars of visible text past which the stream is ended at "length":
@@ -45580,6 +45604,22 @@ class _StreamAnswerGate:
             self._filter_key = str(_cmem_conv() or "%s|%s" % (hop_pid, hop_model))
         except Exception:                                        # noqa: BLE001
             self._filter_key = "%s|%s" % (hop_pid, hop_model)
+        # A reply about to finish on "I'll do X" with no tool call (see A CHAT STREAM THAT
+        # STOPS ON "I'LL DO X" IS RETRIED): opt-in per call site (the chat route only), the
+        # flag read here in the request's context. The retry budget is keyed on the
+        # conversation AND the instruction, so a bare "continue" is not one shared budget.
+        # ...and not once this REQUEST has already walked past _ANNOUNCE_RETRIES announcing hops
+        # (the peek serves the next one so a pool that keeps announcing cannot eat the deadline):
+        # the gate then leaves that reply alone too. Read now: the gate is built right after the
+        # peek committed this hop, and the stream may be iterated outside the request context.
+        try:
+            walked = int(getattr(g, "hub_announce_skips", 0) or 0)
+        except Exception:                                        # noqa: BLE001
+            walked = 0
+        self._announce_ok = bool(announce_retry and self._tools and _announce_gate_on()
+                                 and walked < _ANNOUNCE_RETRIES)
+        self._announce_key = ("%s|%s" % (self._filter_key, last_prompt or prompt_text)
+                              if (last_prompt or prompt_text) else "")
         self.cut = False
         self.reasons = []
 
@@ -45727,6 +45767,27 @@ class _StreamAnswerGate:
 
     def _done(self):
         return b"data: [DONE]" if self._lines else b"data: [DONE]\n\n"
+
+    def _ends_announcing(self, extra=""):
+        """True when the reply about to finish (everything so far + `extra`, the text
+        riding on the finish frame) ends on a bare announcement of its next step AND this
+        conversation's retry budget allows one more. The budget is spent LAST, only for a
+        reply that qualifies. Logs lengths only, never the reply. Never raises."""
+        try:
+            text = self._text + (extra or "")
+            if not _stopped_on_announcement(text):
+                return False
+            if not self._announce_key or not _announce_stop_allowed(self._announce_key):
+                return False
+            paras = [x for x in re.split(r"\n\s*\n", text.strip()) if x.strip()]
+            _log.warning("[announce-stop] chat %s/%s: the stream was about to finish on an "
+                         "announcement with no tool call (%d chars, last paragraph %d chars); "
+                         "the client is asked to retry",
+                         self._pid, self._model_id, len(text),
+                         len(paras[-1].strip()) if paras else 0)
+            return True
+        except Exception:                                        # noqa: BLE001
+            return False
 
     # -- verdicts ---------------------------------------------------------- #
     def _cut_at(self, clean_end, reasons):
@@ -45979,6 +46040,13 @@ class _StreamAnswerGate:
                         # words already shown stay shown.
                         raise _ContentFilterStop(
                             "the provider's content filter blocked the reply")
+                    if (fin == "stop" and self._announce_ok and k in ("text", "finish")
+                            and self._ends_announcing(t if k == "text" else "")):
+                        # The reply is about to finish on "Let me run X" / "Running X..."
+                        # and made no tool call (an armed gate has seen none): the CLI would
+                        # end the turn on it. End the stream like an upstream that died, so
+                        # its own retry reaches another model (_AnnounceStop).
+                        raise _AnnounceStop(_ANNOUNCE_STOP_TEXT)
                     if k == "other":
                         yield fr
                         continue
@@ -46062,7 +46130,8 @@ class _StreamAnswerGate:
             stop.set()
 
 
-def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
+def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools,
+                 announce_retry=False):
     """_StreamAnswerGate for one committed hop. Fail-open: on any setup error
     the upstream iterator is relayed untouched (the gate is never the thing
     that loses an answer)."""
@@ -46076,7 +46145,7 @@ def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
             prompt_text=_prompt_text_for_check(payload),
             last_prompt=_last_user_text_for_check(payload),
             tools_offered=bool(has_tools), visible_cap=cap,
-            req_est=_payload_est_tokens(payload))
+            req_est=_payload_est_tokens(payload), announce_retry=announce_retry)
     except Exception:                                            # noqa: BLE001
         return iterator
 
@@ -46384,6 +46453,17 @@ def _note_broken_stream(pid, model, exc, where):
         _log.info("[broken-stream] %s %s/%s: cut because the client left; "
                   "nothing filed", where, pid, model)
         return
+    if isinstance(exc, _AnnounceStop):
+        # The model finished on an announcement and no tool call (see A CHAT STREAM THAT
+        # STOPS ON "I'LL DO X" IS RETRIED): filed once, as the codex route files it. The
+        # pair stays routable (a heuristic about ONE reply) but goes behind the others.
+        try:
+            if pid and model:
+                _note_nonanswer(pid, model, "announced")
+                _note_recent_hop_failure(pid, model, "announced")
+        except Exception:                                        # noqa: BLE001
+            pass
+        return
     try:
         _log.warning("[broken-stream] %s %s/%s: upstream died before finishing (%s); "
                      "the client got a retryable error, hop filed as failed",
@@ -46533,6 +46613,12 @@ def _filter_retry_ok(conv_key):
 class _ContentFilterStop(_UpstreamStreamError):
     """A committed stream the provider's content filter ended: the relay ends it
     like an upstream that died, so the client retries on another model."""
+
+
+class _AnnounceStop(_UpstreamStreamError):
+    """A committed CHAT stream that was about to finish ("stop") right after announcing
+    its next step, with no tool call (see A CHAT STREAM THAT STOPS ON "I'LL DO X" IS
+    RETRIED): the relay ends it like an upstream that died, so the CLI retries."""
 
 
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
@@ -54570,7 +54656,8 @@ def _chat_completions_uncached(body):
                                        "%s/%s" % (hop_pid, hop_model))
                 # Visible text is held and judged before release (see
                 # _StreamAnswerGate); tool-call deltas are never held.
-                gated = _gate_stream(chained, "bytes", hop_pid, hop_model, payload, has_tools)
+                gated = _gate_stream(chained, "bytes", hop_pid, hop_model, payload, has_tools,
+                                     announce_retry=True)
                 relay = _proxy_sse(resp, gated, hop_pid=hop_pid, hop_model=hop_model,
                                    prompt_est=est,
                                    prompt_text=_prompt_text_for_check(payload),
