@@ -3245,6 +3245,14 @@
   .add-prov-dialog .pa-input[readonly]{ opacity:.7; cursor:default; }
   .pa-opt{ font-weight:400; color:var(--text-dim); }
   .pa-hint{ margin:0; font-size:12.5px; color:var(--text-dim); }
+  .pa-check{ display:flex; align-items:flex-start; gap:8px; font-size:14px; color:var(--text); }
+  .pa-check input{ margin-top:3px; }
+  /* the rank selector on a user-added provider's card */
+  .cp-rank-row{ display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:8px 0 0;
+    font-size:12.5px; color:var(--text-dim); }
+  .cp-rank-row select{ min-height:30px; padding:3px 8px; border:1px solid var(--border);
+    border-radius:var(--radius-sm); background:var(--bg-inset); color:var(--text); font:inherit; font-size:12.5px; }
+  .cp-rank-row select:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   @media (pointer:coarse), (max-width:640px){
     .pa-open{ min-height:calc(44px / var(--ui-scale, .8)); padding-left:14px; padding-right:14px; }
   }
@@ -5060,6 +5068,16 @@
         </div>
         <input type="text" id="cp-signup-url" maxlength="2000" placeholder="Where to get a key (optional) &mdash; a URL or a short note" aria-label="Where to get a key" spellcheck="false">
         <textarea id="cp-notes" maxlength="1000" placeholder="Notes (optional)" aria-label="Notes"></textarea>
+        <div class="sk-inline">
+          <select id="cp-rank" aria-label="Rank in the hub">
+            <option value="auto" selected>Rank: automatic (the hub's own score)</option>
+            <option value="top">Rank: top (the best model of all, used first)</option>
+            <option value="high">Rank: high (level with the best free models)</option>
+            <option value="medium">Rank: medium</option>
+            <option value="low">Rank: low (last resort)</option>
+          </select>
+          <label class="pa-check"><input type="checkbox" id="cp-no-tools"> <span>Chat only (no tool calls)</span></label>
+        </div>
         <div class="sk-err" id="cp-err" role="alert" hidden></div>
         <div class="sd-actions">
           <button class="btn sm" type="submit" id="cp-save">Add provider</button>
@@ -5847,6 +5865,21 @@
           <div class="publish-field">
             <label for="pa-notes">Notes</label>
             <textarea class="pa-input" id="pa-notes" maxlength="1000" rows="3" placeholder="Anything worth remembering about this provider" autocomplete="off"></textarea>
+          </div>
+          <div class="publish-field">
+            <label for="pa-rank">Rank in the hub</label>
+            <select class="pa-input" id="pa-rank" aria-describedby="pa-rank-help">
+              <option value="auto" selected>Automatic (the hub's own score)</option>
+              <option value="top">Top: the best model of all, used first</option>
+              <option value="high">High: level with the best free models</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low: last resort</option>
+            </select>
+            <p class="pa-hint" id="pa-rank-help">Where this provider's models sit when the hub picks one. Top puts it first for chat. You can change it later on its card or in Settings.</p>
+          </div>
+          <div class="publish-field">
+            <label class="pa-check" for="pa-no-tools"><input type="checkbox" id="pa-no-tools"> <span>Chat only: this endpoint cannot call tools</span></label>
+            <p class="pa-hint">Tick it for a bridge or a plain chat endpoint, so the hub never sends it an agent's tool call.</p>
           </div>
         </div>
       </details>
@@ -7063,6 +7096,18 @@
     var s = String(u == null ? '' : u).trim();
     return /^https?:\/\/[^\s<>"']+$/i.test(s) ? s : '';
   }
+  /* The manual rank of a provider the user added: where its models sit when the hub picks one. */
+  var RANK_OPTIONS = [['auto', 'Automatic'], ['top', 'Top (used first)'], ['high', 'High'],
+                      ['medium', 'Medium'], ['low', 'Low (last resort)']];
+  function rankRowHTML(p){
+    var cur = p.rank || 'auto';
+    return '<div class="cp-rank-row"><label for="rk-' + esc(p.id) + '">Rank in the hub</label>' +
+      '<select class="cp-rank-select" id="rk-' + esc(p.id) + '" data-pid="' + esc(p.id) + '">' +
+      RANK_OPTIONS.map(function(o){
+        return '<option value="' + o[0] + '"' + (o[0] === cur ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+      }).join('') + '</select>' +
+      (p.no_tools ? '<span>&middot; chat only</span>' : '') + '</div>';
+  }
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -7191,6 +7236,7 @@
         '</div>' +
       '</div>' +
       quotaLine +
+      (p.custom ? rankRowHTML(p) : '') +
       (p.recommended && REC_NOTES[p.id] ? '<div class="rec-note">' + esc(REC_NOTES[p.id]) + '</div>' : '') +
       /* Real remaining allowance, read from the provider itself. Puter is the
          only one that exposes it; everything else stays as it was. Shown
@@ -7439,6 +7485,15 @@
   }
 
   function wireCard(card, p){
+    var rankSel = $('.cp-rank-select', card);
+    if (rankSel) rankSel.addEventListener('change', function(){
+      var want = rankSel.value;
+      rankSel.disabled = true;
+      api('/api/custom-providers/' + encodeURIComponent(p.id), { method: 'PUT', body: { rank: want } })
+        .then(function(){ toast(want === 'auto' ? 'Rank: automatic' : 'Rank: ' + want); return loadProviders(true); })
+        .catch(function(e){ toast('Rank: ' + e.message, true); rankSel.value = p.rank || 'auto'; })
+        .then(function(){ rankSel.disabled = false; });
+    });
     var keyInput = $('.key-input', card);
     var baseInput = $('.base-input', card);
     var toggle = $('.enable-toggle', card);
@@ -15620,7 +15675,9 @@
     var list = $('#cp-list');
     if (!list) return;
     list.innerHTML = _customProviders.length ? _customProviders.map(function(p){
-      var desc = esc(p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet');
+      var desc = esc(p.base_url || '') + (p.has_key ? ' &middot; key saved' : ' &middot; no key yet') +
+        (p.rank && p.rank !== 'auto' ? ' &middot; rank: ' + esc(p.rank) : '') +
+        (p.no_tools ? ' &middot; chat only' : '');
       // A later update can ship a BUILT-IN provider using this same id --
       // the built-in then wins and this definition (and its saved key) is
       // no longer in effect. Shown, never auto-fixed; the user decides
@@ -15663,13 +15720,18 @@
     var name = clean(v.name), base = clean(v.base_url);
     if (!name) return { error: 'Give the provider a name, for example "My Company LLM".', field: 'name' };
     if (!base) return { error: 'Enter the base URL, for example https://api.example.com/v1.', field: 'base_url' };
-    return { body: { name: name, base_url: base, models_url: clean(v.models_url),
-                     signup_url: clean(v.signup_url), key_hint: clean(v.key_hint), notes: clean(v.notes) } };
+    var body = { name: name, base_url: base, models_url: clean(v.models_url),
+                 signup_url: clean(v.signup_url), key_hint: clean(v.key_hint), notes: clean(v.notes) };
+    /* the manual rank and the chat-only mark ride along only when the form has them */
+    if (v.rank != null) body.rank = clean(v.rank) || 'auto';
+    if (v.no_tools != null) body.no_tools = !!v.no_tools;
+    return { body: body };
   }
   function cpFormReset(){
     $('#cp-id').value = ''; $('#cp-name').value = ''; $('#cp-base-url').value = '';
     $('#cp-models-url').value = ''; $('#cp-key-hint').value = ''; $('#cp-signup-url').value = '';
     $('#cp-notes').value = ''; $('#cp-save').textContent = 'Add provider';
+    $('#cp-rank').value = 'auto'; $('#cp-no-tools').checked = false;
     $('#cp-cancel').hidden = true; $('#cp-err').hidden = true;
   }
   function initCustomProviders(){
@@ -15692,6 +15754,7 @@
         $('#cp-base-url').value = p2.base_url || ''; $('#cp-models-url').value = p2.models_url || '';
         $('#cp-key-hint').value = p2.key_hint || ''; $('#cp-signup-url').value = p2.signup_url || '';
         $('#cp-notes').value = p2.notes || '';
+        $('#cp-rank').value = p2.rank || 'auto'; $('#cp-no-tools').checked = !!p2.no_tools;
         $('#cp-save').textContent = 'Save changes'; $('#cp-cancel').hidden = false;
         $('#cp-name').focus();
       }
@@ -15720,7 +15783,8 @@
       var err = $('#cp-err'), btn = $('#cp-save'), id = $('#cp-id').value;
       var built = cpBuildBody({ name: $('#cp-name').value, base_url: $('#cp-base-url').value,
                                 models_url: $('#cp-models-url').value, key_hint: $('#cp-key-hint').value,
-                                signup_url: $('#cp-signup-url').value, notes: $('#cp-notes').value });
+                                signup_url: $('#cp-signup-url').value, notes: $('#cp-notes').value,
+                                rank: $('#cp-rank').value, no_tools: $('#cp-no-tools').checked });
       if (built.error){ err.textContent = built.error; err.hidden = false; return; }
       var body = built.body;
       err.hidden = true; btn.disabled = true;
@@ -15861,9 +15925,12 @@
     function val(id){ var el = $('#' + id); return el ? el.value : ''; }
     function lockProvider(on){
       providerFields.forEach(function(id){ var el = $('#' + id); if (el) el.readOnly = on; });
+      ['pa-rank', 'pa-no-tools'].forEach(function(id){ var el = $('#' + id); if (el) el.disabled = on; });
     }
     function resetForm(){
       providerFields.concat(['pa-key']).forEach(function(id){ var el = $('#' + id); if (el) el.value = ''; });
+      var rk = $('#pa-rank'); if (rk) rk.value = 'auto';
+      var nt = $('#pa-no-tools'); if (nt) nt.checked = false;
       lockProvider(false);
       var more = $('#pa-more'); if (more) more.open = false;
       _paPid = ''; _paBusy = false;
@@ -15942,7 +16009,8 @@
         body = { name: val('pa-name').trim() };
       } else {
         var built = cpBuildBody({ name: val('pa-name'), base_url: val('pa-base-url'), models_url: val('pa-models-url'),
-                                  signup_url: val('pa-signup-url'), key_hint: val('pa-key-hint'), notes: val('pa-notes') });
+                                  signup_url: val('pa-signup-url'), key_hint: val('pa-key-hint'), notes: val('pa-notes'),
+                                  rank: val('pa-rank') || 'auto', no_tools: !!($('#pa-no-tools') && $('#pa-no-tools').checked) });
         if (built.error){ paShowError(built.error, 'pa-' + built.field.replace(/_/g, '-')); return; }
         body = built.body;
       }

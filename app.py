@@ -3230,6 +3230,54 @@ def _ev_general_evidence_view(model_id):
         return None
 
 
+# MANUAL RANK FOR A PROVIDER THE USER ADDED (2026-11-21). The owner's local browser bridge has no
+# benchmark row and no family the hub knows, so it scored as "unknown" (10) although it fronts one of
+# the strongest models there is. A user-added provider can now be ranked by hand: auto (the hub's own
+# score, the default), top (above every model, the first pick), high (level with the best free models),
+# medium, low. It replaces the score of EVERY model of that provider. `no_tools` marks an endpoint that
+# cannot call tools (chat only): it is never offered a tool turn, so a top rank cannot send an agent's
+# tool call to a provider that refuses it. Flag `manual_provider_rank` (default on) switches the effect off.
+_MANUAL_RANK_SCORE = {"top": 200.0, "high": 134.0, "medium": 90.0, "low": 40.0}
+_CUSTOM_META_TTL = 3.0
+_custom_meta_cache = {"at": 0.0, "map": {}, "on": True}
+
+
+def _custom_meta_reset():
+    _custom_meta_cache["at"] = 0.0
+
+
+def _custom_meta(pid):
+    """The stored definition of a user-added provider (rank / no_tools live there), or None.
+    Cached for a few seconds: this sits on the scoring hot path. Never raises."""
+    try:
+        if not pid:
+            return None
+        c = _custom_meta_cache
+        now = time.monotonic()
+        if now - c["at"] > _CUSTOM_META_TTL:
+            rows = config.get_custom_providers() or {}
+            c["map"] = {k: v for k, v in rows.items() if isinstance(v, dict)}
+            c["on"] = bool(config.get_flag("manual_provider_rank", True))
+            c["at"] = now
+        if not c["on"] or pid in prov.PROVIDERS:        # a built-in with the same id wins
+            return None
+        return c["map"].get(pid)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _manual_rank_score(pid):
+    """The score the user gave this provider's models, or None (automatic)."""
+    meta = _custom_meta(pid)
+    return _MANUAL_RANK_SCORE.get(meta.get("rank")) if meta else None
+
+
+def _custom_no_tools(pid):
+    """True for a user-added provider marked chat-only."""
+    meta = _custom_meta(pid)
+    return bool(meta) and meta.get("no_tools") is True
+
+
 def _benchmark_score(pid, model_id, _rank=True):
     """Strength score for a '<model>' on provider `pid` (higher=better). Base
     tier comes from a REAL Artificial Analysis Intelligence Index match when
@@ -3239,6 +3287,9 @@ def _benchmark_score(pid, model_id, _rank=True):
     floors, mistral penalty, speed cap) still applies on top either
     way — those encode deliberate product decisions, not a capability
     estimate, so real data augments them rather than replacing them."""
+    _mr = _manual_rank_score(pid)           # a rank the user gave a provider he added by hand
+    if _mr is not None:
+        return _mr
     low = _canon_model_id((model_id or "").lower())
     aa = _aa_score_for(model_id)
     if aa is not None:
@@ -9391,6 +9442,8 @@ def _supports_tools(pid, model):
     matching NEITHER list is assumed capable, so a new/unknown model is never
     silently dropped from a tools request. An explicit NOT_TOOL_CAPABLE hit
     (codestral, base/completion-only models) always wins over TOOL_CAPABLE."""
+    if _custom_no_tools(pid):               # a chat-only endpoint the user added
+        return False
     low = (model or "").lower()
     if any(n in low for n in NOT_TOOL_CAPABLE):
         return False
@@ -23219,7 +23272,15 @@ def _provider_row(pid, live_models=False):
         # User-added via Settings -> Custom providers (providers.set_custom_source
         # merge point) -- never true for a static providers.PROVIDERS entry.
         "custom": bool(p.get("custom")),
+        # the manual rank / chat-only mark of a user-added provider (the card's selector)
+        "rank": _card_rank(pid) if p.get("custom") else None,
+        "no_tools": _custom_no_tools(pid) if p.get("custom") else None,
     }
+
+
+def _card_rank(pid):
+    r = (_custom_meta(pid) or {}).get("rank")
+    return r if r in _MANUAL_RANK_SCORE else "auto"
 
 
 @app.route("/api/providers", methods=["GET"])
@@ -23628,6 +23689,8 @@ def _custom_provider_definition_view(pid, row):
         "key_hint": row.get("key_hint") or "",
         "notes": row.get("notes") or "",
         "created_at": row.get("created_at") or "",
+        "rank": row.get("rank") if row.get("rank") in _MANUAL_RANK_SCORE else "auto",
+        "no_tools": row.get("no_tools") is True,
         "has_key": bool(config.get_provider_config(pid).get("api_keys")),
         "shadowed": pid in prov.PROVIDERS,
     }
@@ -23680,6 +23743,20 @@ def _custom_provider_body_fields(body, creating):
                 fields[key] = v.strip()[:limit] or None
             else:
                 return None, "%s must be a string or null" % key
+    if "rank" in body:
+        v = body.get("rank")
+        if v is None or (isinstance(v, str) and v.strip().lower() in ("", "auto")):
+            fields["rank"] = None
+        elif isinstance(v, str) and v.strip().lower() in _MANUAL_RANK_SCORE:
+            fields["rank"] = v.strip().lower()
+        else:
+            return None, "rank must be one of auto, top, high, medium, low"
+    if "no_tools" in body:
+        v = body.get("no_tools")
+        if v is None or isinstance(v, bool):
+            fields["no_tools"] = True if v is True else None
+        else:
+            return None, "no_tools must be true, false or null"
     return fields, None
 
 
@@ -23725,6 +23802,7 @@ def api_custom_provider_create():
             # re-read fresh on the next loop, so the next candidate skips it.
         if not pid:
             return jsonify({"error": "could not generate an id -- please choose one"}), 400
+    _custom_meta_reset()
     with _model_cache_lock:
         _model_cache.pop(pid, None)
         _paid_model_cache.pop(pid, None)
@@ -23762,6 +23840,7 @@ def api_custom_provider_update(pid):
         # that changes base_url always wins: clear any lingering override
         # ('' clears it -- see config.set_provider_config's own docstring).
         config.set_provider_config(pid, base_url="")
+    _custom_meta_reset()
     with _model_cache_lock:
         _model_cache.pop(pid, None)       # base/models URL may have changed -> rediscover
         _paid_model_cache.pop(pid, None)
@@ -23782,6 +23861,7 @@ def api_custom_provider_delete(pid):
                                   "send {\"confirm\": true} to proceed." % pid),
                         "code": "confirm_required"}), 400
     config.delete_custom_provider(pid)
+    _custom_meta_reset()
     with _model_cache_lock:
         _model_cache.pop(pid, None)
         _paid_model_cache.pop(pid, None)
@@ -35522,6 +35602,10 @@ def _validate_settings_import(body):
                     norm[key] = v.strip()[:limit]
             if isinstance(row.get("created_at"), str) and row["created_at"]:
                 norm["created_at"] = row["created_at"]
+            if isinstance(row.get("rank"), str) and row["rank"].strip().lower() in _MANUAL_RANK_SCORE:
+                norm["rank"] = row["rank"].strip().lower()
+            if row.get("no_tools") is True:
+                norm["no_tools"] = True
             rows[norm_pid] = norm
         out["custom_providers"] = rows
         if skipped:
@@ -35571,6 +35655,7 @@ def _apply_settings_import(sections):
         # logical order).
         for pid, row in sections["custom_providers"].items():
             config.set_custom_provider(pid, row)
+        _custom_meta_reset()
         with _model_cache_lock:
             for pid in sections["custom_providers"]:
                 _model_cache.pop(pid, None)

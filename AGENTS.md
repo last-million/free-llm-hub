@@ -11077,3 +11077,37 @@ later than the limit was cut a large share of the time, and its own record never
   effect on real turns is shown by the tests and the numbers above, not by a before/after run.
 
 Release-note: improved: the hub now waits for a model as long as that model's own record says it usually takes, so good but slow models such as Kimi K3.1 Pro are no longer cut off about half the time.
+
+## Rank a provider you added by hand, and mark it chat-only (2026-11-21)
+
+Covered by `tests/test_manual_provider_rank.py` (hermetic: temp config, no network). Owner: "when I add a provider,
+in its card and in Settings, let me rank it among the benchmark models by hand, like putting it at the top, and make
+my local Gemini bridge the most intelligent." The bridge has no benchmark row and no family the hub knows, so it
+scored as unknown (10) although it fronts one of the strongest models there is.
+
+- **Fields** on the stored definition of a user-added provider (`config.json` `custom_providers.<id>`):
+  `rank` (`top` / `high` / `medium` / `low`; absent = automatic) and `no_tools` (true = chat only). Set through
+  `POST /api/custom-providers` and `PUT /api/custom-providers/<id>` (`_custom_provider_body_fields`: an unknown
+  rank or a non-boolean `no_tools` is a 400; `auto` / null clears it; an edit that omits them leaves them alone),
+  shown by GET and on the `/api/providers` card row (`rank`, `no_tools`; null on a built-in), and kept by export /
+  import (`_validate_settings_import` drops an invalid value instead of trusting it).
+- **Effect** (`_manual_rank_score`, first lines of `_benchmark_score`): the rank REPLACES the score of every model of
+  that provider -- top 200 (above every model the hub scores, owner floors and board bonuses included, so it is the
+  first pick), high 134 (level with the best free models), medium 90, low 40. Penalties for measured failure still
+  apply on top of the score in `_learned_score` / `_agentic_score`, so a ranked provider that keeps failing is
+  demoted like any other. A built-in provider with the same id wins (the rank is ignored). Flag `manual_provider_rank`
+  (`config.get_flag`, default ON) turns the effect off; the stored values are kept.
+- **Chat only** (`_custom_no_tools`, first line of `_supports_tools`): such a provider is never offered a tool turn,
+  so a top rank cannot send an agent's tool call to an endpoint that refuses it (the local bridge answers 400 "Tool
+  calling is unsupported."). Every router filter reads `_supports_tools`.
+- **Cache.** `_custom_meta` reads the definitions through a 3 s cache (it sits on the scoring hot path); create, edit,
+  delete and import call `_custom_meta_reset()` so an edit applies at once. `tests/conftest.py` resets it per test.
+- **Where to set it.** The Add provider dialog (Optional details), the Settings -> Custom providers form (a select
+  and a checkbox), and a selector on the provider's own card (a user-added provider only; it PUTs `{rank}` and reloads).
+- **Limits, said plainly.** A top rank picks that provider first for every request that is not a tool turn and not
+  trivial (a trivial turn is routed to a fast model on purpose), whatever its speed: a slow provider is then waited
+  for only up to the normal limits, and the patience for an explicitly named provider applies only to a `provider/model`
+  request. The hub-internal helper calls (verifier, specialists, planner) pick by score too and may choose it. The rank
+  is per provider, not per model. No model is benchmarked by this: it is the owner's call, like Claude's floor.
+
+Release-note: new: you can rank a provider you added yourself (top, high, medium, low) from its card, Settings or the Add dialog, and mark it chat-only so the hub never sends it tool calls.

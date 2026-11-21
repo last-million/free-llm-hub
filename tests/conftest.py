@@ -216,6 +216,8 @@ def _clear_thinking_ledgers():
     getattr(mod, "_PARAM_REJECTED", {}).clear()
     # Providers learned to take only model/messages/stream (strict-body APIs).
     getattr(mod, "_MINIMAL_BODY", set()).clear()
+    # The user-added providers' rank / chat-only cache (read on the scoring hot path).
+    getattr(mod, "_custom_meta_reset", lambda: None)()
 
 
 @pytest.fixture(autouse=True)
