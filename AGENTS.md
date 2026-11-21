@@ -10978,6 +10978,12 @@ background.
   `headless` differs from the flag -- including every marker written before this change, which has no such
   key -- is stopped and relaunched with the right flags. A server with no marker is never touched, and if the
   stop fails the running one is adopted (fail open). It takes effect at the next hub start.
+  The server is found by what it IS (`_playwright_victims`): a process whose command line names `@playwright`
+  + `mcp` AND this hub's own `playwright-profile` folder, plus everything those started (the browser), never
+  the hub itself. MEASURED the first time it ran (2026-11-21): the recorded pid is the launcher shell, gone long
+  before, so killing "that pid" stopped nothing and the headed server was adopted again (and a recycled pid
+  would have been killed). The marker pid now only proves the server is ours; it is never killed on its own.
+  Needs psutil (no psutil = adopt, as before).
 - **To watch the browser, or to sign in / solve a CAPTCHA by hand:** set `playwright_headless` to false
   (`config.set_flag("playwright_headless", False)`) and restart the hub; the profile keeps the login.
 - **Limits, said plainly.** A few sites treat headless Chrome as a bot and show a CAPTCHA; the fix for that is
